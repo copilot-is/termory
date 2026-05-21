@@ -235,17 +235,17 @@ Critical: Grep AND Glob both surface as **Search** in Claude TUI; WebFetch is **
 
 **OpenCode** (`opencode_v2_tool_part_text`) — every branch cites a line in `.audit-sources/opencode/packages/opencode/src/cli/cmd/tui/feature-plugins/system/session-v2.tsx`:
 
-- `Bash` (l.707): with output → `**{description ?? "Shell"}**\n\n```bash\n$ {command}\n{output}\n```` (BlockTool); without output → `$ {command}` (InlineTool)
+- `Bash` (l.707): with output → `\# {description ?? "Shell"}\n\n```bash\n$ {command}\n{output}\n```` (BlockTool); without output → `$ {command}` (InlineTool). The `\#` is an escaped `#` so markdown does not interpret the title as an H1 — the CLI's literal title string starts with `# `.
 - `Glob` (l.748): `Glob "{pattern}" in {path} ({N} match[es])` (singular/plural matched)
 - `Read` (l.764): `Read {filePath} [other=...]\n↳ Loaded {path}` per loaded entry
 - `Grep` (l.794): `Grep "{pattern}" in {path} ({N} match[es])`
 - `WebFetch` (l.810): `WebFetch {url}`
 - `WebSearch` (l.818): `WebSearch "{query}" ({N} results)`
-- `Write` (l.828): `**Wrote {filePath}**\n\n```{lang}\n{content}\n```` block when completed, else `Write {filePath}` inline
-- `Edit` (l.857): `**← Edit {filePath}**\n\n```diff\n{diff}\n```` when diff present
-- `ApplyPatch` (l.891): per-file `**{verb} {path}**\n\n```diff\n{patch}\n```` (Deleted/Created/Moved/Patched)
-- `TodoWrite` (l.964): `**Todos**\n\n{✓/~/✕/☐} {content}` per todo (icons match `todoIcon` helper)
-- `Question` (l.991): `**Questions**\n\n{Q}\n{A}` per Q/A pair
+- `Write` (l.828): `\# Wrote {filePath}\n\n```{lang}\n{content}\n```` block when completed, else `Write {filePath}` inline
+- `Edit` (l.857): `← Edit {filePath}\n\n```diff\n{diff}\n```` when diff present (title starts with `←`, no `#`)
+- `ApplyPatch` (l.891): per-file title — `\# Deleted {path}` / `\# Created {path}` / `\# Moved {old} → {new}` / `← Patched {path}` + ```diff fence
+- `TodoWrite` (l.964): `\# Todos\n\n{✓/~/✕/☐} {content}` per todo (icons match `todoIcon` helper)
+- `Question` (l.991): `\# Questions\n\n{Q}\n{A}` per Q/A pair
 - `Skill` (l.1022): `Skill "{name}"`
 - `Task` (l.1030): `{Titlecase(subagent_type ?? "General")} Task — {description}`
 - generic (l.522): `{name} {input}` inline, or `**{name} {input}**\n\n```\n{output}\n```` block
@@ -257,15 +257,14 @@ Critical: Grep AND Glob both surface as **Search** in Claude TUI; WebFetch is **
 
 ### Tool message metadata + UI
 
-- `SessionMessage` carries `tool: Option<String>` (TUI-style label like `"Bash"`/`"Update"`/`"Search"`/`"Fetch"`) used for downstream filtering; the badge in the UI currently shows the generic role (`Tool`) and the tool name lives inside the body text in the bold function-call header.
 - `SessionMessage` carries `tool_use_id: Option<String>` (`#[serde(skip)]`, never exposed to the frontend). Claude `tool_use.id` and Codex `function_call.call_id` populate it.
 - `merge_tool_outputs(messages)` runs in `parse_claude_session` and `parse_codex_session`: it folds matching `tool_result` / `tool_error` messages back into the `tool_use` card body, wrapping the output in a 4-backtick code fence (so embedded ``` triple backticks survive). Provider-native combined formats (OpenCode parts and Gemini toolCalls) skip this merge — they already arrive combined.
 
-### Markdown rendering & raw toggle
+### Markdown rendering
 
-- The detail-pane body uses `react-markdown` + `remark-gfm` (tables / task lists / strikethrough) + `rehype-sanitize` (extended allowlist for `class^="hljs-"` and `class^="language-"`) + `rehype-highlight` (`atom-one-dark` theme, `detect: true` for unknown language fences).
-- A `Code2` button in `detailHeader` toggles `viewMode` between `"rendered"` (default) and `"raw"`. Raw mode falls back to a plain `<pre>` and is the escape hatch for any message where the renderer mangles the source.
-- Custom override for diff highlighting (`.messageBody pre code .hljs-addition` / `.hljs-deletion`): full-row tinted background so `+`/`-` lines look like a PR diff, since atom-one-dark only colors text.
+- The detail-pane body uses `react-markdown` + `remark-gfm` (tables / task lists / strikethrough). No syntax-highlight pass: code blocks render as plain monospace until a per-language renderer is added intentionally.
+- No DOMPurify / rehype-sanitize: react-markdown emits React elements (not HTML strings), so raw `<tag>` in session content is auto-escaped by React's text node rendering and displays as literal text — same characters the CLI shows.
+- No raw / rendered toggle and no `viewMode` state — every message renders through the same react-markdown pipeline. The "open original file" affordance in the detail header still lets the user inspect the underlying JSONL / db row outside Termory.
 
 ## History and Preview Behavior
 
