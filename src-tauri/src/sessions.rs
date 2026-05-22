@@ -4827,16 +4827,46 @@ fn claude_user_content_is_tool_result_only(value: &Value) -> bool {
 }
 
 fn claude_display_text(text: &str) -> Option<String> {
+    let trimmed_full = text.trim();
+    // `(no content)` NO_CONTENT_MESSAGE → drop (UserTextMessage.tsx:48,
+    // constants/messages.ts:1).
+    if trimmed_full == "(no content)" {
+        return None;
+    }
+    // `[Request interrupted by user]` / `[Request interrupted by user
+    // for tool use]` → italic notice (UserTextMessage.tsx:83-92 renders
+    // `<InterruptedByUser>`; constants at utils/messages.ts:207-209).
+    if trimmed_full == "[Request interrupted by user]"
+        || trimmed_full == "[Request interrupted by user for tool use]"
+    {
+        return Some("*[Interrupted by user]*".to_string());
+    }
+    // `<tick>...</tick>` → drop (UserTextMessage.tsx:57-59 returns null).
+    if text.contains("<tick>") {
+        return None;
+    }
+    // `<local-command-caveat>` → drop (UserTextMessage.tsx:61-64
+    // synthetic caveat, hidden by Claude).
+    if text.contains("<local-command-caveat>") {
+        return None;
+    }
+    // `<user-memory-input>...</user-memory-input>` → `\# {content}`
+    // memory entry (UserMemoryInputMessage.tsx:21-43 renders the inner
+    // text as a colored `# {input}` chip; we use `\#` so markdown
+    // doesn't interpret as H1).
+    if let Some(memory) = extract_xml_tag_value(text, "user-memory-input") {
+        let m = memory.trim();
+        if !m.is_empty() {
+            return Some(format!("\\# {m}"));
+        }
+    }
     // `({tool} completed with no output)` is the placeholder that
     // `toolResultStorage.ts:293` writes into JSONL tool_result.content
     // when stdout+stderr are both empty. Claude TUI's
     // `BashToolResultMessage.tsx:107-121` detects empty streams and
     // renders the cleaner `(No output)` instead. Termory matches that.
-    {
-        let trimmed = text.trim();
-        if trimmed.starts_with('(') && trimmed.ends_with(" completed with no output)") {
-            return Some("(No output)".to_string());
-        }
+    if trimmed_full.starts_with('(') && trimmed_full.ends_with(" completed with no output)") {
+        return Some("(No output)".to_string());
     }
     // Claude's internal `<tool_use_error>...</tool_use_error>` wrapper is
     // not meaningful to humans — it's an Anthropic-internal marker. Strip
