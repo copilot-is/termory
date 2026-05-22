@@ -52,7 +52,11 @@ pub struct SessionMessage {
 /// * failure → `✗` BALLOT X (Codex failure badge,
 ///   exec_cell/render.rs:236)
 fn status_marker(failed: bool) -> &'static str {
-    if failed { "✗ " } else { "⏺ " }
+    if failed {
+        "✗ "
+    } else {
+        "⏺ "
+    }
 }
 
 /// Wrap a string as a markdown inline code span, choosing the backtick
@@ -179,10 +183,7 @@ fn merge_tool_outputs(messages: Vec<SessionMessage>) -> Vec<SessionMessage> {
                 // (Claude TUI's BLACK_CIRCLE, constants/figures.ts:4),
                 // `✗` for failure (Codex `exec_cell/render.rs:236-239`
                 // failure badge). Either way it's the first visual signal.
-                let matched = msg
-                    .tool_use_id
-                    .as_ref()
-                    .and_then(|id| output_by_id.get(id));
+                let matched = msg.tool_use_id.as_ref().and_then(|id| output_by_id.get(id));
                 let failed = matched.is_some_and(|(_, err, _)| *err);
                 let marker = status_marker(failed);
                 msg.text = format!("{marker}{}", msg.text);
@@ -2486,10 +2487,14 @@ fn gemini_tool_messages_from_value(value: &Value) -> Vec<SessionMessage> {
                 .get("description")
                 .and_then(value_to_string)
                 .unwrap_or_default();
+            // Unified `**Verb**(args)` shape — description (Gemini's TUI
+            // secondary text from `ToolShared.tsx:202`) goes inside parens
+            // so the card reads the same as Codex / Claude / OpenCode tool
+            // headers.
             let header = if description.is_empty() {
                 format!("**{display_name}**")
             } else {
-                format!("**{display_name}** {description}")
+                format!("**{display_name}**({description})")
             };
             let mut text = header;
             if let Some(result) = tool.get("resultDisplay").and_then(gemini_content_text_raw) {
@@ -3140,23 +3145,15 @@ fn opencode_v2_assistant_part_text(part: &Value) -> Option<String> {
     }
 }
 
-// OpenCode tool rendering — routes each tool to the Termory unified
-// templates (format_*_tool_use). OpenCode-specific metadata fields
-// (metadata.count for glob, metadata.matches for grep,
-// metadata.numResults for websearch, metadata.loaded for read,
-// metadata.diff for edit, metadata.files for apply_patch) are surfaced
-// in the relevant template slot; remaining input fields go in the
-// `- key: value` extras list so nothing is dropped.
-// OpenCode tool rendering — every branch mirrors the OpenCode TUI render
-// functions in
-//   .audit-sources/opencode/packages/opencode/src/cli/cmd/tui/feature-plugins/system/session-v2.tsx
-// The TUI uses InlineTool (single-line `{icon} {content}`) or BlockTool
-// (bordered card with `{title}` + body). Termory translates:
-//   * InlineTool → plain-text single line, no markdown decoration so the
-//     wording matches the TUI verbatim (icons are dropped since the role
-//     already carries the "Tool" label in the UI).
-//   * BlockTool  → first line as bold (TUI dim title), output in a fenced
-//     code block so the markdown renderer applies monospace + highlight.
+// OpenCode tool rendering — unified `**Verb**(args)` format across the
+// four platforms. The verb (Bash / Read / Edit / etc.) still comes
+// from OpenCode's TUI source (session-v2.tsx referenced per-branch),
+// but the layout is the Termory unified shape:
+//   * header → `**Verb**({wrap_inline_code(arg)})`
+//   * body   → 4-backtick fence with output / content / diff (when present)
+// The OpenCode-specific decorations (`\# Title` H1 escape, `←` arrow,
+// `↳ Loaded`, `"pattern" in path` quoted format) are dropped in favor
+// of the unified shape so all four platforms read consistently.
 fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
     let name = part
         .get("name")
@@ -3180,22 +3177,28 @@ fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
                 .and_then(value_to_string)
         })
         .unwrap_or_default();
-    // BlockTool title: OpenCode CLI shows the title as `fg={theme.textMuted}`
-    // text — literal characters from the title string (often starting with
-    // `# ` or `← `). Termory uses the title verbatim; titles that begin with
-    // `# ` arrive with a backslash escape so markdown does not interpret
-    // them as H1. No bold wrapping (CLI is muted, not bold).
-    let block = |title: &str, body: &str, lang: &str| -> String {
+    // Unified block builder: header `**Verb**(args)` + (optional) fenced
+    // body. The 4-backtick fence matches `merge_tool_outputs` so the
+    // OpenCode parts (which arrive already combined) look identical to
+    // Codex / Claude merged tool cards.
+    let unified = |verb: &str, args: &str, body: &str, lang: &str| -> String {
+        let header = if args.is_empty() {
+            format!("**{verb}**")
+        } else {
+            format!("**{verb}**({args})")
+        };
         let trimmed = body.trim();
         if trimmed.is_empty() {
-            title.to_string()
+            header
+        } else if lang.is_empty() {
+            format!("{header}\n\n````\n{trimmed}\n````")
         } else {
-            format!("{title}\n\n```{lang}\n{trimmed}\n```")
+            format!("{header}\n\n```{lang}\n{trimmed}\n```")
         }
     };
-    // session-v2.tsx:707 Bash
-    //   InlineTool: `$ {command}`
-    //   BlockTool : title = `# {description ?? "Shell"}`, body = `$ {command}\n{output}`
+    // session-v2.tsx:707 Bash — header `**Shell**(\`cmd\`)` (matches the
+    // original OpenCode default title `\# Shell`); body keeps the
+    // description title + bash fence with `$ cmd` prefix unchanged.
     if name == "bash" || name == "shell" {
         let command = input_record
             .and_then(|record| record.get("command"))
@@ -3205,133 +3208,169 @@ fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
         let description = input_record
             .and_then(|record| record.get("description"))
             .and_then(value_to_string);
+        let args = if command.is_empty() {
+            String::new()
+        } else {
+            wrap_inline_code(command.trim())
+        };
+        let header = if args.is_empty() {
+            "**Shell**".to_string()
+        } else {
+            format!("**Shell**({args})")
+        };
         let trimmed_output = output.trim();
         if trimmed_output.is_empty() {
-            return Some(format!("$ {command}"));
+            return Some(header);
         }
         let title_text = description
             .as_deref()
             .filter(|d| !d.is_empty())
             .unwrap_or("Shell");
-        // session-v2.tsx:712 — title is `# ${description ?? "Shell"}`. `\#`
-        // escapes the markdown H1 interpretation while preserving the
-        // literal `# ` characters that the CLI displays.
         let title = format!("\\# {title_text}");
         let body = format!("$ {command}\n{trimmed_output}");
-        return Some(block(&title, &body, "bash"));
+        return Some(format!("{header}\n\n{title}\n\n```bash\n{body}\n```"));
     }
-    // session-v2.tsx:748 Glob — `Glob "{pattern}" in {path} ({N} match[es])`
+    // session-v2.tsx:748 Glob
     if name == "glob" {
         let pattern = input_string(input_record, "pattern")
             .or_else(|| input.as_str().map(ToString::to_string))?;
-        let mut text = format!("Glob \"{pattern}\"");
+        let mut args = format!("pattern: {}", wrap_inline_code(&pattern));
         if let Some(path) = input_string(input_record, "path") {
-            text.push_str(&format!(" in {path}"));
+            args.push_str(&format!(", path: {}", wrap_inline_code(&path)));
         }
         if let Some(count) = metadata
             .and_then(|m| m.get("count"))
             .and_then(value_to_string)
         {
             let plural = if count == "1" { "match" } else { "matches" };
-            text.push_str(&format!(" ({count} {plural})"));
+            args.push_str(&format!(" — {count} {plural}"));
         }
-        return Some(text);
+        return Some(format!("**Glob**({args})"));
     }
-    // session-v2.tsx:764 Read — `Read {filePath} {input(other)}` + `↳ Loaded ...`
+    // session-v2.tsx:764 Read
     if name == "read" {
         let file_path = input_string(input_record, "filePath")
             .or_else(|| input.as_str().map(ToString::to_string))?;
         let other = input_record
             .map(|r| opencode_v2_input_other(r, &["filePath"]))
             .unwrap_or_default();
-        let head = if other.is_empty() {
-            format!("Read {file_path}")
+        let args = if other.is_empty() {
+            wrap_inline_code(&file_path)
         } else {
-            format!("Read {file_path} {other}")
+            format!("{} {other}", wrap_inline_code(&file_path))
         };
-        let mut text = head;
+        let mut text = format!("**Read**({args})");
+        // Restore `metadata.loaded` (was `↳ Loaded {path}` per entry before
+        // the unified-format refactor stripped it). Each entry on its own
+        // line — trailing `\` is a CommonMark hard line break so the lines
+        // don't collapse into a paragraph.
         if let Some(loaded) = metadata
             .and_then(|m| m.get("loaded"))
             .and_then(Value::as_array)
         {
-            for path in loaded.iter().filter_map(value_to_string) {
-                text.push_str(&format!("\n↳ Loaded {path}"));
+            let paths: Vec<String> = loaded.iter().filter_map(value_to_string).collect();
+            if !paths.is_empty() {
+                text.push('\\');
+                for path in &paths {
+                    text.push_str("\n↳ Loaded ");
+                    text.push_str(path);
+                    text.push('\\');
+                }
+                // Drop the trailing `\` on the last line so it doesn't
+                // produce an empty `<br>` after the final entry.
+                if text.ends_with('\\') {
+                    text.pop();
+                }
             }
         }
         return Some(text);
     }
-    // session-v2.tsx:794 Grep — `Grep "{pattern}" in {path} ({N} match[es])`
+    // session-v2.tsx:794 Grep
     if name == "grep" {
         let pattern = input_string(input_record, "pattern")
             .or_else(|| input.as_str().map(ToString::to_string))?;
-        let mut text = format!("Grep \"{pattern}\"");
+        let mut args = format!("pattern: {}", wrap_inline_code(&pattern));
         if let Some(path) = input_string(input_record, "path") {
-            text.push_str(&format!(" in {path}"));
+            args.push_str(&format!(", path: {}", wrap_inline_code(&path)));
         }
         if let Some(matches) = metadata
             .and_then(|m| m.get("matches"))
             .and_then(value_to_string)
         {
             let plural = if matches == "1" { "match" } else { "matches" };
-            text.push_str(&format!(" ({matches} {plural})"));
+            args.push_str(&format!(" — {matches} {plural}"));
         }
-        return Some(text);
+        return Some(format!("**Grep**({args})"));
     }
-    // session-v2.tsx:810 WebFetch — `WebFetch {url}`
+    // session-v2.tsx:810 WebFetch
     if name == "webfetch" {
         let url = input_string(input_record, "url")
             .or_else(|| input.as_str().map(ToString::to_string))?;
-        return Some(format!("WebFetch {url}"));
+        return Some(format!("**WebFetch**({})", wrap_inline_code(&url)));
     }
-    // session-v2.tsx:818 WebSearch — `WebSearch "{query}" ({N} results)`
+    // session-v2.tsx:818 WebSearch
     if name == "websearch" {
         let query = input_string(input_record, "query")
             .or_else(|| input.as_str().map(ToString::to_string))?;
-        let mut text = format!("WebSearch \"{query}\"");
+        let mut args = wrap_inline_code(&query);
         if let Some(results) = metadata
             .and_then(|m| m.get("numResults"))
             .and_then(value_to_string)
         {
-            text.push_str(&format!(" ({results} results)"));
+            args.push_str(&format!(" — {results} results"));
         }
-        return Some(text);
+        return Some(format!("**WebSearch**({args})"));
     }
     // session-v2.tsx:828 Write
-    //   InlineTool: `Write {filePath}`
-    //   BlockTool : title = `# Wrote {filePath}`, body = `{content}` (lang from ext)
     if name == "write" {
         let file_path = input_string(input_record, "filePath").unwrap_or_default();
+        let args = if file_path.is_empty() {
+            String::new()
+        } else {
+            wrap_inline_code(&file_path)
+        };
         if state.get("status").and_then(Value::as_str) == Some("completed") {
             if let Some(content) = input_string(input_record, "content") {
                 let lang = filetype_hint(&file_path);
-                // session-v2.tsx:835 — title is `# Wrote {filePath}`.
-                return Some(block(&format!("\\# Wrote {file_path}"), &content, lang));
+                return Some(unified("Write", &args, &content, lang));
             }
         }
-        return Some(format!("Write {file_path}"));
+        let header = if args.is_empty() {
+            "**Write**".to_string()
+        } else {
+            format!("**Write**({args})")
+        };
+        return Some(header);
     }
     // session-v2.tsx:857 Edit
-    //   InlineTool: `Edit {filePath} {input(replaceAll)}`
-    //   BlockTool : title = `← Edit {filePath}`, body = unified diff
     if name == "edit" {
         let file_path = input_string(input_record, "filePath").unwrap_or_default();
+        let args = if file_path.is_empty() {
+            String::new()
+        } else {
+            wrap_inline_code(&file_path)
+        };
         if let Some(diff) = metadata
             .and_then(|m| m.get("diff"))
             .and_then(value_to_string)
         {
-            return Some(block(&format!("← Edit {file_path}"), &diff, "diff"));
+            return Some(unified("Edit", &args, &diff, "diff"));
         }
         let replace_all = input_record
             .and_then(|r| r.get("replaceAll"))
             .and_then(value_to_string);
-        let suffix = match replace_all {
-            Some(value) => format!(" [replaceAll={value}]"),
-            None => String::new(),
+        let header = if args.is_empty() {
+            "**Edit**".to_string()
+        } else {
+            format!("**Edit**({args})")
         };
-        Some(format!("Edit {file_path}{suffix}"))
+        return Some(match replace_all {
+            Some(value) => format!("{header} [replaceAll={value}]"),
+            None => header,
+        });
     }
     // session-v2.tsx:891 ApplyPatch
-    else if name == "apply_patch" {
+    if name == "apply_patch" {
         if let Some(files) = metadata
             .and_then(|m| m.get("files"))
             .and_then(Value::as_array)
@@ -3339,7 +3378,7 @@ fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
             let blocks = files
                 .iter()
                 .filter_map(|file| {
-                    let title = opencode_v2_patch_file_title(file)?;
+                    let (verb, path) = opencode_v2_patch_file_verb_path(file)?;
                     let body = file
                         .get("patch")
                         .and_then(value_to_string)
@@ -3349,17 +3388,18 @@ fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
                                 .map(|n| format!("-{n} lines"))
                         })
                         .unwrap_or_default();
-                    Some(block(&title, &body, "diff"))
+                    Some(unified(verb, &wrap_inline_code(&path), &body, "diff"))
                 })
                 .collect::<Vec<_>>();
             if !blocks.is_empty() {
                 return Some(blocks.join("\n\n"));
             }
         }
-        Some("Patch".to_string())
+        return Some("**ApplyPatch**".to_string());
     }
-    // session-v2.tsx:964 TodoWrite
-    else if name == "todowrite" {
+    // session-v2.tsx:964 TodoWrite — verb is "Todos" (matches the original
+    // BlockTool title `\# Todos`).
+    if name == "todowrite" {
         let metadata_has_todos = metadata
             .and_then(|m| m.get("todos"))
             .and_then(Value::as_array)
@@ -3382,15 +3422,15 @@ fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
                     })
                     .collect::<Vec<_>>();
                 if !lines.is_empty() {
-                    // session-v2.tsx:970 — title is `# Todos`.
-                    return Some(format!("\\# Todos\n\n{}", lines.join("\n")));
+                    return Some(format!("**Todos**\n\n{}", lines.join("\n")));
                 }
             }
         }
-        Some("Updating todos...".to_string())
+        return Some("**Todos**".to_string());
     }
-    // session-v2.tsx:991 Question
-    else if name == "question" {
+    // session-v2.tsx:991 Question — verb is "Questions" (matches the
+    // original BlockTool title `\# Questions`).
+    if name == "question" {
         let questions = input_record
             .and_then(|r| r.get("questions"))
             .and_then(Value::as_array);
@@ -3409,41 +3449,45 @@ fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
                     })
                     .collect::<Vec<_>>();
                 if !lines.is_empty() {
-                    // session-v2.tsx:1000 — title is `# Questions`.
-                    return Some(format!("\\# Questions\n\n{}", lines.join("\n\n")));
+                    return Some(format!("**Questions**\n\n{}", lines.join("\n\n")));
                 }
             }
         }
         let count = questions.map(|q| q.len()).unwrap_or(0);
         let plural = if count == 1 { "question" } else { "questions" };
-        Some(format!("Asked {count} {plural}"))
+        return Some(format!("**Questions**({count} {plural})"));
     }
-    // session-v2.tsx:1022 Skill — `Skill "{name}"`
-    else if name == "skill" {
+    // session-v2.tsx:1022 Skill
+    if name == "skill" {
         let skill = input_string(input_record, "name")
             .or_else(|| input.as_str().map(ToString::to_string))?;
-        Some(format!("Skill \"{skill}\""))
+        return Some(format!("**Skill**({})", wrap_inline_code(&skill)));
     }
-    // session-v2.tsx:1030 Task
-    else if name == "task" {
+    // session-v2.tsx:1030 Task — verb is `{Titlecase(agent)} Task`
+    // (matches the original `{Agent} Task — description` heading where
+    // the agent name prefixes "Task").
+    if name == "task" {
         let description = input_string(input_record, "description")
             .or_else(|| input.as_str().map(ToString::to_string))?;
         let agent =
             input_string(input_record, "subagent_type").unwrap_or_else(|| "General".to_string());
-        Some(format!("{} Task — {description}", title_case(&agent)))
+        return Some(format!(
+            "**{} Task**({})",
+            title_case(&agent),
+            wrap_inline_code(&description)
+        ));
+    }
+    // session-v2.tsx:522 GenericTool fallback
+    let input_text = input_record.map(opencode_v2_tool_input).unwrap_or_default();
+    let header = if input_text.is_empty() {
+        format!("**{name}**")
     } else {
-        // session-v2.tsx:522 GenericTool
-        let input_text = input_record.map(opencode_v2_tool_input).unwrap_or_default();
-        let head = if input_text.is_empty() {
-            name.clone()
-        } else {
-            format!("{name} {input_text}")
-        };
-        if output.trim().is_empty() {
-            Some(head)
-        } else {
-            Some(block(&head, &output, ""))
-        }
+        format!("**{name}**({input_text})")
+    };
+    if output.trim().is_empty() {
+        Some(header)
+    } else {
+        Some(format!("{header}\n\n````\n{}\n````", output.trim()))
     }
 }
 
@@ -3467,10 +3511,10 @@ fn opencode_v2_input_other(input: &serde_json::Map<String, Value>, omit: &[&str]
     }
 }
 
-fn opencode_v2_patch_file_title(file: &Value) -> Option<String> {
-    // session-v2.tsx:905-912 fileTitle() — returns the literal title used in
-    // the BlockTool header. `\#` escapes markdown H1 while keeping the `# `
-    // characters that CLI shows.
+fn opencode_v2_patch_file_verb_path(file: &Value) -> Option<(&'static str, String)> {
+    // session-v2.tsx:905-912 fileTitle() — picks the verb based on the
+    // FileChange tag. Returns `(verb, path)` for the unified
+    // `**Verb**(args)` header builder.
     let file_type = file.get("type").and_then(value_to_string);
     let relative_path = file
         .get("relativePath")
@@ -3478,16 +3522,16 @@ fn opencode_v2_patch_file_title(file: &Value) -> Option<String> {
         .or_else(|| file.get("filePath").and_then(value_to_string))
         .unwrap_or_else(|| "patch".to_string());
     Some(match file_type.as_deref() {
-        Some("delete") => format!("\\# Deleted {relative_path}"),
-        Some("add") => format!("\\# Created {relative_path}"),
+        Some("delete") => ("Deleted", relative_path),
+        Some("add") => ("Created", relative_path),
         Some("move") => {
             let original = file
                 .get("filePath")
                 .and_then(value_to_string)
                 .unwrap_or_default();
-            format!("\\# Moved {original} → {relative_path}")
+            ("Moved", format!("{original} → {relative_path}"))
         }
-        _ => format!("← Patched {relative_path}"),
+        _ => ("Patched", relative_path),
     })
 }
 
@@ -4285,7 +4329,7 @@ fn claude_tool_use_text(name: &str, input: &Value) -> String {
             // the Codex `EventMsg::McpToolCallEnd` rendering.
             if let Some(rest) = name.strip_prefix("mcp__") {
                 if let Some((server, tool)) = rest.split_once("__") {
-                    return format!("**MCP** {server}/{tool}");
+                    return format!("**MCP**({server}/{tool})");
                 }
             }
             // Otherwise: bold raw name + compact JSON args.
@@ -4508,6 +4552,21 @@ fn codex_message_from_value(value: &Value) -> Option<SessionMessage> {
     if payload_type == "function_call_output" {
         return codex_function_call_output_message(payload, timestamp);
     }
+    // `custom_tool_call` / `custom_tool_call_output` are the modern Codex
+    // shape for apply_patch (and other "custom" tools — see
+    // `codex-rs/protocol/src/models.rs ResponseItem::CustomToolCall`). The
+    // structural difference vs `function_call` is:
+    //   * input arrives in an `input` field (raw text), NOT `arguments`
+    //     (which is reserved for JSON-encoded structured args).
+    //   * output is wrapped in a JSON envelope `{"output": "..."}`.
+    // Reusing `codex_function_call_message` / `_output_message` after a
+    // field rename keeps apply_patch / patch-diff rendering identical.
+    if payload_type == "custom_tool_call" {
+        return codex_custom_tool_call_message(payload, timestamp);
+    }
+    if payload_type == "custom_tool_call_output" {
+        return codex_custom_tool_call_output_message(payload, timestamp);
+    }
     if payload_type == "command_execution" {
         return codex_command_execution_message(payload, timestamp);
     }
@@ -4677,10 +4736,21 @@ fn codex_function_call_message(
         // The TUI verb is `"Ran"` (or `"You ran"` for user-initiated shells)
         // — exec_cell/render.rs:381-385.
         "exec_command" | "shell" | "shell_command" | "local_shell" => {
+            // Unified shell verb across Codex / Claude — both render as
+            // `**Bash**({wrap_inline_code(command)})` so the user sees the
+            // same shape regardless of platform. Codex's TUI uses "Ran"
+            // (exec_cell/render.rs:381-385) but the per-platform card
+            // badge already disambiguates the source; using one verb
+            // makes scanning the transcript easier.
             let command = codex_command_from_arguments(arguments.as_deref())
                 .or_else(|| arguments.clone())
                 .unwrap_or_default();
-            format!("**Ran** {}", wrap_inline_code(command.trim()))
+            let trimmed = command.trim();
+            if trimmed.is_empty() {
+                "**Bash**".to_string()
+            } else {
+                format!("**Bash**({})", wrap_inline_code(trimmed))
+            }
         }
         "apply_patch" => {
             let patch = codex_apply_patch_text(arguments.as_deref())
@@ -4712,7 +4782,7 @@ fn codex_function_call_message(
             if path.is_empty() {
                 "**Viewed image**".to_string()
             } else {
-                format!("**Viewed image** {}", wrap_inline_code(&path))
+                format!("**Viewed image**({})", wrap_inline_code(&path))
             }
         }
         _ => {
@@ -4861,9 +4931,11 @@ fn codex_parse_patch_actions(patch_text: &str) -> Vec<CodexPatchAction> {
 }
 
 /// Build the unified-markdown header for an apply_patch call. Matches
-/// Codex's `render_changes_block` (diff_render.rs:415-437):
-///   * single-file patch → `**{Verb}** {path}` (with optional `→ {move_to}`)
-///   * multi-file patch  → `**Edited** {N} files`
+/// Codex's `render_changes_block` (diff_render.rs:415-437) for the verb
+/// choice, but uses the unified `**Verb**(args)` shape so the card
+/// reads the same as `**Bash**(cmd)` / `**Edit Notebook**(path)`:
+///   * single-file patch → `**{Verb}**(\`{path}\`)` (with optional `→ {move_to}`)
+///   * multi-file patch  → `**Edited**({N} files)`
 fn codex_patch_header(actions: &[CodexPatchAction]) -> String {
     if actions.is_empty() {
         return "**Applied patch**".to_string();
@@ -4873,11 +4945,93 @@ fn codex_patch_header(actions: &[CodexPatchAction]) -> String {
             Some(target) => format!("{} → {}", single.path, target),
             None => single.path.clone(),
         };
-        return format!("**{}** {}", single.verb, path_segment);
+        return format!("**{}**({})", single.verb, wrap_inline_code(&path_segment));
     }
     let count = actions.len();
     let noun = if count == 1 { "file" } else { "files" };
-    format!("**Edited** {count} {noun}")
+    format!("**Edited**({count} {noun})")
+}
+
+/// Codex `custom_tool_call` (`payload.type = "custom_tool_call"`) is the
+/// modern shape for apply_patch and similar tools. Differs from
+/// `function_call` in:
+///   * `input` (raw text) instead of `arguments` (JSON-encoded args)
+///   * No structured args wrapper around the patch body
+/// Real-world example (`/Users/john/.codex/sessions/.../*.jsonl`):
+///   `{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Update File: ...","call_id":"..."}`
+fn codex_custom_tool_call_message(
+    payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    let name = payload.get("name").and_then(value_to_string)?;
+    let input = payload.get("input").and_then(value_to_string);
+    let body = match name.as_str() {
+        "apply_patch" => {
+            let patch = input.clone().unwrap_or_default();
+            let header = codex_patch_header(&codex_parse_patch_actions(&patch));
+            format!("{header}\n\n```diff\n{}\n```", patch.trim())
+        }
+        _ => {
+            // Generic custom tool: bold name + compact input.
+            let compact_input = input
+                .as_deref()
+                .map(|s| compact(s, 200))
+                .unwrap_or_default();
+            if compact_input.is_empty() {
+                format!("**{name}**")
+            } else {
+                format!("**{name}**({compact_input})")
+            }
+        }
+    };
+    Some(SessionMessage {
+        role: "tool".to_string(),
+        text: body,
+        timestamp,
+        kind: kind::TOOL_USE.to_string(),
+        tool_use_id: payload.get("call_id").and_then(value_to_string),
+        exit_code: None,
+    })
+}
+
+/// Codex `custom_tool_call_output` — paired with `custom_tool_call`.
+/// The `output` field is a JSON-encoded string like
+/// `{"output":"Success. Updated:\n..."}` (extracted from the same source
+/// file referenced above). We unwrap the JSON envelope and emit a
+/// tool_result message that `merge_tool_outputs` will fold back into
+/// the matching tool_use card.
+fn codex_custom_tool_call_output_message(
+    payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    let raw_output = payload
+        .get("output")
+        .and_then(value_to_string)
+        .or_else(|| payload.get("content").and_then(value_to_string))?;
+    // Try JSON unwrap: many custom tool outputs use `{"output":"..."}`
+    // / `{"text":"..."}` envelopes. Fall back to the raw string.
+    let unwrapped = serde_json::from_str::<Value>(&raw_output)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("output")
+                .or_else(|| value.get("text"))
+                .or_else(|| value.get("result"))
+                .and_then(value_to_string)
+        })
+        .unwrap_or(raw_output);
+    let trimmed = unwrapped.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(SessionMessage {
+        role: "tool".to_string(),
+        text: trimmed.to_string(),
+        timestamp,
+        kind: kind::TOOL_RESULT.to_string(),
+        tool_use_id: payload.get("call_id").and_then(value_to_string),
+        exit_code: None,
+    })
 }
 
 fn codex_function_call_output_message(
@@ -5094,7 +5248,7 @@ fn codex_web_search_end_event(
         .filter(|s| !s.trim().is_empty())?;
     Some(SessionMessage {
         role: "tool".to_string(),
-        text: format!("**Searched** {}", wrap_inline_code(query)),
+        text: format!("**Searched**({})", wrap_inline_code(query)),
         timestamp,
         kind: kind::TOOL_USE.to_string(),
         tool_use_id: payload.get("call_id").and_then(value_to_string),
@@ -5120,7 +5274,7 @@ fn codex_mcp_tool_call_end_event(
     if server.is_empty() && tool.is_empty() {
         return None;
     }
-    let header = format!("**MCP** {server}/{tool}");
+    let header = format!("**MCP**({server}/{tool})");
     // `result` is either `{"Ok": CallToolResult}` or `{"Err": "..."}`
     // (Rust `Result` serialization). Inspect both arms.
     let result = payload.get("result");
@@ -5197,8 +5351,9 @@ fn codex_image_generation_end_event(
     }
     let mut text = String::from("**Generated image**");
     if let Some(prompt) = revised {
-        text.push(' ');
-        text.push_str(prompt);
+        text.push('(');
+        text.push_str(&wrap_inline_code(prompt));
+        text.push(')');
     }
     if let Some(path) = saved {
         text.push_str("\n\nSaved: ");
@@ -5378,7 +5533,7 @@ fn codex_view_image_tool_call_event(
     }
     Some(SessionMessage {
         role: "tool".to_string(),
-        text: format!("**Viewed image** {}", wrap_inline_code(path)),
+        text: format!("**Viewed image**({})", wrap_inline_code(path)),
         timestamp,
         kind: kind::TOOL_USE.to_string(),
         tool_use_id: payload.get("call_id").and_then(value_to_string),
@@ -6091,7 +6246,10 @@ mod tests {
         // from exec_cell/render.rs:381-385) + raw output extracted from the
         // `Chunk ID:...Output:\nsrc` formatted wrapper (so the metadata
         // noise is gone, matching Codex TUI which uses aggregated_output).
-        assert_eq!(detail.messages[1].text, "⏺ **Ran** `ls`\n\n````\nsrc\n````");
+        assert_eq!(
+            detail.messages[1].text,
+            "⏺ **Bash**(`ls`)\n\n````\nsrc\n````"
+        );
         assert_eq!(detail.messages[2].role, "assistant");
         assert_eq!(detail.messages[2].text, "Done");
     }
@@ -6111,7 +6269,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(body.text, "**Viewed image** `/tmp/shot.png`");
+        assert_eq!(body.text, "**Viewed image**(`/tmp/shot.png`)");
         assert_eq!(body.kind, kind::TOOL_USE);
     }
 
@@ -6245,6 +6403,26 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual diagnostic — dump Codex apply_patch fence text"]
+    fn codex_real_session_dump_diff_fence() {
+        let path = std::path::Path::new(
+            "/Users/john/.codex/sessions/2026/04/28/rollout-2026-04-28T12-00-14-019dd23e-a50a-7c33-8df5-09eb6ae0f7e8.jsonl",
+        );
+        if !path.exists() {
+            return;
+        }
+        let detail = parse_codex_session(path, "019dd23e-a50a-7c33-8df5-09eb6ae0f7e8").unwrap();
+        for (i, m) in detail.messages.iter().enumerate() {
+            if m.text.contains("```diff") {
+                println!("--- msg #{i} kind={} ---\n{}\n", m.kind, m.text);
+                if i > 30 {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "manual diagnostic — reads the user's real session file"]
     fn claude_real_session_dump_tool_messages() {
         let path = std::path::Path::new(
@@ -6362,7 +6540,7 @@ mod tests {
         // (same shape as Codex `EventMsg::McpToolCallEnd`).
         assert_eq!(
             claude_tool_use_text("mcp__figma__inspect", &serde_json::json!({})),
-            "**MCP** figma/inspect"
+            "**MCP**(figma/inspect)"
         );
     }
 
@@ -6423,7 +6601,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(msg.role, "tool");
-        assert_eq!(msg.text, "**Searched** `react markdown rendering`");
+        assert_eq!(msg.text, "**Searched**(`react markdown rendering`)");
         assert_eq!(msg.tool_use_id.as_deref(), Some("ws_1"));
 
         // EventMsg::McpToolCallEnd → header `**MCP** {server}/{tool}`
@@ -6449,7 +6627,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(msg.text, "**MCP** figma/inspect\n\n````\nframe: 12px\n````");
+        assert_eq!(
+            msg.text,
+            "**MCP**(figma/inspect)\n\n````\nframe: 12px\n````"
+        );
         assert_eq!(msg.kind, kind::TOOL_RESULT);
 
         // McpToolCallEnd with Err(_) → kind=tool_error so merge_tool_outputs
@@ -6483,7 +6664,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             msg.text,
-            "**Generated image** A red cat\n\nSaved: `/tmp/img.png`"
+            "**Generated image**(`A red cat`)\n\nSaved: `/tmp/img.png`"
         );
 
         // ContextCompacted → system notice.
@@ -6523,7 +6704,7 @@ mod tests {
             .expect("tool message present");
         assert_eq!(
             tool.text,
-            "✗ **Ran** `npm test`\n\n````\nError: Exit code 1\nFAIL\ntrace\n````"
+            "✗ **Bash**(`npm test`)\n\n````\nError: Exit code 1\nFAIL\ntrace\n````"
         );
     }
 
@@ -6562,7 +6743,7 @@ mod tests {
             .expect("tool message present");
         assert_eq!(
             tool.text,
-            "✗ **Ran** `rg --files -g '*release-airouter.yml' -g '!*node_modules*' -g '!web/**/node_modules/**'`\n\n````\nError: Exit code 1\n````"
+            "✗ **Bash**(`rg --files -g '*release-airouter.yml' -g '!*node_modules*' -g '!web/**/node_modules/**'`)\n\n````\nError: Exit code 1\n````"
         );
     }
 
@@ -6686,7 +6867,7 @@ mod tests {
                 move_to: None,
             }]
         );
-        assert_eq!(codex_patch_header(&actions), "**Added** src/new.rs");
+        assert_eq!(codex_patch_header(&actions), "**Added**(`src/new.rs`)");
 
         // Single-file edit with move → `**Edited** old → new`.
         let actions = codex_parse_patch_actions(
@@ -6702,19 +6883,19 @@ mod tests {
         );
         assert_eq!(
             codex_patch_header(&actions),
-            "**Edited** a/old.rs → a/new.rs"
+            "**Edited**(`a/old.rs → a/new.rs`)"
         );
 
         // Delete.
         let actions = codex_parse_patch_actions("*** Delete File: tmp/out.txt");
-        assert_eq!(codex_patch_header(&actions), "**Deleted** tmp/out.txt");
+        assert_eq!(codex_patch_header(&actions), "**Deleted**(`tmp/out.txt`)");
 
         // Multi-file → counts collapse to a single `**Edited** N files`.
         let actions = codex_parse_patch_actions(
             "*** Update File: a.rs\n@@\n*** Add File: b.rs\n*** Delete File: c.rs",
         );
         assert_eq!(actions.len(), 3);
-        assert_eq!(codex_patch_header(&actions), "**Edited** 3 files");
+        assert_eq!(codex_patch_header(&actions), "**Edited**(3 files)");
 
         // No recognized markers → generic fallback.
         let actions = codex_parse_patch_actions("diff --git a/x b/x\n...");
@@ -7416,11 +7597,16 @@ mod tests {
 
     #[test]
     fn opencode_formats_v2_special_tool_parts_like_official_preview() {
-        // Each branch mirrors the OpenCode TUI render function at the cited
-        // line in session-v2.tsx — see comments inside opencode_v2_tool_part_text.
+        // OpenCode tools all use the unified `**Verb**(args)` shape now —
+        // same as Codex / Claude / Gemini. The verb still comes from
+        // session-v2.tsx but the OpenCode-specific decorations (`\#` H1
+        // escape, `←` arrow, `↳ Loaded`, `"pattern" in path` quoted form)
+        // are dropped in favor of the unified shape.
 
-        // session-v2.tsx:707 Bash — BlockTool with title `# {description}`
-        // and body `$ {command}\n{output}`.
+        // Bash — completed with output goes in 4-backtick fence;
+        // `description` field restored as `\# {description}` between the
+        // header and the fence (preserving the OpenCode BlockTool title
+        // semantics).
         let bash = opencode_v2_tool_part_text(&serde_json::json!({
             "type":"tool",
             "name":"bash",
@@ -7431,10 +7617,13 @@ mod tests {
             }
         }))
         .unwrap();
-        assert_eq!(bash, "\\# Run tests\n\n```bash\n$ npm test\nok\n```");
+        assert_eq!(
+            bash,
+            "**Shell**(`npm test`)\n\n\\# Run tests\n\n```bash\n$ npm test\nok\n```"
+        );
 
-        // session-v2.tsx:764 Read — `Read {filePath} {input(other)}` plus
-        // `↳ Loaded {path}` for each metadata.loaded entry.
+        // Read — `[other=...]` continues to display the other input fields
+        // verbatim; metadata.loaded entries dropped (TUI-only `↳ Loaded`).
         let read = opencode_v2_tool_part_text(&serde_json::json!({
             "type":"tool",
             "name":"read",
@@ -7444,12 +7633,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             read,
-            "Read src/main.ts [limit=20, offset=10]\n↳ Loaded src/main.ts"
+            "**Read**(`src/main.ts` [limit=20, offset=10])\\\n↳ Loaded src/main.ts"
         );
 
-        // session-v2.tsx:964 TodoWrite — BlockTool with title `# Todos` and
-        // each todo as `{icon} {content}` (icons from session-v2.tsx
-        // todoIcon: ✓ ~ ✕ ☐).
+        // TodoWrite — todos rendered as a list with status icons.
         let todos = opencode_v2_tool_part_text(&serde_json::json!({
             "type":"tool",
             "name":"todowrite",
@@ -7462,10 +7649,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             todos,
-            "\\# Todos\n\n✓ Read code\n~ Patch parser\n☐ Run tests"
+            "**Todos**\n\n✓ Read code\n~ Patch parser\n☐ Run tests"
         );
 
-        // session-v2.tsx:748 Glob — `Glob "{pattern}" in {path} (N matches)`.
+        // Glob — `**Glob**(pattern: ..., path: ... — N matches)`.
         let glob = opencode_v2_tool_part_text(&serde_json::json!({
             "type":"tool",
             "name":"glob",
@@ -7473,9 +7660,12 @@ mod tests {
             "metadata":{"count":12}
         }))
         .unwrap();
-        assert_eq!(glob, "Glob \"**/*.ts\" in src (12 matches)");
+        assert_eq!(
+            glob,
+            "**Glob**(pattern: `**/*.ts`, path: `src` — 12 matches)"
+        );
 
-        // session-v2.tsx:794 Grep — singular/plural matches the TUI.
+        // Grep — singular/plural still respected in the trailing summary.
         let grep = opencode_v2_tool_part_text(&serde_json::json!({
             "type":"tool",
             "name":"grep",
@@ -7483,10 +7673,12 @@ mod tests {
             "metadata":{"matches":1}
         }))
         .unwrap();
-        assert_eq!(grep, "Grep \"TODO\" in src/lib.rs (1 match)");
+        assert_eq!(
+            grep,
+            "**Grep**(pattern: `TODO`, path: `src/lib.rs` — 1 match)"
+        );
 
-        // session-v2.tsx:857 Edit — BlockTool with title `← Edit {filePath}`
-        // and body = unified diff (Termory renders via ```diff fence).
+        // Edit — diff content in ```diff fence; `←` arrow dropped.
         let edit = opencode_v2_tool_part_text(&serde_json::json!({
             "type":"tool",
             "name":"edit",
@@ -7494,7 +7686,10 @@ mod tests {
             "metadata":{"diff":"- old\n+ new"}
         }))
         .unwrap();
-        assert_eq!(edit, "← Edit src/main.ts\n\n```diff\n- old\n+ new\n```");
+        assert_eq!(
+            edit,
+            "**Edit**(`src/main.ts`)\n\n```diff\n- old\n+ new\n```"
+        );
     }
 
     #[test]
@@ -7574,7 +7769,7 @@ mod tests {
         assert_eq!(detail.messages[1].kind, "tool_use");
         assert_eq!(
             detail.messages[1].text,
-            "\\# Run tests\n\n```bash\n$ npm test\nok\n```"
+            "**Shell**(`npm test`)\n\n\\# Run tests\n\n```bash\n$ npm test\nok\n```"
         );
     }
 

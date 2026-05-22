@@ -222,7 +222,7 @@ Every tool message — regardless of source platform — funnels into the same m
 ```
 
 - `{status}` is the leading glyph: `⏺` on success, `✗` on failure. Inserted by `merge_tool_outputs` (for paired tool_use/tool_result) or by the tool emitter directly (for self-contained EventMsg-derived cards like MCP / WebSearch). Matches Claude TUI's BLACK_CIRCLE prefix in `constants/figures.ts:4` (`⏺` on darwin, `●` elsewhere) for success; `✗` mirrors Codex's failure badge in `exec_cell/render.rs:236`.
-- `{Verb}` and `{args}` are platform-native (Codex `**Ran**`, Claude `**Bash**`, etc.) — "各家用各家" per design call. The badge on each session list card already disambiguates the platform.
+- `{Verb}` text is platform-native (per `session-v2.tsx` for OpenCode, `userFacingName` for Claude, `exec_cell/render.rs` for Codex, `displayName` for Gemini) — but the wrapper SHAPE `**Verb**(args)` is unified across all four. Platform-native verbs preserved: OpenCode keeps `Shell` / `Todos` / `Questions` / `{Agent} Task`; Codex shell uses `Bash` (was `Ran`, unified with Claude per design call so users don't see two different verbs for the same operation); apply_patch uses `Added` / `Deleted` / `Edited`.
 - `{args}` content (commands, paths, URLs, patterns) is wrapped with `wrap_inline_code` (sessions.rs:48 — CommonMark §6.1 delimiter sizing) so embedded backticks / asterisks / parens don't escape into markdown formatting.
 - `Error:` prefix appears INSIDE the fence body on failures, replacing the old footer-style `**Error**` line. Format is `Error: Exit code N` for Codex (exit code parsed from the `Process exited with code N` wrapper line) or `Error: {message}` for Claude (`is_error: true` with no exit code).
 - Reasoning across all four platforms goes through `format_reasoning_body(content)` → `> *line*\n> *line*\n...` (italic blockquote) so the visual style is consistent.
@@ -240,28 +240,34 @@ Every tool message — regardless of source platform — funnels into the same m
 
 Every Termory branch cites the exact source file that produces the verb in each TUI. Survey under `.audit-sources/{codex,gemini-cli,opencode,claude-code}/`.
 
-**Codex** (`codex_function_call_message`) — `.audit-sources/codex/codex-rs/tui/src/exec_cell/render.rs:381-385`:
+**Codex** (`codex_function_call_message` for ResponseItem::FunctionCall, `codex_custom_tool_call_message` for ResponseItem::CustomToolCall) — `.audit-sources/codex/codex-rs/tui/src/exec_cell/render.rs:381-385`:
 
-- `exec_command` / `shell` / `shell_command` / `local_shell` (all 4 names per `rollout-trace/src/tool_dispatch.rs:263`) → `**Ran** {wrap_inline_code(cmd)}`
-- `apply_patch` → `**{Verb}** {path}\n\n```diff\n{patch}\n```` ` — `codex_parse_patch_actions` scans `*** Add File:` / `*** Delete File:` / `*** Update File:` markers, picks `Added` / `Deleted` / `Edited` per `diff_render.rs:421-436`. Multi-file patches collapse to `**Edited** N files`.
+- `exec_command` / `shell` / `shell_command` / `local_shell` (all 4 names per `rollout-trace/src/tool_dispatch.rs:263`) → `**Bash**({wrap_inline_code(cmd)})` — verb unified with Claude per design call (was `**Ran** \`cmd\`` before unification).
+- `apply_patch` → `**{Verb}**({wrap_inline_code(path)})\n\n```diff\n{patch}\n```` ` — `codex_parse_patch_actions` scans `*** Add File:` / `*** Delete File:` / `*** Update File:` markers, picks `Added` / `Deleted` / `Edited` per `diff_render.rs:421-436`. Multi-file patches collapse to `**Edited**({N} files)`. Modern Codex stores apply_patch as `payload.type = "custom_tool_call"` with `input` field (raw patch text); legacy form is `function_call` with `arguments`. Both shapes route to the same patch-header builder.
 - `update_plan` → `**Updated plan**` + optional `*explanation*` + GFM task list `- [x]/[~]/[ ]` (matches PlanUpdateCell at `history_cell/plans.rs:138-194`)
-- `view_image` → `**Viewed image** {wrap_inline_code(path)}` (patches.rs:63-72)
-- other → `{name}({compact args})` fallback
+- `view_image` → `**Viewed image**({wrap_inline_code(path)})` (patches.rs:63-72)
+- other → `**{name}**({compact args})` fallback
 
 **Codex EventMsg dispatch** (`codex_event_msg_to_message`) — `RolloutItem::EventMsg` records are the canonical replay source for Codex; the wrapper `codex_message_from_value` routes `event_msg` records here. Handled variants:
 
 - `user_message` / `agent_message` / `agent_reasoning` / `agent_reasoning_raw_content`
-- `web_search_end` → `**Searched** {wrap_inline_code(query)}`
-- `mcp_tool_call_end` → `**MCP** {server}/{tool}` + 4-backtick result fence
-- `image_generation_end` → `**Generated image** {prompt}` + saved path
+- `web_search_end` → `**Searched**({wrap_inline_code(query)})`
+- `mcp_tool_call_end` → `**MCP**({server}/{tool})` + 4-backtick result fence
+- `image_generation_end` → `**Generated image**({wrap_inline_code(prompt)})` + saved path
 - `view_image_tool_call` → same shape as the function_call variant
 - `plan_update` → same as the function_call `update_plan` (payload IS the UpdatePlanArgs)
-- `patch_apply_end` (Extended mode) → per-file `**Verb** {path}` lines; on failure appends stderr fence + `**Error**`
+- `patch_apply_end` (Extended mode) → per-file `**Verb**({path})` lines; on failure appends stderr fence + `**Error**`
 - `context_compacted` → `*Context compacted*` system notice
 - `error` → `**Error**: {message}` system notice
 - `turn_aborted` → `*Turn interrupted by user*` / `*Turn stopped — budget limit reached*`
 - `thread_rolled_back` → `*Rolled back N turn(s)*`
 - `entered_review_mode` / `exited_review_mode` → italic notices
+
+**Codex `custom_tool_call` / `custom_tool_call_output`** (`codex_custom_tool_call_message` / `codex_custom_tool_call_output_message`) — modern shape for apply_patch and similar tools, differs from `function_call`:
+* input arrives in an `input` field (raw text) instead of `arguments` (JSON-encoded args)
+* output is wrapped in a JSON envelope `{"output":"..."}` — the message handler unwraps `output` / `text` / `result` keys, falling back to raw on parse failure
+
+Without these handlers, modern apply_patch was silently dropped and no ```diff fence was emitted.
 
 `exec_command_end` (Extended-mode shell) is intentionally NOT dispatched yet — it would duplicate the ResponseItem-derived card. Need call_id-based dedup before enabling.
 
@@ -294,30 +300,31 @@ Every Termory branch cites the exact source file that produces the verb in each 
 - `thinking` and `redacted_thinking` → reasoning message via `claude_thinking_blocks` + `format_reasoning_body`. Claude TUI renders `∴ Thinking…` (AssistantThinkingMessage.tsx); Termory emits the unified `> *content*` blockquote instead.
 - `image` (`{source: {type: "base64"|"url", media_type, ...}}`) → italic `*Image ({mime})*` or `*Image: {url}*` notice via `claude_image_part_label`.
 - `tool_result.content` may be `Value::String` or `Value::Array` of `text` blocks. The `<tool_use_error>...</tool_use_error>` wrapper Anthropic adds for internal validation failures is stripped by `claude_display_text` so only the human-readable error text remains.
+- `<task-notification>...</task-notification>` blocks (emitted by LocalShellTask / LocalAgentTask / RemoteAgentTask in claude-code) are collapsed to `⏺ {summary}` — matches `UserAgentNotificationMessage.tsx` which only renders the `<summary>` tag. The `<task-id>` / `<event>` / `<output-file>` siblings are dropped.
 
-**OpenCode** (`opencode_v2_tool_part_text`) — every branch cites a line in `.audit-sources/opencode/packages/opencode/src/cli/cmd/tui/feature-plugins/system/session-v2.tsx`:
+**OpenCode** (`opencode_v2_tool_part_text`) — each tool header uses the unified `**Verb**(args)` shape but the verb text + body content stay platform-native (matching `session-v2.tsx` lines cited below). Body decorations (`\# description` BlockTool title, bash fence with `$ cmd` prefix, ```diff diff fence, `↳ Loaded` instruction-file list, `{✓/~/✕/☐}` todo icons) are preserved verbatim — only the header line was reshaped:
 
-- `Bash` (l.707): with output → `\# {description ?? "Shell"}\n\n```bash\n$ {command}\n{output}\n```` (BlockTool); without output → `$ {command}` (InlineTool). The `\#` is an escaped `#` so markdown does not interpret the title as an H1 — the CLI's literal title string starts with `# `.
-- `Glob` (l.748): `Glob "{pattern}" in {path} ({N} match[es])` (singular/plural matched)
-- `Read` (l.764): `Read {filePath} [other=...]\n↳ Loaded {path}` per loaded entry
-- `Grep` (l.794): `Grep "{pattern}" in {path} ({N} match[es])`
-- `WebFetch` (l.810): `WebFetch {url}`
-- `WebSearch` (l.818): `WebSearch "{query}" ({N} results)`
-- `Write` (l.828): `\# Wrote {filePath}\n\n```{lang}\n{content}\n```` block when completed, else `Write {filePath}` inline
-- `Edit` (l.857): `← Edit {filePath}\n\n```diff\n{diff}\n```` when diff present (title starts with `←`, no `#`)
-- `ApplyPatch` (l.891): per-file title — `\# Deleted {path}` / `\# Created {path}` / `\# Moved {old} → {new}` / `← Patched {path}` + ```diff fence
-- `TodoWrite` (l.964): `\# Todos\n\n{✓/~/✕/☐} {content}` per todo (icons match `todoIcon` helper)
-- `Question` (l.991): `\# Questions\n\n{Q}\n{A}` per Q/A pair
-- `Skill` (l.1022): `Skill "{name}"`
-- `Task` (l.1030): `{Titlecase(subagent_type ?? "General")} Task — {description}`
-- generic (l.522): `{name} {input}` inline, or `**{name} {input}**\n\n```\n{output}\n```` block
-- `reasoning` part → `format_reasoning_body` (unified italic blockquote — replaces the old `_Thinking:_` inline prefix)
+- `Bash` / `Shell` (l.707): header `**Shell**({wrap_inline_code(cmd)})`. With output → followed by `\# {description ?? "Shell"}\n\n```bash\n$ {cmd}\n{output}\n```` (original BlockTool body). Without output → header alone (original InlineTool was `$ {cmd}`).
+- `Glob` (l.748): `**Glob**(pattern: {wrap_inline_code(pattern)}, path: {wrap_inline_code(path)} — {N} match[es])` (singular/plural matched).
+- `Read` (l.764): `**Read**({wrap_inline_code(filePath)} [other=...])` + per-entry `↳ Loaded {path}` lines using CommonMark hard breaks (`\` line terminator). `metadata.loaded` is the `instruction.resolve` array from `read.ts:264` — the auto-loaded instruction files (AGENTS.md / CLAUDE.md / etc.) the Read tool fetched alongside the requested file; surfaced because it's data, not decoration.
+- `Grep` (l.794): `**Grep**(pattern: {pattern}, path: {path} — {N} match[es])`.
+- `WebFetch` (l.810): `**WebFetch**({wrap_inline_code(url)})`.
+- `WebSearch` (l.818): `**WebSearch**({wrap_inline_code(query)} — {N} results)`.
+- `Write` (l.828): `**Write**({wrap_inline_code(filePath)})` + ```{lang from ext}\n{content}\n``` body when completed.
+- `Edit` (l.857): `**Edit**({wrap_inline_code(filePath)})` + ```diff\n{diff}\n``` body when diff present.
+- `ApplyPatch` (l.891): per-file header → `**Deleted**({path})` / `**Created**({path})` / `**Moved**({old → new})` / `**Patched**({path})` + ```diff fence (matches FileChange tags in fileTitle()).
+- `TodoWrite` (l.964): `**Todos**\n\n{✓/~/✕/☐} {content}` per todo (verb is "Todos" — matches the original BlockTool title `\# Todos`; icons from todoIcon helper).
+- `Question` (l.991): `**Questions**\n\n{Q}\n{A}` per Q/A pair (verb "Questions" matches `\# Questions` title).
+- `Skill` (l.1022): `**Skill**({wrap_inline_code(name)})`.
+- `Task` (l.1030): `**{Titlecase(subagent_type ?? "General")} Task**({wrap_inline_code(description)})` — verb includes the agent name prefix, matching the original `{Agent} Task — description` heading.
+- generic (l.522): `**{name}**({input})` header + 4-backtick output fence when present.
+- `reasoning` part → `format_reasoning_body` (unified italic blockquote — replaces the old `_Thinking:_` inline prefix).
 
 Audit reference is OpenCode `1.15.5` (commit `9324ef0`). Compared against `v1.15.7`: only cosmetic reasoning collapse-icon change in session-v2.tsx (`▼/▶` → `-/+`), no structural / schema diffs. No re-audit needed.
 
 **Gemini CLI** (`gemini_tool_messages_from_value` + `gemini_thought_messages_from_value` + `gemini_part_to_string`) — `.audit-sources/gemini-cli/packages/cli/src/ui/components/messages/`:
 
-- `toolCalls[]` entries (ToolShared.tsx:202 `ToolInfo`) → `**{displayName}** {description}` + 4-backtick `resultDisplay` fence
+- `toolCalls[]` entries (ToolShared.tsx:202 `ToolInfo`) → `**{displayName}**({description})` + 4-backtick `resultDisplay` fence
 - `thoughts[{subject, description}]` array (ThinkingMessage.tsx:22 `normalizeThoughtLines`) → one reasoning message per entry via `format_reasoning_body`. Noise filtering matches the source (skip whitespace-only or `...` runs)
 - Parts with `executableCode: {code, language}` → ```{lang}\n{code}\n``` fence
 - Parts with `codeExecutionResult: {outcome, output}` → 4-backtick output fence + italic `*Outcome: OUTCOME_FAILED*` footer when non-OK
@@ -347,7 +354,9 @@ Audit reference is OpenCode `1.15.5` (commit `9324ef0`). Compared against `v1.15
 - No DOMPurify / rehype-sanitize: react-markdown emits React elements (not HTML strings), so raw `<tag>` in session content is auto-escaped by React's text node rendering and displays as literal text — same characters the CLI shows.
 - No raw / rendered toggle and no `viewMode` state — every message renders through the same react-markdown pipeline. The "open original file" affordance in the detail header still lets the user inspect the underlying JSONL / db row outside Termory.
 - Inline `<code>` carries `word-break: break-all` so a long no-space path inside `**Read**(\`/very/long/path\`)` wraps with the surrounding paragraph instead of overflowing the message card.
+- `.messageBody pre` has `margin: 0; padding: 0 0 0 1em` — code fences sit flush with the verb header above, with a 1em left indent so the fence content visually aligns with the verb under the `⏺` marker.
 - Unordered lists render with the `- ` text marker via `list-style-type: "- "` (matching Codex TUI's `start_item` output at `codex-rs/tui/src/markdown_render.rs:754-760`).
+- Tool detail-pane loading state shows only the spinner icon (no `Loading transcript` label) so the brief delay between session select and detail load is unobtrusive.
 
 ## History and Preview Behavior
 
