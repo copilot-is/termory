@@ -23,10 +23,6 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./styles.css";
 
-// Markdown stack: react-markdown + remark-gfm (GFM tables / task lists /
-// strikethrough). Status markers in tool cards (`⏺` success / `✗`
-// failure) come through as plain unicode text from the Rust side — no
-// frontend override.
 const messageRemarkPlugins = [remarkGfm];
 
 const MessageBody = React.memo(function MessageBody({

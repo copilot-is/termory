@@ -273,34 +273,49 @@ Without these handlers, modern apply_patch was silently dropped and no ```diff f
 
 `Limited` vs `Extended` mode (per `codex-rs/rollout/src/policy.rs:135-153`): the CLI default is Limited (`tui/src/app_server_session.rs: persist_extended_history: false`), so most rollouts only carry `ResponseItem::FunctionCall` + `FunctionCallOutput` for shell tools — NOT `EventMsg::ExecCommandEnd`. Termory's `codex_function_call_output_message` is the authoritative path for shell output in that mode; `codex_parse_exec_output` strips the wrapper to recover `aggregated_output`.
 
-**Claude Code** (`claude_tool_use_text`) — `.audit-sources/claude-code/src/components/messages/AssistantToolUseMessage.tsx:152` wraps `<bold>{userFacingName}</bold>({renderToolUseMessage})`. Each Tool's `UI.tsx` provides both pieces. All argument values pass through `wrap_inline_code` so markdown-special chars in user payloads can't leak:
+**Claude Code** (`claude_tool_use_text`) — `.audit-sources/claude-code/src/components/messages/AssistantToolUseMessage.tsx:152` wraps `<bold>{userFacingName}</bold>({renderToolUseMessage})`. Each Tool's `UI.tsx` provides both pieces. All argument values pass through `wrap_inline_code` so markdown-special chars in user payloads can't leak.
 
-| Raw name | `userFacingName` | Termory output |
+`claude_tool_use_text` returns `Option<String>` so tools that Claude TUI explicitly suppresses (`userFacingName: ''` AND `renderToolUseMessage: () => null`) can return `None` and the entire tool card is skipped — matching the TUI which renders nothing for them:
+
+| Raw name | userFacingName source | Termory output |
 |---|---|---|
 | `Bash` | BashTool/UI.tsx | `**Bash**({command})` (empty cmd → just `**Bash**`) |
-| `Read` / `View` | FileReadTool/UI.tsx:8 → "Read" | `**Read**({path} · lines X-Y / · pages N / · limit N)` |
+| `Read` / `View` | FileReadTool/UI.tsx:179 → "Read" / "Read agent output" (path matches `/tasks/{taskId}.output` per `getAgentOutputTaskId`); `getPlansDirectory` "Reading Plan" variant is intentionally skipped (depends on session config) | `**Read**({path} · lines X-Y / · pages N / · limit N)` / `**Read agent output**({taskId})` |
 | `Write` | FileWriteTool/UI.tsx → "Write" | `**Write**({path})` |
-| `Edit` / `MultiEdit` / `str_replace*` | FileEditTool/UI.tsx → "Update" | `**Update**({path})` |
+| `Edit` / `MultiEdit` / `str_replace*` | FileEditTool/UI.tsx:28-87 → "Update" by default, "Create" when `old_string === ''` (or first edit's `old_string === ''` for MultiEdit) | `**Update**({path})` / `**Create**({path})` |
 | `Grep` | GrepTool.ts:170 → "Search" | `**Search**(pattern: ..., path: ...)` |
 | `Glob` | GlobTool/UI.tsx:13 → "Search" | `**Search**(pattern: ..., path: ...)` |
 | `WebFetch` | WebFetchTool.ts:81 → "Fetch" | `**Fetch**({url})` |
 | `WebSearch` | WebSearchTool.ts:160 → "Web Search" (space) | `**Web Search**({query})` |
-| `TodoWrite` | (Termory uses GFM task-list) | `**TodoWrite**\n\n- [x]/[~]/[ ] ...` |
-| `Task` | TaskCreateTool/etc. | `**Task**({description}, agent: ...)` |
 | `NotebookEdit` | NotebookEditTool.ts → "Edit Notebook" | `**Edit Notebook**({notebook_path})` |
-| `ExitPlanMode` / `EnterPlanMode` | empty userFacingName (suppressed in TUI) | `**Exit/Enter Plan Mode**` minimal marker |
-| `AskUserQuestion` | empty userFacingName | `**Ask** {question}` (one) / `**Ask** (N questions)` |
-| `ReadMcpResource` | ReadMcpResourceTool/UI.tsx → "readMcpResource" | `**Read MCP Resource**({uri})` |
-| `ListMcpResources` | "listMcpResources" | `**List MCP Resources**({server})` |
-| `McpAuth` | "{server} - authenticate (MCP)" | `**MCP Auth** {server}` |
-| `mcp__{server}__{tool}` (generic MCP) | — | `**MCP** {server}/{tool}` (same shape as Codex MCP) |
+| `Task` / `Agent` | AgentTool/UI.tsx `userFacingName` — "Agent" for `worker`/`general-purpose`/missing subagent_type, else the subagent_type verbatim | `**{verb}**({description})` (`verb` = "Agent" or `subagent_type`) |
+| `Skill` | SkillTool/UI.tsx | `**Skill**({name})` |
+| `ReadMcpResource` | ReadMcpResourceTool/UI.tsx → literal **`readMcpResource`** (camelCase, NOT title-cased) | `**readMcpResource**({uri})` |
+| `ListMcpResources` | literal **`listMcpResources`** | `**listMcpResources**({server})` |
+| `McpAuth` | McpAuthTool.ts → literal `'{server} - authenticate (MCP)'` (the whole label IS the verb) | `**{server} - authenticate (MCP)**` |
+| `mcp__{server}__{tool}` (generic MCP) | — | `**MCP**({server}/{tool})` (matches Codex MCP) |
+| **SUPPRESSED in Claude TUI** — `TodoWrite` / `AskUserQuestion` / `EnterPlanMode` / `ExitPlanMode` / `ExitPlanModeV2` / `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList` / `TaskStop` / `TaskOutput` / `ToolSearch` | userFacingName `''` AND renderToolUseMessage returns null | `claude_tool_use_text` returns `None` → no tool card emitted at all |
 
 **Claude content blocks** beyond `text` / `tool_use`:
 
 - `thinking` and `redacted_thinking` → reasoning message via `claude_thinking_blocks` + `format_reasoning_body`. Claude TUI renders `∴ Thinking…` (AssistantThinkingMessage.tsx); Termory emits the unified `> *content*` blockquote instead.
 - `image` (`{source: {type: "base64"|"url", media_type, ...}}`) → italic `*Image ({mime})*` or `*Image: {url}*` notice via `claude_image_part_label`.
-- `tool_result.content` may be `Value::String` or `Value::Array` of `text` blocks. The `<tool_use_error>...</tool_use_error>` wrapper Anthropic adds for internal validation failures is stripped by `claude_display_text` so only the human-readable error text remains.
+- `tool_result.content` may be `Value::String` or `Value::Array` of `text` blocks. `claude_display_text` strips Claude-internal wrappers:
+  - `<tool_use_error>…</tool_use_error>` → inner error text only
+  - `<bash-stdout>…</bash-stdout>` + `<bash-stderr>…</bash-stderr>` → unwrapped + concatenated (stdout, then stderr). Also strips the inner `<persisted-output>` wrapper from long captured bash output. Matches `UserBashOutputMessage.tsx`.
 - `<task-notification>...</task-notification>` blocks (emitted by LocalShellTask / LocalAgentTask / RemoteAgentTask in claude-code) are collapsed to `⏺ {summary}` — matches `UserAgentNotificationMessage.tsx` which only renders the `<summary>` tag. The `<task-id>` / `<event>` / `<output-file>` siblings are dropped.
+
+**Claude top-level record types** (per Message.tsx:103-281 dispatch):
+
+- `user` / `assistant` — message containers (see content-block handling above)
+- `attachment` — dispatched per `attachment.type` by `claude_attachment_messages` (sessions.rs). Subtypes that emit a notice line: `directory`, `file` / `already_read_file` (with `numLines` / `cells` / `unchanged` / `bytes` detail), `compact_file_reference`, `pdf_reference`, `selected_lines_in_ide`, `nested_memory`, `skill_listing` (non-initial only), `queued_command` (prompt text run through `claude_display_text` so embedded `<task-notification>` etc. dispatch correctly), `plan_file_reference`, `invoked_skills`, `mcp_resource`. NULL_RENDERING subtypes (`task_reminder`, `deferred_tools_delta`, `command_permissions`, `date_change`, `hook_success`, `async_hook_response`, `agent_setting`, `relevant_memories`, `dynamic_skill`, `agent_listing_delta`) drop silently — matches `nullRenderingAttachments.ts:14-49`.
+- `system` — dispatched by `subtype` via `claude_system_message`:
+  - `local_command` → strips `<command-message>`/`<command-args>` to `/cmd args` (kind=LOCAL_COMMAND)
+  - `turn_duration` → `*※ Worked for {duration}*` italic dim (matches SystemTextMessage.tsx:342-401). Duration formatted via `format_duration_short` (e.g. `45269ms` → `45.3s`).
+  - `away_summary` → `*※ {content}*` italic dim (l.70-84)
+  - `agents_killed` → `**Error** All background agents stopped` (l.87-101)
+  - `compact_boundary` → `---\n\n*{content}*\n\n---` GFM divider notice (Message.tsx:195-203 `CompactBoundaryMessage`)
+  - `microcompact_boundary` / `api_error` / other → silent drop (matches verbose-only or null fallthrough)
 
 **OpenCode** (`opencode_v2_tool_part_text`) — each tool header uses the unified `**Verb**(args)` shape but the verb text + body content stay platform-native (matching `session-v2.tsx` lines cited below). Body decorations (`\# description` BlockTool title, bash fence with `$ cmd` prefix, ```diff diff fence, `↳ Loaded` instruction-file list, `{✓/~/✕/☐}` todo icons) are preserved verbatim — only the header line was reshaped:
 

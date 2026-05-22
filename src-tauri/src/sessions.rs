@@ -223,11 +223,21 @@ fn merge_tool_outputs(messages: Vec<SessionMessage>) -> Vec<SessionMessage> {
                     }
                     if !body.is_empty() {
                         msg.text.push_str("\n\n");
-                        // 4-backtick fence so embedded ``` triple-backtick
-                        // content in the output survives.
-                        msg.text.push_str("````\n");
-                        msg.text.push_str(&body);
-                        msg.text.push_str("\n````");
+                        // If the body ALREADY starts with a code fence
+                        // (e.g. Claude's structuredPatch builder emits
+                        // ```diff\n...\n```), append it verbatim so the
+                        // markdown layer sees a single fence — wrapping
+                        // it in another 4-backtick fence would make the
+                        // inner fence render as literal characters.
+                        // Otherwise, wrap in 4-backticks (handles
+                        // triple-backtick content inside plain output).
+                        if body.starts_with("```") {
+                            msg.text.push_str(&body);
+                        } else {
+                            msg.text.push_str("````\n");
+                            msg.text.push_str(&body);
+                            msg.text.push_str("\n````");
+                        }
                     }
                 }
                 Some(msg)
@@ -3935,8 +3945,22 @@ fn claude_message_from_value(value: &Value) -> Vec<SessionMessage> {
             //    transcript reflects what each prior tool call returned. Carry
             //    the tool_use_id so merge_tool_outputs can fold the result
             //    back into the matching tool_use card.
+            //
+            //    For Edit / MultiEdit / Write tools, Claude also stores a
+            //    `toolUseResult.structuredPatch` sibling field on the JSONL
+            //    line (next to `message`) — this is what Claude TUI's
+            //    `StructuredDiff.tsx` renders as a unified diff with
+            //    `+`/`-` lines. We prefer that diff over the brief
+            //    "The file ... has been updated successfully" content
+            //    when present, matching the official UI's verbosity.
+            let tool_use_result = value.get("toolUseResult");
+            let diff_text = tool_use_result.and_then(claude_format_structured_patch);
             for tool_result in claude_tool_results(content) {
-                if let Some(display) = claude_display_text(&tool_result.text) {
+                let body_text = diff_text
+                    .clone()
+                    .filter(|_| !tool_result.is_error)
+                    .or_else(|| claude_display_text(&tool_result.text));
+                if let Some(display) = body_text {
                     out.push(SessionMessage {
                         role: "tool".to_string(),
                         text: display,
@@ -4019,15 +4043,351 @@ fn claude_message_from_value(value: &Value) -> Vec<SessionMessage> {
                 }
             }
         }
+        // System subtype dispatch. Branches mirror
+        // `.audit-sources/claude-code/src/components/messages/SystemTextMessage.tsx`:
+        //   - `turn_duration` (line 342-401): `※ Worked for {duration}` italic dim
+        //   - `away_summary` (line 70-84): `※ {content}` italic dim
+        //   - `compact_boundary` (Message.tsx:195-203): divider notice
+        //   - `microcompact_boundary` (Message.tsx:204-207): null
+        //   - `api_error`: hidden unless verbose (SystemTextMessage.tsx:139-145)
+        // Other subtypes drop silently (matches verbose-only fallthrough).
+        "system" => {
+            if let Some(msg) = claude_system_message(value, timestamp) {
+                out.push(msg);
+            }
+        }
+        // Attachment records — dispatched by `attachment.type` per Claude
+        // TUI's `AttachmentMessage.tsx`. Many subtypes are NULL_RENDERING
+        // (drop silently). The rest emit a short notice line matching
+        // the TUI's `<Line>` output.
+        "attachment" => {
+            out.extend(claude_attachment_messages(value, timestamp));
+        }
         _ => {}
     }
     out
+}
+
+/// Render a Claude `system` record (non-`local_command` subtypes) to a
+/// single SessionMessage. Mirrors `SystemTextMessage.tsx`'s per-subtype
+/// branches; drops subtypes that Claude TUI also hides (api_error /
+/// microcompact_boundary / verbose-only generic info).
+fn claude_system_message(value: &Value, timestamp: Option<String>) -> Option<SessionMessage> {
+    let subtype = value.get("subtype").and_then(Value::as_str)?;
+    let make = |text: String| {
+        Some(SessionMessage {
+            role: "system".to_string(),
+            text,
+            timestamp: timestamp.clone(),
+            kind: kind::TEXT.to_string(),
+            tool_use_id: None,
+            exit_code: None,
+        })
+    };
+    match subtype {
+        // SystemTextMessage.tsx:342-401 — `※ Worked for {duration}`.
+        // The TUI samples a verb from TURN_COMPLETION_VERBS ("Worked",
+        // "Toiled", "Labored", etc.); Termory uses a stable "Worked"
+        // since session replay needs a deterministic transcript.
+        "turn_duration" => {
+            let ms = value.get("durationMs").and_then(Value::as_i64)?;
+            make(format!("*※ Worked for {}*", format_duration_short(ms)))
+        }
+        // SystemTextMessage.tsx:70-84 — `※ {content}` dim italic.
+        "away_summary" => {
+            let content = value.get("content").and_then(Value::as_str)?;
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                make(format!("*※ {trimmed}*"))
+            }
+        }
+        // SystemTextMessage.tsx:87-101 — red BLACK_CIRCLE + dim text.
+        "agents_killed" => make("**Error** All background agents stopped".to_string()),
+        // Message.tsx:195-203 — `<CompactBoundaryMessage>` divider.
+        // The actual TUI renders a horizontal rule with a label; in
+        // markdown we approximate with `---` GFM divider + italic notice.
+        "compact_boundary" => {
+            let content = value
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let body = match content {
+                Some(c) => format!("---\n\n*{c}*\n\n---"),
+                None => "---\n\n*Conversation compacted*\n\n---".to_string(),
+            };
+            make(body)
+        }
+        // microcompact_boundary → null (Message.tsx:204-207)
+        // api_error → verbose-only (SystemTextMessage.tsx:139-145)
+        // Other subtypes drop silently.
+        _ => None,
+    }
+}
+
+/// Compact human-readable duration (`45269 ms` → `45.3s`).
+/// Used by `turn_duration` system messages.
+fn format_duration_short(ms: i64) -> String {
+    if ms < 0 {
+        return "0s".to_string();
+    }
+    let secs = ms as f64 / 1000.0;
+    if secs < 60.0 {
+        format!("{:.1}s", secs)
+    } else if secs < 3600.0 {
+        let m = (secs / 60.0).floor();
+        let s = secs - m * 60.0;
+        format!("{}m {:.0}s", m as i64, s)
+    } else {
+        let h = (secs / 3600.0).floor();
+        let m = ((secs - h * 3600.0) / 60.0).floor();
+        format!("{}h {}m", h as i64, m as i64)
+    }
+}
+
+/// Render a Claude `attachment` record to zero-or-one SessionMessages.
+/// Branches mirror `.audit-sources/claude-code/src/components/messages/AttachmentMessage.tsx:162-450`.
+/// NULL_RENDERING types (task_reminder / deferred_tools_delta /
+/// command_permissions / date_change / hook_success / async_hook_response
+/// / agent_setting / etc.) return an empty list to match Claude's
+/// `nullRenderingAttachments.ts:14-49`.
+fn claude_attachment_messages(value: &Value, timestamp: Option<String>) -> Vec<SessionMessage> {
+    let Some(att) = value.get("attachment") else {
+        return Vec::new();
+    };
+    let Some(att_type) = att.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let push = |text: String| {
+        vec![SessionMessage {
+            role: "system".to_string(),
+            text,
+            timestamp: timestamp.clone(),
+            kind: kind::TEXT.to_string(),
+            tool_use_id: None,
+            exit_code: None,
+        }]
+    };
+    let display_path = att
+        .get("displayPath")
+        .and_then(Value::as_str)
+        .or_else(|| att.get("filename").and_then(Value::as_str))
+        .unwrap_or("");
+    match att_type {
+        // AttachmentMessage.tsx:163-168
+        "directory" => push(format!("Listed directory {}", wrap_inline_code(&format!("{display_path}/")))),
+        // AttachmentMessage.tsx:169-194
+        "file" | "already_read_file" => {
+            let content = att.get("content");
+            let inner_type = content
+                .and_then(|c| c.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let detail = match inner_type {
+                "notebook" => {
+                    let cells = content
+                        .and_then(|c| c.get("file"))
+                        .and_then(|f| f.get("cells"))
+                        .and_then(Value::as_array)
+                        .map(|c| c.len())
+                        .unwrap_or(0);
+                    format!("{cells} cells")
+                }
+                "file_unchanged" => "unchanged".to_string(),
+                "text" => {
+                    let num_lines = content
+                        .and_then(|c| c.get("file"))
+                        .and_then(|f| f.get("numLines"))
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let truncated = att
+                        .get("truncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let plus = if truncated { "+" } else { "" };
+                    format!("{num_lines}{plus} lines")
+                }
+                _ => {
+                    // image/pdf/parts paths use `file.originalSize`
+                    let size = content
+                        .and_then(|c| c.get("file"))
+                        .and_then(|f| f.get("originalSize"))
+                        .and_then(Value::as_i64);
+                    match size {
+                        Some(s) => format!("{} bytes", s),
+                        None => String::new(),
+                    }
+                }
+            };
+            if detail.is_empty() {
+                push(format!("Read {}", wrap_inline_code(display_path)))
+            } else {
+                push(format!(
+                    "Read {} ({detail})",
+                    wrap_inline_code(display_path)
+                ))
+            }
+        }
+        // AttachmentMessage.tsx:195-200
+        "compact_file_reference" => {
+            push(format!("Referenced file {}", wrap_inline_code(display_path)))
+        }
+        // AttachmentMessage.tsx:201-207
+        "pdf_reference" => {
+            let pages = att
+                .get("pageCount")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            push(format!(
+                "Referenced PDF {} ({pages} pages)",
+                wrap_inline_code(display_path)
+            ))
+        }
+        // AttachmentMessage.tsx:208-216
+        "selected_lines_in_ide" => {
+            let start = att.get("lineStart").and_then(Value::as_i64).unwrap_or(0);
+            let end = att.get("lineEnd").and_then(Value::as_i64).unwrap_or(0);
+            let lines = end - start + 1;
+            let ide = att.get("ideName").and_then(Value::as_str).unwrap_or("");
+            push(format!(
+                "⧉ Selected {lines} lines from {} in {ide}",
+                wrap_inline_code(display_path)
+            ))
+        }
+        // AttachmentMessage.tsx:217-222
+        "nested_memory" => push(format!("Loaded {}", wrap_inline_code(display_path))),
+        // AttachmentMessage.tsx:280-290 — isInitial returns null
+        "skill_listing" => {
+            if att.get("isInitial").and_then(Value::as_bool) == Some(true) {
+                return Vec::new();
+            }
+            let count = att.get("skillCount").and_then(Value::as_i64).unwrap_or(0);
+            let noun = if count == 1 { "skill" } else { "skills" };
+            push(format!("{count} {noun} available"))
+        }
+        // AttachmentMessage.tsx:302-322 — queued_command wraps a prompt
+        // that itself goes through the UserTextMessage XML-wrapper
+        // dispatch chain (i.e. `<task-notification>` etc. apply).
+        "queued_command" => {
+            let prompt = att.get("prompt");
+            let text = match prompt {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(|item| {
+                        if item.get("type").and_then(Value::as_str) == Some("text") {
+                            item.get("text").and_then(value_to_string)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            };
+            if text.trim().is_empty() {
+                Vec::new()
+            } else {
+                claude_display_text(&text)
+                    .map(push)
+                    .unwrap_or_default()
+            }
+        }
+        // AttachmentMessage.tsx:324-329
+        "plan_file_reference" => {
+            let plan_path = att
+                .get("planFilePath")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            push(format!(
+                "Plan file referenced ({})",
+                wrap_inline_code(plan_path)
+            ))
+        }
+        // AttachmentMessage.tsx:330-336
+        "invoked_skills" => {
+            let names: Vec<String> = att
+                .get("skills")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.get("name").and_then(value_to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if names.is_empty() {
+                Vec::new()
+            } else {
+                push(format!("Skills restored ({})", names.join(", ")))
+            }
+        }
+        // AttachmentMessage.tsx:339-345
+        "mcp_resource" => {
+            let name = att.get("name").and_then(Value::as_str).unwrap_or("");
+            let server = att.get("server").and_then(Value::as_str).unwrap_or("");
+            push(format!(
+                "Read MCP resource {} from {server}",
+                wrap_inline_code(name)
+            ))
+        }
+        // NULL_RENDERING per nullRenderingAttachments.ts:14-49 and
+        // explicit returns in AttachmentMessage.tsx — drop silently.
+        "task_reminder"
+        | "deferred_tools_delta"
+        | "command_permissions"
+        | "date_change"
+        | "hook_success"
+        | "async_hook_response"
+        | "agent_setting"
+        | "relevant_memories" // Usually absorbed into a CollapsedReadSearchGroup; safe to drop for now
+        | "dynamic_skill"
+        | "agent_listing_delta" => Vec::new(),
+        // Unknown attachment type — drop (matches Claude TUI's
+        // `_exhaustive` fall-through).
+        _ => Vec::new(),
+    }
 }
 
 struct ClaudeToolResult {
     text: String,
     is_error: bool,
     tool_use_id: Option<String>,
+}
+
+/// Build a unified-diff fence from Claude's `toolUseResult.structuredPatch`
+/// array — the same data Claude TUI's `StructuredDiff.tsx` consumes.
+/// Each hunk has `{oldStart, oldLines, newStart, newLines, lines: [...]}`
+/// where `lines` entries are already prefixed with ` ` (context),
+/// `+` (added), or `-` (removed). Termory wraps the output in a
+/// ```diff fence so the markdown layer can syntax-highlight it later.
+///
+/// Returns None when the field is missing or empty (caller falls back
+/// to the brief tool_result `content` text).
+fn claude_format_structured_patch(tool_use_result: &Value) -> Option<String> {
+    let hunks = tool_use_result.get("structuredPatch")?.as_array()?;
+    if hunks.is_empty() {
+        return None;
+    }
+    let mut out = String::from("```diff\n");
+    for hunk in hunks {
+        let old_start = hunk.get("oldStart").and_then(Value::as_i64).unwrap_or(0);
+        let old_lines = hunk.get("oldLines").and_then(Value::as_i64).unwrap_or(0);
+        let new_start = hunk.get("newStart").and_then(Value::as_i64).unwrap_or(0);
+        let new_lines = hunk.get("newLines").and_then(Value::as_i64).unwrap_or(0);
+        out.push_str(&format!(
+            "@@ -{old_start},{old_lines} +{new_start},{new_lines} @@\n"
+        ));
+        if let Some(lines) = hunk.get("lines").and_then(Value::as_array) {
+            for line in lines.iter().filter_map(Value::as_str) {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out.push_str("```");
+    Some(out)
 }
 
 fn claude_tool_results(content: &Value) -> Vec<ClaudeToolResult> {
@@ -4089,7 +4449,9 @@ fn claude_tool_uses(content: &Value) -> Vec<ClaudeToolUse> {
                 return None;
             }
             let input = item.get("input").unwrap_or(&Value::Null);
-            let text = claude_tool_use_text(&name, input);
+            // None → tool suppressed in Claude TUI (userFacingName='' AND
+            // renderToolUseMessage returns null). Skip the whole card.
+            let text = claude_tool_use_text(&name, input)?;
             Some(ClaudeToolUse {
                 text,
                 id: item.get("id").and_then(value_to_string),
@@ -4114,16 +4476,53 @@ fn claude_tool_uses(content: &Value) -> Vec<ClaudeToolUse> {
 /// * GlobTool/UI.tsx:13 → "Search", same `pattern: "..."` format.
 /// * WebFetchTool.ts:81 → "Fetch", returns the URL.
 /// * WebSearchTool.ts:160 → "Web Search", returns `"{query}"`.
-fn claude_tool_use_text(name: &str, input: &Value) -> String {
+/// Detect agent-output file paths used by Claude Code's TaskOutput tool.
+/// Pattern: `…/tasks/{taskId}.output` where taskId is alphanumeric +
+/// `_-` and ≤20 chars. Matches `FileReadTool/UI.tsx:18-33`.
+fn claude_agent_output_task_id(path: &str) -> Option<String> {
+    let stripped = path.strip_suffix(".output")?;
+    let after_tasks = stripped.rsplit_once("/tasks/")?.1;
+    if after_tasks.is_empty() || after_tasks.len() > 20 {
+        return None;
+    }
+    if after_tasks
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        Some(after_tasks.to_string())
+    } else {
+        None
+    }
+}
+
+fn claude_tool_use_text(name: &str, input: &Value) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     let obj = input.as_object();
     let get = |key: &str| obj.and_then(|o| o.get(key)).and_then(value_to_string);
+    // Tools that Claude TUI suppresses entirely (`userFacingName: ''`
+    // AND `renderToolUseMessage: () => null`). The entire `<bold>x</bold>(args)`
+    // card is hidden. We return None so the caller skips emitting any
+    // SessionMessage. Per `.audit-sources/claude-code/src/tools/`:
+    //   * TodoWriteTool.ts:48,62
+    //   * AskUserQuestionTool.tsx:222-278
+    //   * EnterPlanModeTool.ts:52
+    //   * ExitPlanModeTool.ts / ExitPlanModeV2Tool.ts:163
+    //   * TaskCreateTool.ts:64,77 + sibling TaskUpdate/Get/List/Stop/Output
+    //   * ToolSearchTool.ts:438
+    match lower.as_str() {
+        "todowrite" | "todo_write" | "askuserquestion" | "ask_user_question" | "enterplanmode"
+        | "enter_plan_mode" | "exitplanmode" | "exit_plan_mode" | "exitplanmodev2"
+        | "taskcreate" | "task_create" | "taskupdate" | "task_update" | "taskget" | "task_get"
+        | "tasklist" | "task_list" | "taskstop" | "task_stop" | "taskoutput" | "task_output"
+        | "toolsearch" | "tool_search" => return None,
+        _ => {}
+    }
     // All dynamic arguments (commands, paths, URLs, patterns) are wrapped
     // with `wrap_inline_code` so any markdown special characters inside the
     // user payload (backticks, `*`, `_`, `()`) don't leak into the rendered
     // output. The TUI version (Claude Code Ink) doesn't need this because
     // it bypasses markdown entirely.
-    match lower.as_str() {
+    let text = match lower.as_str() {
         "bash" => {
             let command = get("command").unwrap_or_default();
             if command.is_empty() {
@@ -4135,7 +4534,19 @@ fn claude_tool_use_text(name: &str, input: &Value) -> String {
         "read" | "view" => {
             let path = get("file_path").unwrap_or_default();
             if path.is_empty() {
-                return "**Read**".to_string();
+                return Some("**Read**".to_string());
+            }
+            // FileReadTool/UI.tsx userFacingName (l.179-187): the verb
+            // varies by file path. Agent-output reads (path matches
+            // `{tempDir}/tasks/{taskId}.output`) use verb
+            // "Read agent output" and show just the taskId as args.
+            // Plans-directory variant is skipped — `getPlansDirectory()`
+            // depends on session config Termory doesn't have access to.
+            if let Some(task_id) = claude_agent_output_task_id(&path) {
+                return Some(format!(
+                    "**Read agent output**({})",
+                    wrap_inline_code(&task_id)
+                ));
             }
             let pages = get("pages");
             let offset = get("offset");
@@ -4164,16 +4575,30 @@ fn claude_tool_use_text(name: &str, input: &Value) -> String {
         }
         "edit" | "multiedit" | "str_replace" | "str_replace_editor" => {
             let path = get("file_path").unwrap_or_default();
+            // FileEditTool/UI.tsx:28-87 — verb defaults to "Update", but
+            // becomes "Create" when `old_string === ''` (new file being
+            // written via edit). MultiEdit checks the first edit.
+            let creating = match lower.as_str() {
+                "multiedit" => input
+                    .get("edits")
+                    .and_then(Value::as_array)
+                    .and_then(|arr| arr.first())
+                    .and_then(|e| e.get("old_string"))
+                    .and_then(Value::as_str)
+                    .is_some_and(str::is_empty),
+                _ => get("old_string").is_some_and(|s| s.is_empty()),
+            };
+            let verb = if creating { "Create" } else { "Update" };
             if path.is_empty() {
-                "**Update**".to_string()
+                format!("**{verb}**")
             } else {
-                format!("**Update**({})", wrap_inline_code(&path))
+                format!("**{verb}**({})", wrap_inline_code(&path))
             }
         }
         "grep" => {
             let pattern = get("pattern").unwrap_or_default();
             if pattern.is_empty() && get("path").is_none() {
-                return "**Search**".to_string();
+                return Some("**Search**".to_string());
             }
             let mut parts: Vec<String> = Vec::new();
             if !pattern.is_empty() {
@@ -4198,19 +4623,6 @@ fn claude_tool_use_text(name: &str, input: &Value) -> String {
                 (true, Some(p)) => format!("**Search**(path: {})", wrap_inline_code(p)),
             }
         }
-        "task" => {
-            let description = get("description").unwrap_or_default();
-            let agent = get("subagent_type");
-            if description.is_empty() && agent.is_none() {
-                return "**Task**".to_string();
-            }
-            match (description.is_empty(), agent) {
-                (false, Some(a)) => format!("**Task**({description}, agent: {a})"),
-                (false, None) => format!("**Task**({description})"),
-                (true, Some(a)) => format!("**Task**(agent: {a})"),
-                (true, None) => "**Task**".to_string(),
-            }
-        }
         "websearch" | "web_search" => {
             let query = get("query").unwrap_or_default();
             if query.is_empty() {
@@ -4227,34 +4639,37 @@ fn claude_tool_use_text(name: &str, input: &Value) -> String {
                 format!("**Fetch**({})", wrap_inline_code(&url))
             }
         }
-        "todowrite" | "todo_write" => {
-            let body = input
-                .get("todos")
-                .and_then(Value::as_array)
-                .map(|todos| {
-                    todos
-                        .iter()
-                        .filter_map(|t| {
-                            let content = t.get("content").and_then(value_to_string)?;
-                            let status = t
-                                .get("status")
-                                .and_then(value_to_string)
-                                .unwrap_or_else(|| "pending".to_string());
-                            let marker = match status.as_str() {
-                                "completed" => "- [x]",
-                                "in_progress" => "- [~]",
-                                _ => "- [ ]",
-                            };
-                            Some(format!("{marker} {content}"))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default();
-            if body.is_empty() {
-                "**TodoWrite**".to_string()
+        // AgentTool userFacingName depends on `subagent_type`
+        // (AgentTool/UI.tsx export userFacingName):
+        //   * `worker` → "Agent"
+        //   * `general-purpose` (or missing) → "Agent" (description as args)
+        //   * other subagent_type → use it verbatim
+        // renderToolUseMessage emits the description.
+        "task" | "agent" => {
+            let description = get("description").unwrap_or_default();
+            let subagent_type = get("subagent_type").unwrap_or_default();
+            let verb = if subagent_type.is_empty()
+                || subagent_type == "general-purpose"
+                || subagent_type == "worker"
+            {
+                "Agent".to_string()
             } else {
-                format!("**TodoWrite**\n\n{body}")
+                subagent_type
+            };
+            if description.is_empty() {
+                format!("**{verb}**")
+            } else {
+                format!("**{verb}**({})", wrap_inline_code(&description))
+            }
+        }
+        // SkillTool/UI.tsx — emits `skill` or `/skill` (legacy commands).
+        // Termory just shows `**Skill**({name})` to keep it predictable.
+        "skill" => {
+            let skill = get("skill").or_else(|| get("name")).unwrap_or_default();
+            if skill.is_empty() {
+                "**Skill**".to_string()
+            } else {
+                format!("**Skill**({})", wrap_inline_code(&skill))
             }
         }
         // NotebookEditTool/NotebookEditTool.ts userFacingName → "Edit Notebook".
@@ -4269,67 +4684,44 @@ fn claude_tool_use_text(name: &str, input: &Value) -> String {
                 format!("**Edit Notebook**({})", wrap_inline_code(&path))
             }
         }
-        // ExitPlanModeTool/ExitPlanModeV2Tool.ts userFacingName → ''. The
-        // TUI suppresses the call header and only renders the result
-        // (plan content) via renderToolResultMessage. In markdown we keep
-        // a minimal `**Exit Plan Mode**` marker so the call is visible in
-        // the transcript; the plan body arrives as the matched
-        // tool_result and is appended by merge_tool_outputs.
-        "exitplanmode" | "exit_plan_mode" => "**Exit Plan Mode**".to_string(),
-        "enterplanmode" | "enter_plan_mode" => "**Enter Plan Mode**".to_string(),
-        // AskUserQuestionTool userFacingName → ''. TUI presents a
-        // multiple-choice dialog. In markdown we surface the first
-        // question text (or count when multiple).
-        "askuserquestion" | "ask_user_question" => {
-            let questions = input.get("questions").and_then(Value::as_array);
-            match questions {
-                Some(qs) if !qs.is_empty() => {
-                    if qs.len() == 1 {
-                        let q = qs[0].get("question").and_then(Value::as_str).unwrap_or("");
-                        format!("**Ask** {}", wrap_inline_code(q))
-                    } else {
-                        format!("**Ask** ({} questions)", qs.len())
-                    }
-                }
-                _ => "**Ask**".to_string(),
-            }
-        }
-        // ReadMcpResourceTool/UI.tsx userFacingName → 'readMcpResource'.
+        // ReadMcpResourceTool/UI.tsx userFacingName → literal 'readMcpResource'
+        // (camelCase, matches Claude TUI exactly).
         "readmcpresource" | "read_mcp_resource" => {
             let uri = get("uri").or_else(|| get("url")).unwrap_or_default();
             if uri.is_empty() {
-                "**Read MCP Resource**".to_string()
+                "**readMcpResource**".to_string()
             } else {
-                format!("**Read MCP Resource**({})", wrap_inline_code(&uri))
+                format!("**readMcpResource**({})", wrap_inline_code(&uri))
             }
         }
-        // ListMcpResourcesTool userFacingName → 'listMcpResources'.
+        // ListMcpResourcesTool userFacingName → literal 'listMcpResources'.
         "listmcpresources" | "list_mcp_resources" => {
             let server = get("server").unwrap_or_default();
             if server.is_empty() {
-                "**List MCP Resources**".to_string()
+                "**listMcpResources**".to_string()
             } else {
-                format!("**List MCP Resources**({})", wrap_inline_code(&server))
+                format!("**listMcpResources**({})", wrap_inline_code(&server))
             }
         }
         // McpAuthTool userFacingName → '{server} - authenticate (MCP)'.
+        // Whole label IS the verb (bold).
         "mcpauth" | "mcp_auth" => {
             let server = get("server").unwrap_or_default();
             if server.is_empty() {
-                "**MCP Auth**".to_string()
+                "**authenticate (MCP)**".to_string()
             } else {
-                format!("**MCP Auth** {}", wrap_inline_code(&server))
+                format!("**{server} - authenticate (MCP)**")
             }
         }
         _ => {
             // MCP tools follow the canonical name pattern
             // `mcp__{server}__{tool}` (Claude Code's MCP client
             // strips the prefix in display). Surface them as
-            // `**MCP** {server}/{tool}` so they look the same as
+            // `**MCP**({server}/{tool})` so they look the same as
             // the Codex `EventMsg::McpToolCallEnd` rendering.
             if let Some(rest) = name.strip_prefix("mcp__") {
                 if let Some((server, tool)) = rest.split_once("__") {
-                    return format!("**MCP**({server}/{tool})");
+                    return Some(format!("**MCP**({server}/{tool})"));
                 }
             }
             // Otherwise: bold raw name + compact JSON args.
@@ -4340,7 +4732,8 @@ fn claude_tool_use_text(name: &str, input: &Value) -> String {
                 format!("**{name}**({})", compact(&json, 200))
             }
         }
-    }
+    };
+    Some(text)
 }
 
 fn claude_text_blocks(value: &Value) -> Vec<String> {
@@ -4441,6 +4834,28 @@ fn claude_display_text(text: &str) -> Option<String> {
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
         }
+    }
+    // Bash tool_result wrappers: `<bash-stdout>...</bash-stdout>` and
+    // `<bash-stderr>...</bash-stderr>`. Claude TUI's `UserBashOutputMessage`
+    // extracts both and renders stdout + stderr. We concatenate stdout
+    // first, then stderr (prefixed) so the unified card carries both
+    // streams. Also unwrap the inner `<persisted-output>` wrapper that
+    // claude-code adds for long captured bash output.
+    if text.contains("<bash-stdout>") || text.contains("<bash-stderr>") {
+        let stdout = extract_xml_tag_value(text, "bash-stdout")
+            .map(|s| extract_xml_tag_value(&s, "persisted-output").unwrap_or(s))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let stderr = extract_xml_tag_value(text, "bash-stderr")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let combined = match (stdout, stderr) {
+            (Some(o), Some(e)) => format!("{o}\n\n{e}"),
+            (Some(o), None) => o,
+            (None, Some(e)) => e,
+            (None, None) => return None,
+        };
+        return Some(combined);
     }
     // Background-task notifications (`<task-notification>...`) emitted by
     // LocalShellTask / LocalAgentTask / RemoteAgentTask. Claude Code's
@@ -6426,21 +6841,18 @@ mod tests {
     #[ignore = "manual diagnostic — reads the user's real session file"]
     fn claude_real_session_dump_tool_messages() {
         let path = std::path::Path::new(
-            "/Users/john/.claude/projects/-Users-john-Documents-copilot-is/34584c4e-6718-4027-99da-ac548d0aff8d.jsonl",
+            "/Users/john/.claude/projects/-Users-john-Documents-termory/0d6abfa5-8939-4bd8-8437-30fbb3bc6f09.jsonl",
         );
         if !path.exists() {
             return;
         }
         let detail = parse_claude_session(path).unwrap();
         for (i, m) in detail.messages.iter().enumerate() {
-            if m.role != "tool" {
-                continue;
-            }
-            if i == 12 || i == 28 {
-                println!("--- msg #{i} kind={} BYTES ---", m.kind);
-                println!("{:?}", m.text);
-                println!("--- msg #{i} kind={} DISPLAY ---", m.kind);
-                println!("{}", m.text);
+            if m.text
+                .contains("**Update**(`/Users/john/Documents/termory/src/main.tsx`)")
+            {
+                println!("--- msg #{i} kind={} ---", m.kind);
+                println!("{}", &m.text[..m.text.len().min(400)]);
                 println!();
             }
         }
@@ -6498,49 +6910,51 @@ mod tests {
                 "NotebookEdit",
                 &serde_json::json!({"notebook_path": "notes/a.ipynb"})
             ),
-            "**Edit Notebook**(`notes/a.ipynb`)"
+            Some("**Edit Notebook**(`notes/a.ipynb`)".to_string())
         );
 
-        // ExitPlanMode (empty userFacingName in TUI; we keep a visible marker).
+        // ExitPlanMode / EnterPlanMode / AskUserQuestion / TodoWrite /
+        // Task* / ToolSearch — Claude TUI suppresses these via
+        // `userFacingName: ''` + `renderToolUseMessage: null`. Termory
+        // returns None so no card is emitted.
         assert_eq!(
             claude_tool_use_text("ExitPlanMode", &serde_json::json!({"plan": "..."})),
-            "**Exit Plan Mode**"
+            None
         );
-
-        // AskUserQuestion with one question.
         assert_eq!(
             claude_tool_use_text(
                 "AskUserQuestion",
-                &serde_json::json!({
-                    "questions": [{"question": "Which path?"}]
-                })
+                &serde_json::json!({"questions": [{"question": "Which path?"}]})
             ),
-            "**Ask** `Which path?`"
+            None
         );
-
-        // AskUserQuestion with multiple questions.
         assert_eq!(
-            claude_tool_use_text(
-                "AskUserQuestion",
-                &serde_json::json!({"questions": [{"question": "A?"}, {"question": "B?"}]})
-            ),
-            "**Ask** (2 questions)"
+            claude_tool_use_text("TodoWrite", &serde_json::json!({"todos": []})),
+            None
+        );
+        assert_eq!(
+            claude_tool_use_text("TaskCreate", &serde_json::json!({})),
+            None
+        );
+        assert_eq!(
+            claude_tool_use_text("ToolSearch", &serde_json::json!({})),
+            None
         );
 
-        // ReadMcpResource.
+        // ReadMcpResource — verb is literal `readMcpResource` (camelCase
+        // from Claude TUI userFacingName).
         assert_eq!(
             claude_tool_use_text(
                 "ReadMcpResource",
                 &serde_json::json!({"uri": "mcp://figma/file/x"})
             ),
-            "**Read MCP Resource**(`mcp://figma/file/x`)"
+            Some("**readMcpResource**(`mcp://figma/file/x`)".to_string())
         );
 
-        // Generic MCP tool name `mcp__{server}__{tool}` → `**MCP** {s}/{t}`
-        // (same shape as Codex `EventMsg::McpToolCallEnd`).
+        // Generic MCP tool name `mcp__{server}__{tool}` → `**MCP**(s/t)`.
         assert_eq!(
             claude_tool_use_text("mcp__figma__inspect", &serde_json::json!({})),
-            "**MCP**(figma/inspect)"
+            Some("**MCP**(figma/inspect)".to_string())
         );
     }
 
