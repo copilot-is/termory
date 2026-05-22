@@ -733,8 +733,19 @@ input {
   padding-left: 1.5em;
 }
 
+/* Use `- ` instead of the default `•` disc so the visual matches Codex
+ * TUI's `start_item` output (codex-rs/tui/src/markdown_render.rs:754-760
+ * emits `" ".repeat(n) + "- "`). */
+.messageBody ul {
+  list-style-type: "- ";
+}
+
 .messageBody li {
   margin: 0.2em 0;
+}
+
+.messageBody li::marker {
+  color: #6b7a7d;
 }
 
 .messageBody li > p {
@@ -750,11 +761,20 @@ input {
     ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
     monospace;
   font-size: 0.92em;
+  /* Long no-space content (file paths / URLs / commands) inside an
+   * inline `<code>` would otherwise overflow the message card. The
+   * browser's default for `<code>` keeps the contents as one
+   * unbreakable token; `word-break: break-all` allows splitting at any
+   * character so long paths wrap with the surrounding paragraph. */
+  word-break: break-all;
 }
 
 .messageBody pre {
-  margin: 0.7em 0;
-  padding: 11px 14px;
+  margin: 0;
+  /* Left indent aligns the fence content with the start of the verb in
+   * the `⏺ **Verb**` header line above (one bullet-glyph + one space ≈
+   * 1.5em in the current font). */
+  padding: 0 0 0 1em;
   border-radius: 6px;
   font-size: 12.5px;
   line-height: 1.55;

@@ -23,10 +23,10 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./styles.css";
 
-// Markdown stack: react-markdown (parser → React elements) + remark-gfm
-// (GFM tables / task lists / strikethrough). No syntax-highlight pass;
-// code blocks render as plain monospace until a per-language renderer is
-// added intentionally.
+// Markdown stack: react-markdown + remark-gfm (GFM tables / task lists /
+// strikethrough). Status markers in tool cards (`⏺` success / `✗`
+// failure) come through as plain unicode text from the Rust side — no
+// frontend override.
 const messageRemarkPlugins = [remarkGfm];
 
 const MessageBody = React.memo(function MessageBody({
@@ -568,7 +568,11 @@ function App() {
             </div>
 
             <div className="messageList">
-              {detailLoading && <EmptyState icon={<Loader2 className="spin" />} title="Loading transcript" />}
+              {detailLoading && (
+                <div className="emptyState">
+                  <Loader2 className="spin" />
+                </div>
+              )}
               {!detailLoading &&
                 detail?.messages.map((message, index) => (
                   <article key={`${message.timestamp ?? "msg"}:${index}`} className={`message ${roleClass(message.role)}`}>

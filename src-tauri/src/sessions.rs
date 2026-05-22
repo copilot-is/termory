@@ -37,6 +37,82 @@ pub struct SessionMessage {
     /// `merge_tool_outputs` and not exposed to the frontend.
     #[serde(skip)]
     pub tool_use_id: Option<String>,
+    /// Internal: shell exit code parsed from a Codex `function_call_output`
+    /// metadata wrapper. `merge_tool_outputs` surfaces it as part of the
+    /// `**Error** · exit {N}` footer so failed commands carry diagnosis
+    /// info even when stdout/stderr were empty.
+    #[serde(skip)]
+    pub exit_code: Option<i64>,
+}
+
+/// Leading status marker for tool-card headers. Pure unicode (no HTML
+/// or styling — the frontend renders as-is):
+/// * success → `⏺` BLACK CIRCLE FOR RECORD (Claude TUI BLACK_CIRCLE,
+///   constants/figures.ts:4)
+/// * failure → `✗` BALLOT X (Codex failure badge,
+///   exec_cell/render.rs:236)
+fn status_marker(failed: bool) -> &'static str {
+    if failed { "✗ " } else { "⏺ " }
+}
+
+/// Wrap a string as a markdown inline code span, choosing the backtick
+/// delimiter so the content's own backticks don't terminate the span.
+/// Implements CommonMark 6.1 (Code spans): if the content begins or ends
+/// with a backtick, both delimiters are padded with a space (those spaces
+/// are stripped during render).
+fn wrap_inline_code(content: &str) -> String {
+    let max_run = content
+        .chars()
+        .fold((0usize, 0usize), |(max, cur), c| {
+            if c == '`' {
+                let new_cur = cur + 1;
+                (max.max(new_cur), new_cur)
+            } else {
+                (max, 0)
+            }
+        })
+        .0;
+    let delim = "`".repeat(max_run + 1);
+    if content.starts_with('`') || content.ends_with('`') {
+        format!("{delim} {content} {delim}")
+    } else {
+        format!("{delim}{content}{delim}")
+    }
+}
+
+/// Format reasoning content as italic blockquote (`> *content*`) so the
+/// frontend's default markdown renderer styles it visibly distinct from
+/// normal assistant text — matching the common "thinking" display
+/// convention.
+fn format_reasoning_body(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Italic doesn't survive multiple paragraphs cleanly, so wrap each
+    // non-empty line in `> *...*` so the entire block renders as one
+    // styled blockquote.
+    let mut out = String::new();
+    for (idx, line) in trimmed.lines().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            out.push('>');
+        } else {
+            out.push_str("> *");
+            // Escape stray `*` chars in the source so italic isn't broken.
+            for c in line.chars() {
+                if c == '*' || c == '_' {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out.push('*');
+        }
+    }
+    out
 }
 
 /// Walk a list of tool-related messages and fold `tool_result` /
@@ -54,9 +130,10 @@ fn merge_tool_outputs(messages: Vec<SessionMessage>) -> Vec<SessionMessage> {
         return messages;
     }
 
-    // (text, is_error) — multiple result blocks per call get concatenated;
-    // any error marks the whole bundle so the merge can prefix `**Error:**`.
-    let mut output_by_id: HashMap<String, (String, bool)> = HashMap::new();
+    // (text, is_error, exit_code) — multiple result blocks per call get
+    // concatenated; any error marks the whole bundle so merge can append
+    // `**Error**` (with the most recent non-zero exit code, when known).
+    let mut output_by_id: HashMap<String, (String, bool, Option<i64>)> = HashMap::new();
     for msg in &messages {
         if !matches!(msg.kind.as_str(), "tool_result" | "tool_error") {
             continue;
@@ -70,12 +147,15 @@ fn merge_tool_outputs(messages: Vec<SessionMessage>) -> Vec<SessionMessage> {
         let is_error = msg.kind == "tool_error";
         output_by_id
             .entry(id)
-            .and_modify(|(text, err)| {
+            .and_modify(|(text, err, code)| {
                 text.push_str("\n\n");
                 text.push_str(&msg.text);
                 *err = *err || is_error;
+                if msg.exit_code.is_some() {
+                    *code = msg.exit_code;
+                }
             })
-            .or_insert_with(|| (msg.text.clone(), is_error));
+            .or_insert_with(|| (msg.text.clone(), is_error, msg.exit_code));
     }
 
     messages
@@ -87,23 +167,66 @@ fn merge_tool_outputs(messages: Vec<SessionMessage>) -> Vec<SessionMessage> {
                         return None;
                     }
                 }
+                // Orphan result (no matching tool_use kept it). Prefix
+                // with the same status marker we use for tool_use cards
+                // so the user can scan failures at a glance.
+                let prefix = status_marker(msg.kind == "tool_error");
+                msg.text = format!("{prefix}{}", msg.text);
                 Some(msg)
             }
             "tool_use" => {
-                if let Some(id) = &msg.tool_use_id {
-                    if let Some((output, is_error)) = output_by_id.get(id) {
-                        let trimmed = output.trim();
-                        if !trimmed.is_empty() {
-                            msg.text.push_str("\n\n");
-                            if *is_error {
-                                msg.text.push_str("**Error:**\n\n");
+                // Status marker BEFORE the tool name. `⏺` for success
+                // (Claude TUI's BLACK_CIRCLE, constants/figures.ts:4),
+                // `✗` for failure (Codex `exec_cell/render.rs:236-239`
+                // failure badge). Either way it's the first visual signal.
+                let matched = msg
+                    .tool_use_id
+                    .as_ref()
+                    .and_then(|id| output_by_id.get(id));
+                let failed = matched.is_some_and(|(_, err, _)| *err);
+                let marker = status_marker(failed);
+                msg.text = format!("{marker}{}", msg.text);
+
+                if let Some((output, is_error, exit_code)) = matched {
+                    // Build the merged body. On failures, prefix with
+                    // `Error:` and the exit code (when known) — matching
+                    // Claude Code TUI's `⎿ Error: Exit code N` line and
+                    // unifying the format across platforms. Codex carries
+                    // an exit_code, Claude doesn't (is_error alone signals
+                    // failure).
+                    let trimmed = output.trim();
+                    let mut body = String::new();
+                    if *is_error {
+                        body.push_str("Error:");
+                        // Codex: `Error: Exit code N` then (if any) the
+                        // command output on subsequent lines.
+                        // Claude: no exit_code — content comes inline
+                        // after `Error: ` (single line head + multi-line
+                        // continuation if the error message has \n).
+                        match *exit_code {
+                            Some(code) if code != 0 => {
+                                body.push_str(&format!(" Exit code {code}"));
+                                if !trimmed.is_empty() {
+                                    body.push('\n');
+                                    body.push_str(trimmed);
+                                }
                             }
-                            // 4-backtick fence so embedded ``` triple-backtick
-                            // content in the output survives.
-                            msg.text.push_str("````\n");
-                            msg.text.push_str(trimmed);
-                            msg.text.push_str("\n````");
+                            _ if !trimmed.is_empty() => {
+                                body.push(' ');
+                                body.push_str(trimmed);
+                            }
+                            _ => {}
                         }
+                    } else {
+                        body.push_str(trimmed);
+                    }
+                    if !body.is_empty() {
+                        msg.text.push_str("\n\n");
+                        // 4-backtick fence so embedded ``` triple-backtick
+                        // content in the output survives.
+                        msg.text.push_str("````\n");
+                        msg.text.push_str(&body);
+                        msg.text.push_str("\n````");
                     }
                 }
                 Some(msg)
@@ -148,7 +271,6 @@ mod kind {
     pub const AGENT_SWITCHED: &str = "agent-switched";
     pub const MODEL_SWITCHED: &str = "model-switched";
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDetail {
@@ -1242,7 +1364,9 @@ fn memory_tool_for_file(file_name: &str) -> &'static str {
     }
 }
 
-fn split_memory_frontmatter(raw: &str) -> (Option<std::collections::HashMap<String, String>>, String) {
+fn split_memory_frontmatter(
+    raw: &str,
+) -> (Option<std::collections::HashMap<String, String>>, String) {
     let trimmed = raw.trim_start_matches('\u{feff}');
     if !trimmed.starts_with("---") {
         return (None, raw.to_string());
@@ -1269,7 +1393,11 @@ fn split_memory_frontmatter(raw: &str) -> (Option<std::collections::HashMap<Stri
         }
         if let Some((key, value)) = key_value.split_once(':') {
             let key = key.trim().to_string();
-            let value = value.trim().trim_matches('"').trim_matches('\'').to_string();
+            let value = value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
             if !value.is_empty() {
                 map.insert(key, value);
             }
@@ -1338,6 +1466,7 @@ fn parse_doc_file(path: &Path, source: &str) -> Result<SessionDetail, Box<dyn Er
         timestamp: updated_at,
         kind: kind.to_string(),
         tool_use_id: None,
+        exit_code: None,
     }];
     Ok(SessionDetail { session, messages })
 }
@@ -1431,7 +1560,12 @@ fn derive_memory_project_label(path: &Path) -> String {
                 let is_tool_dot = tool_dir
                     .file_name()
                     .and_then(|s| s.to_str())
-                    .map(|n| matches!(n, ".claude" | ".codex" | ".gemini" | ".opencode" | ".agents"))
+                    .map(|n| {
+                        matches!(
+                            n,
+                            ".claude" | ".codex" | ".gemini" | ".opencode" | ".agents"
+                        )
+                    })
                     .unwrap_or(false);
                 if is_tool_dot {
                     if let Some(cwd) = tool_dir.parent() {
@@ -1948,8 +2082,7 @@ fn parse_gemini_session_file(
                 .or_else(|| Some(fallback.clone()));
         }
         if conversation.last_updated.is_none() {
-            conversation.last_updated =
-                conversation.start_time.clone().or(Some(fallback));
+            conversation.last_updated = conversation.start_time.clone().or(Some(fallback));
         }
     }
 
@@ -2216,6 +2349,12 @@ fn strip_unsafe_characters(message: &str) -> String {
 fn gemini_messages_from_values(values: &[Value]) -> Vec<SessionMessage> {
     let mut messages = Vec::new();
     for value in values {
+        // Gemini's `thoughts` array (rendered by the TUI's `ThinkingMessage`
+        // at .audit-sources/gemini-cli/packages/cli/src/ui/components/messages/ThinkingMessage.tsx)
+        // is sibling to `content`. We surface each thought as a separate
+        // reasoning message using the shared italic-blockquote format so
+        // Claude / Codex / OpenCode / Gemini all use the same convention.
+        messages.extend(gemini_thought_messages_from_value(value));
         if let Some(message) = gemini_message_from_value(value) {
             messages.push(message);
         }
@@ -2224,6 +2363,73 @@ fn gemini_messages_from_values(values: &[Value]) -> Vec<SessionMessage> {
         }
     }
     messages
+}
+
+/// Extract Gemini thought entries (`thoughts: [{subject, description, ...}]`)
+/// and emit each as a reasoning SessionMessage. Mirrors
+/// `normalizeThoughtLines` in
+/// `.audit-sources/gemini-cli/packages/cli/src/ui/components/messages/ThinkingMessage.tsx:22`
+/// — subject + description joined, noise lines (whitespace / `...` runs)
+/// filtered out.
+fn gemini_thought_messages_from_value(value: &Value) -> Vec<SessionMessage> {
+    let Some(thoughts) = value.get("thoughts").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let parent_ts = value
+        .get("timestamp")
+        .and_then(value_to_string)
+        .and_then(normalize_time);
+    let mut out = Vec::new();
+    for thought in thoughts {
+        let subject = thought
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let description = thought
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let is_noise = |line: &str| {
+            let trimmed = line.trim();
+            trimmed.is_empty() || trimmed.chars().all(|c| c == '.')
+        };
+        let mut lines: Vec<&str> = Vec::new();
+        if !subject.is_empty() && !is_noise(subject) {
+            lines.push(subject);
+        }
+        if !description.is_empty() {
+            lines.extend(
+                description
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !is_noise(line)),
+            );
+        }
+        if lines.is_empty() {
+            continue;
+        }
+        let joined = lines.join("\n");
+        let formatted = format_reasoning_body(&joined);
+        if formatted.is_empty() {
+            continue;
+        }
+        let ts = thought
+            .get("timestamp")
+            .and_then(value_to_string)
+            .and_then(normalize_time)
+            .or_else(|| parent_ts.clone());
+        out.push(SessionMessage {
+            role: "assistant".to_string(),
+            text: formatted,
+            timestamp: ts,
+            kind: kind::REASONING.to_string(),
+            tool_use_id: None,
+            exit_code: None,
+        });
+    }
+    out
 }
 
 fn gemini_message_from_value(value: &Value) -> Option<SessionMessage> {
@@ -2251,6 +2457,7 @@ fn gemini_message_from_value(value: &Value) -> Option<SessionMessage> {
         timestamp,
         kind: kind::TEXT.to_string(),
         tool_use_id: None,
+        exit_code: None,
     })
 }
 
@@ -2303,6 +2510,7 @@ fn gemini_tool_messages_from_value(value: &Value) -> Vec<SessionMessage> {
                 timestamp: timestamp.clone(),
                 kind: kind::TOOL_USE.to_string(),
                 tool_use_id: None,
+                exit_code: None,
             })
         })
         .collect()
@@ -2339,50 +2547,99 @@ fn gemini_part_to_string(value: &Value) -> Option<String> {
     if let Some(thought) = value.get("thought").and_then(value_to_string) {
         return Some(format!("[Thought: {thought}]"));
     }
-    if value.get("codeExecutionResult").is_some() {
-        return Some("[Code Execution Result]".to_string());
+    // `executableCode` ({code, language}) is the model's "I will run this
+    // code" announcement; render as a fenced block so it's visible
+    // (matches Gemini TUI's `ExecutableCodeRenderer`, which displays code
+    // in a syntax-highlighted block).
+    if let Some(exec) = value.get("executableCode") {
+        let code = exec.get("code").and_then(Value::as_str).unwrap_or("");
+        let lang = exec
+            .get("language")
+            .and_then(Value::as_str)
+            .map(|s| s.to_lowercase())
+            .filter(|s| !s.is_empty());
+        if !code.trim().is_empty() {
+            return Some(match lang {
+                Some(l) => format!("```{l}\n{}\n```", code.trim_end()),
+                None => format!("```\n{}\n```", code.trim_end()),
+            });
+        }
     }
-    if value.get("executableCode").is_some() {
-        return Some("[Executable Code]".to_string());
+    // `codeExecutionResult` ({outcome, output}) is the result of running
+    // executable code. Show the output in a fenced block + outcome label
+    // (e.g., `OUTCOME_OK` / `OUTCOME_FAILED`).
+    if let Some(result) = value.get("codeExecutionResult") {
+        let output = result
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim_end();
+        let outcome = result.get("outcome").and_then(Value::as_str).unwrap_or("");
+        if !output.is_empty() || !outcome.is_empty() {
+            let mut text = String::new();
+            if !output.is_empty() {
+                text.push_str("````\n");
+                text.push_str(output);
+                text.push_str("\n````");
+            }
+            if !outcome.is_empty() && outcome != "OUTCOME_OK" {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&format!("*Outcome: {outcome}*"));
+            }
+            return Some(text);
+        }
+    }
+    // `inlineData` ({mimeType, data}) carries base64 binary content
+    // (images / audio). We can't show it in markdown but we should
+    // signal what was attached.
+    if let Some(inline) = value.get("inlineData") {
+        let mime = inline
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream");
+        return Some(format!("*Inline data ({mime})*"));
     }
     if value.get("fileData").is_some() {
-        return Some("[File Data]".to_string());
+        let uri = value
+            .get("fileData")
+            .and_then(|f| f.get("fileUri"))
+            .and_then(Value::as_str);
+        return Some(match uri {
+            Some(u) => format!("*File: {u}*"),
+            None => "[File Data]".to_string(),
+        });
     }
+    // `functionCall` / `functionResponse` in PARTS (sibling to `text`)
+    // are inline markers of the assistant invoking a tool. The structured
+    // ToolCall/ToolResponse cards arrive separately via `toolCalls` and
+    // are rendered by `gemini_tool_messages_from_value`. The PART version
+    // here just signals "a tool call happened" without duplicating the
+    // full body.
     if let Some(call) = value.get("functionCall") {
         let name = call
             .get("name")
             .and_then(value_to_string)
             .unwrap_or_default();
-        return Some(format!("[Function Call: {name}]"));
+        let display = if name.is_empty() {
+            "*Tool call*".to_string()
+        } else {
+            format!("*Tool call: {name}*")
+        };
+        return Some(display);
     }
     if let Some(response) = value.get("functionResponse") {
         let name = response
             .get("name")
             .and_then(value_to_string)
             .unwrap_or_default();
-        return Some(format!("[Function Response: {name}]"));
-    }
-    if let Some(inline) = value.get("inlineData") {
-        let mime = inline
-            .get("mimeType")
-            .and_then(value_to_string)
-            .unwrap_or_else(|| "unknown".to_string());
-        let data = inline
-            .get("data")
-            .and_then(value_to_string)
-            .unwrap_or_default();
-        let bytes = (data.len() * 3).div_ceil(4);
-        let kb = bytes as f64 / 1024.0;
-        let category = if mime.starts_with("audio/") {
-            "Audio"
-        } else if mime.starts_with("video/") {
-            "Video"
-        } else if mime.starts_with("image/") {
-            "Image"
+        let display = if name.is_empty() {
+            "*Tool response*".to_string()
         } else {
-            "Media"
+            format!("*Tool response: {name}*")
         };
-        return Some(format!("[{category}: {mime}, {kb:.1} KB]"));
+        return Some(display);
     }
     None
 }
@@ -2618,7 +2875,11 @@ fn read_opencode_db_messages(
     )?;
     let message_rows: Vec<(String, i64, String)> = stmt
         .query_map([session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?
         .collect::<Result<_, _>>()?;
 
@@ -2675,6 +2936,7 @@ fn read_opencode_db_messages(
                         timestamp: timestamp.clone(),
                         kind: kind::TEXT.to_string(),
                         tool_use_id: None,
+                        exit_code: None,
                     });
                 }
                 "reasoning" => {
@@ -2682,16 +2944,17 @@ fn read_opencode_db_messages(
                         continue;
                     };
                     let cleaned = text.replace("[REDACTED]", "");
-                    let cleaned = cleaned.trim();
-                    if cleaned.is_empty() {
+                    let formatted = format_reasoning_body(&cleaned);
+                    if formatted.is_empty() {
                         continue;
                     }
                     out.push(SessionMessage {
                         role: "assistant".to_string(),
-                        text: format!("_Thinking:_ {cleaned}"),
+                        text: formatted,
                         timestamp: timestamp.clone(),
                         kind: kind::REASONING.to_string(),
                         tool_use_id: None,
+                        exit_code: None,
                     });
                 }
                 "tool" => {
@@ -2704,6 +2967,7 @@ fn read_opencode_db_messages(
                         timestamp: timestamp.clone(),
                         kind: kind::TOOL_USE.to_string(),
                         tool_use_id: part.get("callID").and_then(value_to_string),
+                        exit_code: None,
                     });
                 }
                 _ => {}
@@ -2767,6 +3031,7 @@ fn opencode_v2_message_from_value(value: &Value, created: i64) -> Option<Session
                 timestamp,
                 kind: kind::TEXT.to_string(),
                 tool_use_id: None,
+                exit_code: None,
             }),
         "assistant" => opencode_v2_assistant_text(value).map(|text| SessionMessage {
             role: "assistant".to_string(),
@@ -2774,6 +3039,7 @@ fn opencode_v2_message_from_value(value: &Value, created: i64) -> Option<Session
             timestamp,
             kind: kind::TEXT.to_string(),
             tool_use_id: None,
+            exit_code: None,
         }),
         "shell" => {
             let command = value.get("command").and_then(value_to_string)?;
@@ -2790,6 +3056,7 @@ fn opencode_v2_message_from_value(value: &Value, created: i64) -> Option<Session
                 timestamp,
                 kind: kind::SHELL.to_string(),
                 tool_use_id: None,
+                exit_code: None,
             })
         }
         "compaction" => value
@@ -2801,17 +3068,21 @@ fn opencode_v2_message_from_value(value: &Value, created: i64) -> Option<Session
                 timestamp,
                 kind: kind::COMPACTION.to_string(),
                 tool_use_id: None,
+                exit_code: None,
             }),
-        "agent-switched" => value
-            .get("agent")
-            .and_then(value_to_string)
-            .map(|agent| SessionMessage {
-                role: "system".to_string(),
-                text: format!("Switched agent to {}", title_case(&agent)),
-                timestamp,
-                kind: kind::AGENT_SWITCHED.to_string(),
-                tool_use_id: None,
-            }),
+        "agent-switched" => {
+            value
+                .get("agent")
+                .and_then(value_to_string)
+                .map(|agent| SessionMessage {
+                    role: "system".to_string(),
+                    text: format!("Switched agent to {}", title_case(&agent)),
+                    timestamp,
+                    kind: kind::AGENT_SWITCHED.to_string(),
+                    tool_use_id: None,
+                    exit_code: None,
+                })
+        }
         "model-switched" => value.get("model").map(|model| {
             let provider = model
                 .get("providerID")
@@ -2835,6 +3106,7 @@ fn opencode_v2_message_from_value(value: &Value, created: i64) -> Option<Session
                 timestamp,
                 kind: kind::MODEL_SWITCHED.to_string(),
                 tool_use_id: None,
+                exit_code: None,
             }
         }),
         _ => None,
@@ -2861,7 +3133,8 @@ fn opencode_v2_assistant_part_text(part: &Value) -> Option<String> {
         "reasoning" => part
             .get("text")
             .and_then(value_to_string)
-            .map(|text| format!("_Thinking:_ {}", text.replace("[REDACTED]", "").trim())),
+            .map(|text| format_reasoning_body(&text.replace("[REDACTED]", "")))
+            .filter(|s| !s.is_empty()),
         "tool" => opencode_v2_tool_part_text(part),
         _ => None,
     }
@@ -3121,7 +3394,9 @@ fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
         let questions = input_record
             .and_then(|r| r.get("questions"))
             .and_then(Value::as_array);
-        let answers = metadata.and_then(|m| m.get("answers")).and_then(Value::as_array);
+        let answers = metadata
+            .and_then(|m| m.get("answers"))
+            .and_then(Value::as_array);
         if let (Some(questions), Some(answers)) = (questions, answers) {
             if !answers.is_empty() {
                 let lines = questions
@@ -3174,10 +3449,7 @@ fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
 
 // Helper functions ported from TUI conventions.
 
-fn opencode_v2_input_other(
-    input: &serde_json::Map<String, Value>,
-    omit: &[&str],
-) -> String {
+fn opencode_v2_input_other(input: &serde_json::Map<String, Value>, omit: &[&str]) -> String {
     let pairs = input
         .iter()
         .filter(|(key, _)| !omit.contains(&key.as_str()))
@@ -3519,6 +3791,7 @@ fn opencode_storage_message_from_value(value: &Value) -> Option<SessionMessage> 
         timestamp,
         kind: kind::TEXT.to_string(),
         tool_use_id: None,
+        exit_code: None,
     })
 }
 
@@ -3610,6 +3883,7 @@ fn claude_message_from_value(value: &Value) -> Vec<SessionMessage> {
                         timestamp: timestamp.clone(),
                         kind: kind::TEXT.to_string(),
                         tool_use_id: None,
+                        exit_code: None,
                     });
                 }
             }
@@ -3629,6 +3903,7 @@ fn claude_message_from_value(value: &Value) -> Vec<SessionMessage> {
                             kind::TOOL_RESULT.to_string()
                         },
                         tool_use_id: tool_result.tool_use_id,
+                        exit_code: None,
                     });
                 }
             }
@@ -3637,7 +3912,27 @@ fn claude_message_from_value(value: &Value) -> Vec<SessionMessage> {
             let Some(content) = value.get("message").and_then(|m| m.get("content")) else {
                 return out;
             };
-            // 1. Plain assistant text.
+            // 1. Extended-thinking blocks render BEFORE the visible text
+            //    (matching `AssistantThinkingMessage`'s `∴ Thinking…`
+            //    indented dim markdown placement in claude-code TUI).
+            //    Format via the shared `format_reasoning_body` helper so
+            //    Claude / Codex / OpenCode all use the same `> *content*`
+            //    italic-blockquote convention.
+            for thinking in claude_thinking_blocks(content) {
+                let formatted = format_reasoning_body(&thinking);
+                if formatted.is_empty() {
+                    continue;
+                }
+                out.push(SessionMessage {
+                    role: "assistant".to_string(),
+                    text: formatted,
+                    timestamp: timestamp.clone(),
+                    kind: kind::REASONING.to_string(),
+                    tool_use_id: None,
+                    exit_code: None,
+                });
+            }
+            // 2. Plain assistant text.
             let text = claude_assistant_text_blocks(content).join("\n");
             if !text.trim().is_empty() {
                 if let Some(display) = claude_display_text(&text) {
@@ -3647,10 +3942,11 @@ fn claude_message_from_value(value: &Value) -> Vec<SessionMessage> {
                         timestamp: timestamp.clone(),
                         kind: kind::TEXT.to_string(),
                         tool_use_id: None,
+                        exit_code: None,
                     });
                 }
             }
-            // 2. Tool use blocks — emitted as separate tool messages, each
+            // 3. Tool use blocks — emitted as separate tool messages, each
             //    labeled with the canonical TUI tool name (Bash/Update/Read/...).
             //    The tool_use.id is preserved so the eventual tool_result can
             //    be paired up and merged into this card.
@@ -3661,6 +3957,7 @@ fn claude_message_from_value(value: &Value) -> Vec<SessionMessage> {
                     timestamp: timestamp.clone(),
                     kind: kind::TOOL_USE.to_string(),
                     tool_use_id: tool_use.id,
+                    exit_code: None,
                 });
             }
         }
@@ -3673,6 +3970,7 @@ fn claude_message_from_value(value: &Value) -> Vec<SessionMessage> {
                         timestamp,
                         kind: kind::LOCAL_COMMAND.to_string(),
                         tool_use_id: None,
+                        exit_code: None,
                     });
                 }
             }
@@ -3716,7 +4014,10 @@ fn claude_tool_results(content: &Value) -> Vec<ClaudeToolResult> {
             }
             Some(ClaudeToolResult {
                 text,
-                is_error: item.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                is_error: item
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 tool_use_id: item.get("tool_use_id").and_then(value_to_string),
             })
         })
@@ -3736,7 +4037,10 @@ fn claude_tool_uses(content: &Value) -> Vec<ClaudeToolUse> {
         .iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("tool_use"))
         .filter_map(|item| {
-            let name = item.get("name").and_then(value_to_string).unwrap_or_default();
+            let name = item
+                .get("name")
+                .and_then(value_to_string)
+                .unwrap_or_default();
             if name.is_empty() {
                 return None;
             }
@@ -3770,21 +4074,29 @@ fn claude_tool_use_text(name: &str, input: &Value) -> String {
     let lower = name.to_ascii_lowercase();
     let obj = input.as_object();
     let get = |key: &str| obj.and_then(|o| o.get(key)).and_then(value_to_string);
+    // All dynamic arguments (commands, paths, URLs, patterns) are wrapped
+    // with `wrap_inline_code` so any markdown special characters inside the
+    // user payload (backticks, `*`, `_`, `()`) don't leak into the rendered
+    // output. The TUI version (Claude Code Ink) doesn't need this because
+    // it bypasses markdown entirely.
     match lower.as_str() {
         "bash" => {
             let command = get("command").unwrap_or_default();
             if command.is_empty() {
                 "**Bash**".to_string()
             } else {
-                format!("**Bash**({command})")
+                format!("**Bash**({})", wrap_inline_code(&command))
             }
         }
         "read" | "view" => {
             let path = get("file_path").unwrap_or_default();
+            if path.is_empty() {
+                return "**Read**".to_string();
+            }
             let pages = get("pages");
             let offset = get("offset");
             let limit = get("limit");
-            let mut text = format!("**Read**({path}");
+            let mut text = format!("**Read**({}", wrap_inline_code(&path));
             if let Some(p) = pages {
                 text.push_str(&format!(" · pages {p}"));
             } else if let Some(off) = offset.as_deref() {
@@ -3800,43 +4112,76 @@ fn claude_tool_use_text(name: &str, input: &Value) -> String {
         }
         "write" => {
             let path = get("file_path").unwrap_or_default();
-            format!("**Write**({path})")
+            if path.is_empty() {
+                "**Write**".to_string()
+            } else {
+                format!("**Write**({})", wrap_inline_code(&path))
+            }
         }
         "edit" | "multiedit" | "str_replace" | "str_replace_editor" => {
             let path = get("file_path").unwrap_or_default();
-            format!("**Update**({path})")
+            if path.is_empty() {
+                "**Update**".to_string()
+            } else {
+                format!("**Update**({})", wrap_inline_code(&path))
+            }
         }
         "grep" => {
             let pattern = get("pattern").unwrap_or_default();
-            let mut parts = vec![format!("pattern: \"{pattern}\"")];
+            if pattern.is_empty() && get("path").is_none() {
+                return "**Search**".to_string();
+            }
+            let mut parts: Vec<String> = Vec::new();
+            if !pattern.is_empty() {
+                parts.push(format!("pattern: {}", wrap_inline_code(&pattern)));
+            }
             if let Some(path) = get("path") {
-                parts.push(format!("path: \"{path}\""));
+                parts.push(format!("path: {}", wrap_inline_code(&path)));
             }
             format!("**Search**({})", parts.join(", "))
         }
         "glob" => {
             let pattern = get("pattern").unwrap_or_default();
             let path = get("path");
-            match path {
-                Some(p) => format!("**Search**(pattern: \"{pattern}\", path: \"{p}\")"),
-                None => format!("**Search**(pattern: \"{pattern}\")"),
+            match (pattern.is_empty(), path.as_deref()) {
+                (true, None) => "**Search**".to_string(),
+                (false, Some(p)) => format!(
+                    "**Search**(pattern: {}, path: {})",
+                    wrap_inline_code(&pattern),
+                    wrap_inline_code(p)
+                ),
+                (false, None) => format!("**Search**(pattern: {})", wrap_inline_code(&pattern)),
+                (true, Some(p)) => format!("**Search**(path: {})", wrap_inline_code(p)),
             }
         }
         "task" => {
             let description = get("description").unwrap_or_default();
             let agent = get("subagent_type");
-            match agent {
-                Some(a) => format!("**Task**({description}, agent: {a})"),
-                None => format!("**Task**({description})"),
+            if description.is_empty() && agent.is_none() {
+                return "**Task**".to_string();
+            }
+            match (description.is_empty(), agent) {
+                (false, Some(a)) => format!("**Task**({description}, agent: {a})"),
+                (false, None) => format!("**Task**({description})"),
+                (true, Some(a)) => format!("**Task**(agent: {a})"),
+                (true, None) => "**Task**".to_string(),
             }
         }
         "websearch" | "web_search" => {
             let query = get("query").unwrap_or_default();
-            format!("**Web Search**(\"{query}\")")
+            if query.is_empty() {
+                "**Web Search**".to_string()
+            } else {
+                format!("**Web Search**({})", wrap_inline_code(&query))
+            }
         }
         "webfetch" | "web_fetch" => {
             let url = get("url").unwrap_or_default();
-            format!("**Fetch**({url})")
+            if url.is_empty() {
+                "**Fetch**".to_string()
+            } else {
+                format!("**Fetch**({})", wrap_inline_code(&url))
+            }
         }
         "todowrite" | "todo_write" => {
             let body = input
@@ -3868,8 +4213,82 @@ fn claude_tool_use_text(name: &str, input: &Value) -> String {
                 format!("**TodoWrite**\n\n{body}")
             }
         }
+        // NotebookEditTool/NotebookEditTool.ts userFacingName → "Edit Notebook".
+        // Renders `**Edit Notebook**({notebook_path})`.
+        "notebookedit" | "notebook_edit" => {
+            let path = get("notebook_path")
+                .or_else(|| get("file_path"))
+                .unwrap_or_default();
+            if path.is_empty() {
+                "**Edit Notebook**".to_string()
+            } else {
+                format!("**Edit Notebook**({})", wrap_inline_code(&path))
+            }
+        }
+        // ExitPlanModeTool/ExitPlanModeV2Tool.ts userFacingName → ''. The
+        // TUI suppresses the call header and only renders the result
+        // (plan content) via renderToolResultMessage. In markdown we keep
+        // a minimal `**Exit Plan Mode**` marker so the call is visible in
+        // the transcript; the plan body arrives as the matched
+        // tool_result and is appended by merge_tool_outputs.
+        "exitplanmode" | "exit_plan_mode" => "**Exit Plan Mode**".to_string(),
+        "enterplanmode" | "enter_plan_mode" => "**Enter Plan Mode**".to_string(),
+        // AskUserQuestionTool userFacingName → ''. TUI presents a
+        // multiple-choice dialog. In markdown we surface the first
+        // question text (or count when multiple).
+        "askuserquestion" | "ask_user_question" => {
+            let questions = input.get("questions").and_then(Value::as_array);
+            match questions {
+                Some(qs) if !qs.is_empty() => {
+                    if qs.len() == 1 {
+                        let q = qs[0].get("question").and_then(Value::as_str).unwrap_or("");
+                        format!("**Ask** {}", wrap_inline_code(q))
+                    } else {
+                        format!("**Ask** ({} questions)", qs.len())
+                    }
+                }
+                _ => "**Ask**".to_string(),
+            }
+        }
+        // ReadMcpResourceTool/UI.tsx userFacingName → 'readMcpResource'.
+        "readmcpresource" | "read_mcp_resource" => {
+            let uri = get("uri").or_else(|| get("url")).unwrap_or_default();
+            if uri.is_empty() {
+                "**Read MCP Resource**".to_string()
+            } else {
+                format!("**Read MCP Resource**({})", wrap_inline_code(&uri))
+            }
+        }
+        // ListMcpResourcesTool userFacingName → 'listMcpResources'.
+        "listmcpresources" | "list_mcp_resources" => {
+            let server = get("server").unwrap_or_default();
+            if server.is_empty() {
+                "**List MCP Resources**".to_string()
+            } else {
+                format!("**List MCP Resources**({})", wrap_inline_code(&server))
+            }
+        }
+        // McpAuthTool userFacingName → '{server} - authenticate (MCP)'.
+        "mcpauth" | "mcp_auth" => {
+            let server = get("server").unwrap_or_default();
+            if server.is_empty() {
+                "**MCP Auth**".to_string()
+            } else {
+                format!("**MCP Auth** {}", wrap_inline_code(&server))
+            }
+        }
         _ => {
-            // Unknown / MCP tool: bold raw name + compact JSON args.
+            // MCP tools follow the canonical name pattern
+            // `mcp__{server}__{tool}` (Claude Code's MCP client
+            // strips the prefix in display). Surface them as
+            // `**MCP** {server}/{tool}` so they look the same as
+            // the Codex `EventMsg::McpToolCallEnd` rendering.
+            if let Some(rest) = name.strip_prefix("mcp__") {
+                if let Some((server, tool)) = rest.split_once("__") {
+                    return format!("**MCP** {server}/{tool}");
+                }
+            }
+            // Otherwise: bold raw name + compact JSON args.
             let json = serde_json::to_string(input).unwrap_or_default();
             if json == "null" || json == "{}" {
                 format!("**{name}**")
@@ -3885,15 +4304,40 @@ fn claude_text_blocks(value: &Value) -> Vec<String> {
         Value::String(text) => vec![text.clone()],
         Value::Array(items) => items
             .iter()
-            .filter_map(|item| {
-                if item.get("type").and_then(Value::as_str) == Some("text") {
-                    item.get("text").and_then(value_to_string)
-                } else {
-                    None
-                }
+            .filter_map(|item| match item.get("type").and_then(Value::as_str)? {
+                "text" => item.get("text").and_then(value_to_string),
+                // Anthropic image content blocks
+                // (`{"type":"image","source":{"type":"base64"|"url",...}}`):
+                // surface as an italic notice with the mime type / URL so
+                // the transcript shows that an image was attached. The
+                // base64 payload is too large to render inline.
+                "image" => Some(claude_image_part_label(item.get("source")?)),
+                _ => None,
             })
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+fn claude_image_part_label(source: &Value) -> String {
+    let kind = source.get("type").and_then(Value::as_str).unwrap_or("");
+    match kind {
+        "base64" => {
+            let mime = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream");
+            format!("*Image ({mime})*")
+        }
+        "url" => {
+            let url = source.get("url").and_then(Value::as_str).unwrap_or("");
+            if url.is_empty() {
+                "*Image*".to_string()
+            } else {
+                format!("*Image: {url}*")
+            }
+        }
+        _ => "*Image*".to_string(),
     }
 }
 
@@ -3914,6 +4358,26 @@ fn claude_assistant_text_blocks(value: &Value) -> Vec<String> {
     }
 }
 
+/// Extract Claude extended-thinking blocks
+/// (`{"type":"thinking","thinking":"..."}` and `redacted_thinking`).
+/// Claude Code's TUI renders these via `AssistantThinkingMessage` as
+/// `∴ Thinking…` + dim markdown body. We surface them as separate
+/// reasoning messages (italic blockquote via `format_reasoning_body`)
+/// instead of dropping the content.
+fn claude_thinking_blocks(value: &Value) -> Vec<String> {
+    let Value::Array(items) = value else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| match item.get("type").and_then(Value::as_str)? {
+            "thinking" => item.get("thinking").and_then(value_to_string),
+            "redacted_thinking" => Some("[redacted thinking]".to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn claude_user_content_is_tool_result_only(value: &Value) -> bool {
     let Some(items) = value.as_array() else {
         return false;
@@ -3925,6 +4389,29 @@ fn claude_user_content_is_tool_result_only(value: &Value) -> bool {
 }
 
 fn claude_display_text(text: &str) -> Option<String> {
+    // Claude's internal `<tool_use_error>...</tool_use_error>` wrapper is
+    // not meaningful to humans — it's an Anthropic-internal marker. Strip
+    // it to show just the inner error message.
+    if let Some(inner) = extract_xml_tag_value(text, "tool_use_error") {
+        let trimmed = inner.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    // Background-task notifications (`<task-notification>...`) emitted by
+    // LocalShellTask / LocalAgentTask / RemoteAgentTask. Claude Code's
+    // `UserAgentNotificationMessage.tsx` extracts only `<summary>` and
+    // shows it as `⏺ {summary}` (with status-derived color). Termory
+    // emits the same `⏺ {summary}` prefix; the other tags (task-id /
+    // output-file / event / status) are dropped to match Claude TUI.
+    if text.contains("<task-notification>") || text.contains("<task-notification ") {
+        if let Some(summary) = extract_xml_tag_value(text, "summary") {
+            let trimmed = summary.trim();
+            if !trimmed.is_empty() {
+                return Some(format!("{}{trimmed}", status_marker(false)));
+            }
+        }
+    }
     if text.contains("<command-message>") {
         let command_message = extract_xml_tag_value(text, "command-message")?;
         let args = extract_xml_tag_value(text, "command-args");
@@ -3975,19 +4462,46 @@ fn non_empty_xml_value(value: String) -> Option<String> {
 }
 
 fn codex_message_from_value(value: &Value) -> Option<SessionMessage> {
-    if value.get("type").and_then(Value::as_str) != Some("response_item") {
-        return None;
-    }
+    let item_type = value.get("type").and_then(Value::as_str)?;
     let payload = value.get("payload")?;
     let timestamp = value
         .get("timestamp")
         .and_then(value_to_string)
         .and_then(normalize_time);
+
+    // `event_msg` records are what Codex's TUI uses to render replayed sessions
+    // (see `ThreadHistoryBuilder::handle_event` in
+    // codex-rs/app-server-protocol/src/protocol/thread_history.rs). For shell
+    // tool calls Codex pulls raw `aggregated_output` from
+    // `EventMsg::ExecCommandEnd`, NOT from `ResponseItem::FunctionCallOutput`
+    // (which only contains the model-facing `Chunk ID: ...Output: ...` format
+    // and is a no-op during replay).
+    if item_type == "event_msg" {
+        return codex_event_msg_to_message(payload, timestamp);
+    }
+
+    if item_type != "response_item" {
+        return None;
+    }
     let payload_type = payload
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("event");
 
+    // For Codex CLI sessions the default rollout mode is `Limited`
+    // (codex-rs/tui/src/app_server_session.rs: `persist_extended_history:
+    // false`). In Limited mode the `EventMsg::ExecCommandEnd` event is NOT
+    // persisted (see codex-rs/rollout/src/policy.rs:166 — it's
+    // Extended-only). So the only source for shell command + output in
+    // these sessions is `ResponseItem::FunctionCall` +
+    // `ResponseItem::FunctionCallOutput`. We process them here as a
+    // fallback. When a session DOES have `EventMsg::ExecCommandEnd` (the
+    // canonical source — Extended mode), `merge_tool_outputs` will dedupe
+    // by `call_id` and the EventMsg-derived message wins.
+    //
+    // We do skip `Message` and `Reasoning` ResponseItems unconditionally
+    // because their EventMsg counterparts (`UserMessage`, `AgentMessage`,
+    // `AgentReasoning`) are persisted in BOTH modes (policy.rs:137-153).
     if payload_type == "function_call" {
         return codex_function_call_message(payload, timestamp);
     }
@@ -4001,7 +4515,10 @@ fn codex_message_from_value(value: &Value) -> Option<SessionMessage> {
         return codex_plan_message(payload, timestamp);
     }
     if payload_type == "reasoning" {
-        return codex_reasoning_message(payload, timestamp);
+        // Reasoning content is delivered via `EventMsg::AgentReasoning` in
+        // both Limited and Extended modes — skip the ResponseItem variant
+        // to avoid duplicate reasoning cards.
+        return None;
     }
     if let Some(message) = codex_fallback_event_message(payload_type, payload, timestamp.clone()) {
         return Some(message);
@@ -4009,30 +4526,11 @@ fn codex_message_from_value(value: &Value) -> Option<SessionMessage> {
     if payload_type != "message" {
         return None;
     }
-    let role = payload
-        .get("role")
-        .and_then(value_to_string)
-        .unwrap_or_else(|| "assistant".to_string());
-    if role != "user" && role != "assistant" {
-        return None;
-    }
-    let mut text = codex_content_text(payload.get("content")?)?;
-    if role == "user" && is_codex_contextual_user_text(&text) {
-        return None;
-    }
-    if role == "assistant" {
-        text = codex_visible_assistant_markdown(&text);
-        if text.trim().is_empty() {
-            return None;
-        }
-    }
-    Some(SessionMessage {
-        role,
-        text,
-        timestamp,
-        kind: kind::TEXT.to_string(),
-        tool_use_id: None,
-    })
+    // `Message` ResponseItems are also covered by `EventMsg::UserMessage` /
+    // `AgentMessage` in both persistence modes. Skip them to avoid
+    // duplicates. (Hook prompts use a different parser path, not handled
+    // here.)
+    None
 }
 
 fn codex_content_text(value: &Value) -> Option<String> {
@@ -4117,6 +4615,7 @@ fn codex_plan_message(payload: &Value, timestamp: Option<String>) -> Option<Sess
         timestamp,
         kind: kind::PLAN.to_string(),
         tool_use_id: None,
+        exit_code: None,
     })
 }
 
@@ -4153,6 +4652,7 @@ fn codex_reasoning_message(payload: &Value, timestamp: Option<String>) -> Option
         timestamp,
         kind: kind::REASONING.to_string(),
         tool_use_id: None,
+        exit_code: None,
     })
 }
 
@@ -4160,29 +4660,60 @@ fn codex_function_call_message(
     payload: &Value,
     timestamp: Option<String>,
 ) -> Option<SessionMessage> {
-    // Format matches Codex TUI render in
-    //   .audit-sources/codex/codex-rs/tui/src/exec_cell/render.rs
-    // For `shell` calls the TUI shows `$ {command}` (highlighted as bash via
-    // highlight_bash_to_lines). For `apply_patch` the input is rendered as
-    // a unified diff via the diff renderer. For other tools the TUI shows
-    // the function name with its compact arguments.
+    // Each branch produces the unified Termory header markdown — bold verb
+    // + inline-code argument (or a fenced block for content that doesn't
+    // fit on one line). Output, when present, is appended later by
+    // `merge_tool_outputs` in a 4-backtick fence. Codex's official TUI
+    // uses bold verbs (`"Ran"` / `"You ran"`) per exec_cell/render.rs:381.
     let name = payload
         .get("name")
         .and_then(value_to_string)
         .unwrap_or_else(|| "tool".to_string());
     let arguments = payload.get("arguments").and_then(value_to_string);
     let body = match name.as_str() {
-        "shell" | "local_shell_exec" | "local_shell" => {
+        // Codex treats these 4 names as shell-exec calls, per
+        // .audit-sources/codex/codex-rs/rollout-trace/src/tool_dispatch.rs:263:
+        //   `"exec_command" | "local_shell" | "shell" | "shell_command"`
+        // The TUI verb is `"Ran"` (or `"You ran"` for user-initiated shells)
+        // — exec_cell/render.rs:381-385.
+        "exec_command" | "shell" | "shell_command" | "local_shell" => {
             let command = codex_command_from_arguments(arguments.as_deref())
                 .or_else(|| arguments.clone())
                 .unwrap_or_default();
-            format!("```bash\n$ {}\n```", command.trim())
+            format!("**Ran** {}", wrap_inline_code(command.trim()))
         }
         "apply_patch" => {
             let patch = codex_apply_patch_text(arguments.as_deref())
                 .or_else(|| arguments.clone())
                 .unwrap_or_default();
-            format!("```diff\n{}\n```", patch.trim())
+            let header = codex_patch_header(&codex_parse_patch_actions(&patch));
+            format!("{header}\n\n```diff\n{}\n```", patch.trim())
+        }
+        // Codex `update_plan` tool — TUI shows a checkbox-style plan via
+        // PlanUpdateCell (history_cell/plans.rs:138-194 emits `✔` for
+        // completed, `□` for in_progress / pending). We map to GFM task
+        // lists which remark-gfm renders with checkbox UI:
+        //   - [x] completed
+        //   - [~] in_progress  (`[~]` is a common extension marker)
+        //   - [ ] pending
+        "update_plan" => codex_update_plan_message(arguments.as_deref()),
+        // Codex `view_image` tool — TUI shows `• Viewed Image` + indented
+        // path (history_cell/patches.rs:63-72). We map to `**Viewed image**
+        // \`{path}\`` so the path stays monospaced.
+        "view_image" => {
+            let path = arguments
+                .as_deref()
+                .and_then(|args| {
+                    serde_json::from_str::<Value>(args)
+                        .ok()
+                        .and_then(|v| v.get("path").and_then(value_to_string))
+                })
+                .unwrap_or_default();
+            if path.is_empty() {
+                "**Viewed image**".to_string()
+            } else {
+                format!("**Viewed image** {}", wrap_inline_code(&path))
+            }
         }
         _ => {
             // Generic fallback: `{name}({compact args})` as plain text.
@@ -4203,7 +4734,68 @@ fn codex_function_call_message(
         timestamp,
         kind: kind::TOOL_USE.to_string(),
         tool_use_id: payload.get("call_id").and_then(value_to_string),
+        exit_code: None,
     })
+}
+
+/// Build the unified-markdown body for a Codex `update_plan` tool call.
+/// Matches the structure of `PlanUpdateCell.display_lines`:
+///   * `**Updated plan**` header
+///   * optional explanation in italic
+///   * each plan step rendered as a GFM task list entry with status marker
+fn codex_update_plan_message(arguments: Option<&str>) -> String {
+    let mut text = String::from("**Updated plan**");
+    let Some(args) = arguments else {
+        return text;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(args.trim()) else {
+        return text;
+    };
+    if let Some(explanation) = value
+        .get("explanation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        text.push_str("\n\n*");
+        // Escape stray `*` so italic span isn't broken mid-line.
+        for c in explanation.chars() {
+            if c == '*' || c == '_' {
+                text.push('\\');
+            }
+            text.push(c);
+        }
+        text.push('*');
+    }
+    let plan = value.get("plan").and_then(Value::as_array);
+    let Some(items) = plan else {
+        return text;
+    };
+    if items.is_empty() {
+        return text;
+    }
+    text.push_str("\n");
+    for item in items {
+        let step = item
+            .get("step")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if step.is_empty() {
+            continue;
+        }
+        let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+        let marker = match status {
+            "completed" => "- [x]",
+            "in_progress" => "- [~]",
+            _ => "- [ ]",
+        };
+        text.push('\n');
+        text.push_str(marker);
+        text.push(' ');
+        text.push_str(step);
+    }
+    text
 }
 
 fn codex_apply_patch_text(arguments: Option<&str>) -> Option<String> {
@@ -4218,6 +4810,76 @@ fn codex_apply_patch_text(arguments: Option<&str>) -> Option<String> {
         .or_else(|| value.get("patch").and_then(value_to_string))
 }
 
+/// Codex apply_patch verb per file action. Mirrors
+/// `.audit-sources/codex/codex-rs/tui/src/diff_render.rs:421-436` which
+/// picks "Added" / "Deleted" / "Edited" depending on the FileChange
+/// variant. We don't have the structured FileChange in Limited-mode
+/// rollouts, so we scan the patch text for `*** Add File:` /
+/// `*** Delete File:` / `*** Update File:` markers from Codex's
+/// apply_patch grammar.
+#[derive(Debug, PartialEq, Eq)]
+struct CodexPatchAction {
+    verb: &'static str,
+    path: String,
+    move_to: Option<String>,
+}
+
+fn codex_parse_patch_actions(patch_text: &str) -> Vec<CodexPatchAction> {
+    let mut actions: Vec<CodexPatchAction> = Vec::new();
+    let mut lines = patch_text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim_start();
+        let (verb, rest) = if let Some(rest) = trimmed.strip_prefix("*** Add File:") {
+            ("Added", rest)
+        } else if let Some(rest) = trimmed.strip_prefix("*** Delete File:") {
+            ("Deleted", rest)
+        } else if let Some(rest) = trimmed.strip_prefix("*** Update File:") {
+            ("Edited", rest)
+        } else {
+            continue;
+        };
+        let path = rest.trim().to_string();
+        if path.is_empty() {
+            continue;
+        }
+        let mut move_to = None;
+        if verb == "Edited" {
+            if let Some(next) = lines.peek() {
+                if let Some(rest) = next.trim_start().strip_prefix("*** Move to:") {
+                    move_to = Some(rest.trim().to_string());
+                    lines.next();
+                }
+            }
+        }
+        actions.push(CodexPatchAction {
+            verb,
+            path,
+            move_to,
+        });
+    }
+    actions
+}
+
+/// Build the unified-markdown header for an apply_patch call. Matches
+/// Codex's `render_changes_block` (diff_render.rs:415-437):
+///   * single-file patch → `**{Verb}** {path}` (with optional `→ {move_to}`)
+///   * multi-file patch  → `**Edited** {N} files`
+fn codex_patch_header(actions: &[CodexPatchAction]) -> String {
+    if actions.is_empty() {
+        return "**Applied patch**".to_string();
+    }
+    if let [single] = actions {
+        let path_segment = match &single.move_to {
+            Some(target) => format!("{} → {}", single.path, target),
+            None => single.path.clone(),
+        };
+        return format!("**{}** {}", single.verb, path_segment);
+    }
+    let count = actions.len();
+    let noun = if count == 1 { "file" } else { "files" };
+    format!("**Edited** {count} {noun}")
+}
+
 fn codex_function_call_output_message(
     payload: &Value,
     timestamp: Option<String>,
@@ -4226,17 +4888,108 @@ fn codex_function_call_output_message(
         .get("output")
         .and_then(value_to_string)
         .or_else(|| payload.get("content").and_then(value_to_string))?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
+    let extracted = codex_parse_exec_output(&text);
+    if extracted.raw.is_empty() && extracted.exit_code.is_none() {
         return None;
     }
+    let is_error = extracted.exit_code.is_some_and(|code| code != 0);
     Some(SessionMessage {
         role: "tool".to_string(),
-        text: trimmed.to_string(),
+        text: extracted.raw,
         timestamp,
-        kind: kind::TOOL_RESULT.to_string(),
+        kind: if is_error {
+            kind::TOOL_ERROR.to_string()
+        } else {
+            kind::TOOL_RESULT.to_string()
+        },
         tool_use_id: payload.get("call_id").and_then(value_to_string),
+        exit_code: extracted.exit_code,
     })
+}
+
+/// Strip Codex's `ExecCommandToolOutput.response_text()` metadata wrapper.
+/// The wrapper format (codex-rs/core/src/tools/context.rs:409-434) is:
+///
+/// ```text
+/// [Chunk ID: X]
+/// Wall time: X seconds
+/// [Process exited with code X]
+/// [Process running with session ID X]
+/// [Original token count: X]
+/// Output:
+/// {raw command output}
+/// ```
+///
+/// All sections are joined with single `\n`. The metadata is only useful
+/// to the model; Codex's TUI never displays it in the main viewport (it
+/// uses `aggregated_output` directly from `EventMsg::ExecCommandEnd`).
+/// In Limited-mode rollouts the EventMsg is not persisted, so this
+/// wrapper string is our only handle on the raw output.
+///
+/// Detection is line-by-line so we tolerate trailing whitespace on the
+/// `Output:` delimiter and don't depend on an exact `\nOutput:\n`
+/// substring match. Also pulls the exit code out of the metadata lines
+/// (`Process exited with code N` / `Exit code: N`) so the caller can
+/// surface a `**Error**` footer on non-zero exits.
+#[derive(Debug, PartialEq, Eq, Default)]
+struct CodexExecOutput {
+    raw: String,
+    exit_code: Option<i64>,
+}
+
+fn codex_parse_exec_output(text: &str) -> CodexExecOutput {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return CodexExecOutput::default();
+    }
+    let first_line = trimmed.lines().next().unwrap_or("");
+    let looks_like_exec_wrapper = first_line.starts_with("Chunk ID:")
+        || first_line.starts_with("Wall time:")
+        || first_line.starts_with("Exit code:")
+        || first_line.starts_with("Script ");
+    if !looks_like_exec_wrapper {
+        return CodexExecOutput {
+            raw: trimmed.to_string(),
+            exit_code: None,
+        };
+    }
+    // The wrapper format guarantees a single `Output:` delimiter line
+    // before the actual raw output. Split on it.
+    let mut output_started = false;
+    let mut output_lines: Vec<&str> = Vec::new();
+    let mut exit_code: Option<i64> = None;
+    for line in trimmed.lines() {
+        if output_started {
+            output_lines.push(line);
+            continue;
+        }
+        // Extract exit code from one of the canonical metadata lines.
+        // Codex's context.rs:420 emits `"Process exited with code {N}"`;
+        // the older `unified_exec` format uses `"Exit code: {N}"`.
+        if exit_code.is_none() {
+            let trimmed_line = line.trim_start();
+            if let Some(rest) = trimmed_line.strip_prefix("Process exited with code ") {
+                exit_code = rest.trim().parse().ok();
+            } else if let Some(rest) = trimmed_line.strip_prefix("Exit code:") {
+                exit_code = rest.trim().parse().ok();
+            }
+        }
+        if line.trim_end() == "Output:" {
+            output_started = true;
+        }
+    }
+    if !output_started {
+        // Wrapper-looking content but missing the `Output:` marker
+        // (truncated stream, etc.) — keep the original text and exit code.
+        return CodexExecOutput {
+            raw: trimmed.to_string(),
+            exit_code,
+        };
+    }
+    CodexExecOutput {
+        raw: output_lines.join("\n").trim_end().to_string(),
+        exit_code,
+    }
 }
 
 fn codex_command_execution_message(
@@ -4265,6 +5018,536 @@ fn codex_command_execution_message(
         timestamp,
         kind: kind::COMMAND_EXECUTION.to_string(),
         tool_use_id: None,
+        exit_code: None,
+    })
+}
+
+/// Dispatch by the inner `type` of a Codex `RolloutItem::EventMsg` payload.
+/// Mirrors `ThreadHistoryBuilder::handle_event` (in
+/// codex-rs/app-server-protocol/src/protocol/thread_history.rs:163-225) — the
+/// same reducer Codex's TUI uses to rehydrate replayed sessions.
+fn codex_event_msg_to_message(
+    payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    let event_type = payload.get("type").and_then(Value::as_str)?;
+    match event_type {
+        "user_message" => codex_user_message_event(payload, timestamp),
+        "agent_message" => codex_agent_message_event(payload, timestamp),
+        "agent_reasoning" => codex_agent_reasoning_event(payload, timestamp),
+        // Raw chain-of-thought (`AgentReasoningRawContentEvent`,
+        // protocol.rs:2157). Codex's TUI renders this with the same
+        // `ReasoningSummaryCell` style when `show_raw_agent_reasoning`
+        // is on — and `replay_thread_item` ALSO emits it via
+        // `on_agent_reasoning_delta` (replay.rs:118-121). Termory
+        // surfaces it as a reasoning message using the same italic
+        // blockquote format so it's distinguishable from regular text.
+        "agent_reasoning_raw_content" => codex_agent_reasoning_event(payload, timestamp),
+        "web_search_end" => codex_web_search_end_event(payload, timestamp),
+        "mcp_tool_call_end" => codex_mcp_tool_call_end_event(payload, timestamp),
+        "image_generation_end" => codex_image_generation_end_event(payload, timestamp),
+        // `EventMsg::ViewImageToolCall` ({call_id, path}) — separate from
+        // the `function_call` shape; Codex emits this when the agent
+        // attaches a local image. patches.rs:63-72 renders it as
+        // `• Viewed Image\n  └ {path}`. Map to the same markdown form
+        // we use for the function_call variant for consistency.
+        "view_image_tool_call" => codex_view_image_tool_call_event(payload, timestamp),
+        "plan_update" => codex_plan_update_event(payload, timestamp),
+        // `EventMsg::PatchApplyEnd` (Extended-mode rollouts only) carries
+        // the structured `changes: HashMap<PathBuf, FileChange>` map and a
+        // `success: bool`. Codex's TUI renders this via PatchHistoryCell
+        // → `create_diff_summary` (per-file colored summary). We approximate
+        // by listing each file with its verb (Added/Deleted/Edited) and
+        // marking the apply as failed when `success: false`.
+        "patch_apply_end" => codex_patch_apply_end_event(payload, timestamp),
+        "context_compacted" => codex_context_compacted_event(payload, timestamp),
+        // Lifecycle notices — Codex's TUI emits these as small one-line
+        // info cards. Termory surfaces them as plain text so the
+        // transcript carries the signal but they don't masquerade as
+        // tool messages.
+        "error" => codex_error_event(payload, timestamp),
+        "turn_aborted" => codex_turn_aborted_event(payload, timestamp),
+        "thread_rolled_back" => codex_thread_rolled_back_event(payload, timestamp),
+        "entered_review_mode" => codex_entered_review_mode_event(payload, timestamp),
+        "exited_review_mode" => codex_exited_review_mode_event(payload, timestamp),
+        // `exec_command_end` is intentionally NOT handled yet. In Extended
+        // mode it would supply better data than the ResponseItem path
+        // (raw `aggregated_output` instead of `Chunk ID:...Output:...`),
+        // but in Limited mode (the CLI default) it's simply not persisted,
+        // so the ResponseItem path is authoritative. Mixing the two
+        // currently produces duplicate tool cards for Extended-mode
+        // sessions. Handle when we add proper call_id-based deduplication.
+        _ => None,
+    }
+}
+
+/// `EventMsg::WebSearchEnd` — Codex renders this via WebSearchCell with a
+/// `Searched ...` header showing the query (or the structured action).
+/// Unified-markdown form: `**Searched** "{query}"`.
+fn codex_web_search_end_event(
+    payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    let query = payload
+        .get("query")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())?;
+    Some(SessionMessage {
+        role: "tool".to_string(),
+        text: format!("**Searched** {}", wrap_inline_code(query)),
+        timestamp,
+        kind: kind::TOOL_USE.to_string(),
+        tool_use_id: payload.get("call_id").and_then(value_to_string),
+        exit_code: None,
+    })
+}
+
+/// `EventMsg::McpToolCallEnd` — Codex renders via McpToolCallCell. The
+/// invocation has `server`/`tool`/`arguments`; the result is either the
+/// successful CallToolResult or an error string. Unified-markdown form:
+/// `**MCP** {server}/{tool}` + result body (4-backtick fence) + optional
+/// `**Error**` footer (added by merge_tool_outputs when kind=tool_error).
+fn codex_mcp_tool_call_end_event(
+    payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    let invocation = payload.get("invocation")?;
+    let server = invocation
+        .get("server")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let tool = invocation.get("tool").and_then(Value::as_str).unwrap_or("");
+    if server.is_empty() && tool.is_empty() {
+        return None;
+    }
+    let header = format!("**MCP** {server}/{tool}");
+    // `result` is either `{"Ok": CallToolResult}` or `{"Err": "..."}`
+    // (Rust `Result` serialization). Inspect both arms.
+    let result = payload.get("result");
+    let (body, is_error) = match result {
+        Some(r) if r.get("Err").is_some() => {
+            let err = r.get("Err").and_then(Value::as_str).unwrap_or("");
+            (err.to_string(), true)
+        }
+        Some(r) if r.get("Ok").is_some() => {
+            let ok = r.get("Ok").expect("Ok arm");
+            let is_err = ok.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+            let content_text = mcp_call_tool_result_text(ok);
+            (content_text, is_err)
+        }
+        _ => (String::new(), false),
+    };
+    let trimmed = body.trim();
+    let mut text = header;
+    if !trimmed.is_empty() {
+        text.push_str("\n\n````\n");
+        text.push_str(trimmed);
+        text.push_str("\n````");
+    }
+    Some(SessionMessage {
+        role: "tool".to_string(),
+        text,
+        timestamp,
+        kind: if is_error {
+            kind::TOOL_ERROR.to_string()
+        } else {
+            kind::TOOL_RESULT.to_string()
+        },
+        tool_use_id: payload.get("call_id").and_then(value_to_string),
+        exit_code: None,
+    })
+}
+
+/// Extract human-readable text from an MCP `CallToolResult`. Joins all
+/// `content[].text` entries with newlines; image / resource items are
+/// skipped because they aren't representable in plain markdown.
+fn mcp_call_tool_result_text(result: &Value) -> String {
+    let Some(items) = result.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for item in items {
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            parts.push(text.to_string());
+        }
+    }
+    parts.join("\n")
+}
+
+/// `EventMsg::ImageGenerationEnd` — Codex shows "Generated Image:"
+/// with the (optional) revised prompt and saved file URL.
+/// Unified-markdown form: `**Generated image** {revised_prompt}` +
+/// optional `\nSaved: {path}` line.
+fn codex_image_generation_end_event(
+    payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    let revised = payload
+        .get("revised_prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let saved = payload
+        .get("saved_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if revised.is_none() && saved.is_none() {
+        return None;
+    }
+    let mut text = String::from("**Generated image**");
+    if let Some(prompt) = revised {
+        text.push(' ');
+        text.push_str(prompt);
+    }
+    if let Some(path) = saved {
+        text.push_str("\n\nSaved: ");
+        text.push_str(&wrap_inline_code(path));
+    }
+    Some(SessionMessage {
+        role: "tool".to_string(),
+        text,
+        timestamp,
+        kind: kind::TOOL_USE.to_string(),
+        tool_use_id: payload.get("call_id").and_then(value_to_string),
+        exit_code: None,
+    })
+}
+
+/// `EventMsg::ContextCompacted` — Codex shows a brief "Context compacted"
+/// info line in the transcript. Unified-markdown form: italic notice.
+fn codex_context_compacted_event(
+    _payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    Some(SessionMessage {
+        role: "system".to_string(),
+        text: "*Context compacted*".to_string(),
+        timestamp,
+        kind: kind::COMPACTION.to_string(),
+        tool_use_id: None,
+        exit_code: None,
+    })
+}
+
+/// `EventMsg::Error` — Codex renders error notices via the chat widget.
+/// `ErrorEvent.message` is human-readable; we surface it inline as a
+/// `**Error**: {message}` system notice (bold marker + plain message
+/// so the transcript shows what went wrong without losing the body).
+fn codex_error_event(payload: &Value, timestamp: Option<String>) -> Option<SessionMessage> {
+    let message = payload.get("message").and_then(Value::as_str)?;
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(SessionMessage {
+        role: "system".to_string(),
+        text: format!("**Error**: {trimmed}"),
+        timestamp,
+        kind: kind::TEXT.to_string(),
+        tool_use_id: None,
+        exit_code: None,
+    })
+}
+
+/// `EventMsg::TurnAborted` — `reason` is one of `interrupted` / `budget_limited`.
+/// Codex shows this as a small dim notice in the transcript when a turn
+/// stops mid-flight.
+fn codex_turn_aborted_event(payload: &Value, timestamp: Option<String>) -> Option<SessionMessage> {
+    let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("");
+    let text = match reason {
+        "interrupted" => "*Turn interrupted by user*".to_string(),
+        "budget_limited" => "*Turn stopped — budget limit reached*".to_string(),
+        other if !other.is_empty() => format!("*Turn aborted — {other}*"),
+        _ => "*Turn aborted*".to_string(),
+    };
+    Some(SessionMessage {
+        role: "system".to_string(),
+        text,
+        timestamp,
+        kind: kind::TEXT.to_string(),
+        tool_use_id: None,
+        exit_code: None,
+    })
+}
+
+/// `EventMsg::ThreadRolledBack` — Codex shows this when the conversation
+/// has been rolled back N user turns.
+fn codex_thread_rolled_back_event(
+    payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    let dropped = payload
+        .get("dropped_turn_count")
+        .or_else(|| payload.get("count"))
+        .and_then(Value::as_i64);
+    let text = match dropped {
+        Some(1) => "*Rolled back 1 turn*".to_string(),
+        Some(n) if n > 0 => format!("*Rolled back {n} turns*"),
+        _ => "*Conversation rolled back*".to_string(),
+    };
+    Some(SessionMessage {
+        role: "system".to_string(),
+        text,
+        timestamp,
+        kind: kind::TEXT.to_string(),
+        tool_use_id: None,
+        exit_code: None,
+    })
+}
+
+/// `EventMsg::PatchApplyEnd` ({call_id, changes, success, stdout,
+/// stderr}). Renders each FileChange entry as a `**{Verb}** {path}`
+/// line and surfaces stderr inline when `success: false` so failed
+/// patches show why they failed.
+fn codex_patch_apply_end_event(
+    payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    let changes = payload.get("changes").and_then(Value::as_object);
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(changes) = changes {
+        let mut entries: Vec<(&String, &Value)> = changes.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (path, change) in entries {
+            // `FileChange` is `#[serde(tag = "type")]`. The type discriminant
+            // is `add` / `delete` / `update` (snake_case enum).
+            let kind = change.get("type").and_then(Value::as_str).unwrap_or("");
+            let verb = match kind {
+                "add" => "Added",
+                "delete" => "Deleted",
+                "update" => "Edited",
+                _ => "Edited",
+            };
+            let display_path = match (kind, change.get("move_path").and_then(Value::as_str)) {
+                ("update", Some(target)) if !target.is_empty() => {
+                    format!("{path} → {target}")
+                }
+                _ => path.clone(),
+            };
+            lines.push(format!("**{verb}** {display_path}"));
+        }
+    }
+    let success = payload
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut text = if lines.is_empty() {
+        "**Applied patch**".to_string()
+    } else {
+        lines.join("\n")
+    };
+    if !success {
+        let err = payload
+            .get("stderr")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        text.push_str("\n\n");
+        if let Some(e) = err {
+            text.push_str("````\n");
+            text.push_str(e);
+            text.push_str("\n````\n\n");
+        }
+        text.push_str("**Error**");
+    }
+    Some(SessionMessage {
+        role: "tool".to_string(),
+        text,
+        timestamp,
+        kind: if success {
+            kind::TOOL_USE.to_string()
+        } else {
+            kind::TOOL_ERROR.to_string()
+        },
+        tool_use_id: payload.get("call_id").and_then(value_to_string),
+        exit_code: None,
+    })
+}
+
+/// `EventMsg::ViewImageToolCall` — `{call_id, path}` payload. Same
+/// surface as the `function_call::view_image` ResponseItem variant
+/// (codex_function_call_message): `**Viewed image** \`{path}\``.
+fn codex_view_image_tool_call_event(
+    payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    let path = payload.get("path").and_then(Value::as_str)?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(SessionMessage {
+        role: "tool".to_string(),
+        text: format!("**Viewed image** {}", wrap_inline_code(path)),
+        timestamp,
+        kind: kind::TOOL_USE.to_string(),
+        tool_use_id: payload.get("call_id").and_then(value_to_string),
+        exit_code: None,
+    })
+}
+
+/// `EventMsg::PlanUpdate` — the plan EventMsg variant (carries
+/// `UpdatePlanArgs` directly, not nested in `arguments`). Same surface
+/// as the `update_plan` function_call but the payload IS the
+/// UpdatePlanArgs.
+fn codex_plan_update_event(payload: &Value, timestamp: Option<String>) -> Option<SessionMessage> {
+    let args = serde_json::to_string(payload).ok()?;
+    let text = codex_update_plan_message(Some(&args));
+    Some(SessionMessage {
+        role: "tool".to_string(),
+        text,
+        timestamp,
+        kind: kind::PLAN.to_string(),
+        tool_use_id: None,
+        exit_code: None,
+    })
+}
+
+/// `EventMsg::EnteredReviewMode` — start of an automated code review.
+fn codex_entered_review_mode_event(
+    _payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    Some(SessionMessage {
+        role: "system".to_string(),
+        text: "*Entered review mode*".to_string(),
+        timestamp,
+        kind: kind::TEXT.to_string(),
+        tool_use_id: None,
+        exit_code: None,
+    })
+}
+
+/// `EventMsg::ExitedReviewMode` — end of an automated review. The
+/// payload's `review_output` carries the structured findings; we leave
+/// it to a future iteration to render the structured form and only
+/// emit the lifecycle notice here.
+fn codex_exited_review_mode_event(
+    _payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    Some(SessionMessage {
+        role: "system".to_string(),
+        text: "*Exited review mode*".to_string(),
+        timestamp,
+        kind: kind::TEXT.to_string(),
+        tool_use_id: None,
+        exit_code: None,
+    })
+}
+
+fn codex_user_message_event(payload: &Value, timestamp: Option<String>) -> Option<SessionMessage> {
+    let message = payload.get("message").and_then(Value::as_str)?;
+    if message.trim().is_empty() {
+        return None;
+    }
+    // Codex hides specific contextual user fragments from the visible
+    // transcript (environment_context / user_instructions / ...). Apply the
+    // same filter we use for ResponseItem-derived user messages.
+    if is_codex_contextual_user_text(message) {
+        return None;
+    }
+    Some(SessionMessage {
+        role: "user".to_string(),
+        text: message.to_string(),
+        timestamp,
+        kind: kind::TEXT.to_string(),
+        tool_use_id: None,
+        exit_code: None,
+    })
+}
+
+fn codex_agent_message_event(payload: &Value, timestamp: Option<String>) -> Option<SessionMessage> {
+    let message = payload.get("message").and_then(Value::as_str)?;
+    let visible = codex_visible_assistant_markdown(message);
+    if visible.is_empty() {
+        return None;
+    }
+    Some(SessionMessage {
+        role: "assistant".to_string(),
+        text: visible,
+        timestamp,
+        kind: kind::TEXT.to_string(),
+        tool_use_id: None,
+        exit_code: None,
+    })
+}
+
+fn codex_agent_reasoning_event(
+    payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    let text = payload.get("text").and_then(Value::as_str)?;
+    let formatted = format_reasoning_body(text);
+    if formatted.is_empty() {
+        return None;
+    }
+    Some(SessionMessage {
+        role: "assistant".to_string(),
+        text: formatted,
+        timestamp,
+        kind: kind::REASONING.to_string(),
+        tool_use_id: None,
+        exit_code: None,
+    })
+}
+
+/// Build a tool message from `EventMsg::ExecCommandEnd` (the canonical source
+/// for shell-tool replay rendering in Codex). Codex's TUI feeds these to
+/// `ExecCell` and renders:
+///   `$ {command}` (bash-highlighted, magenta `$`)
+///   {aggregated_output}     (dim, `└ ` / `    ` prefixed)
+///   `✓` / `✗ ({exit})` • {duration}
+/// We approximate that in markdown — the raw output is the actual command
+/// output (no `Chunk ID:` / `Wall time:` metadata).
+fn codex_exec_command_end_message(
+    payload: &Value,
+    timestamp: Option<String>,
+) -> Option<SessionMessage> {
+    let command = payload
+        .get("command")
+        .and_then(Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|s| !s.is_empty())?;
+    let aggregated_output = payload
+        .get("aggregated_output")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let exit_code = payload.get("exit_code").and_then(Value::as_i64);
+
+    let mut text = String::new();
+    text.push_str("```bash\n$ ");
+    text.push_str(&command);
+    text.push_str("\n```");
+
+    let output_trimmed = aggregated_output.trim_end();
+    if !output_trimmed.is_empty() {
+        text.push_str("\n\n````\n");
+        text.push_str(output_trimmed);
+        text.push_str("\n````");
+    }
+
+    if let Some(code) = exit_code {
+        text.push_str("\n\n");
+        if code == 0 {
+            text.push('✓');
+        } else {
+            text.push_str(&format!("✗ exit {code}"));
+        }
+    }
+
+    Some(SessionMessage {
+        role: "tool".to_string(),
+        text,
+        timestamp,
+        kind: kind::COMMAND_EXECUTION.to_string(),
+        tool_use_id: payload.get("call_id").and_then(value_to_string),
+        exit_code: None,
     })
 }
 
@@ -4407,6 +5690,7 @@ fn codex_fallback_event_message(
         timestamp,
         kind: payload_type.to_string(),
         tool_use_id: None,
+        exit_code: None,
     })
 }
 
@@ -4608,11 +5892,19 @@ mod tests {
     fn codex_scans_threads_from_state_db_only() {
         let dir = TestDir::new("codex");
         let rollout = dir.path().join("rollout.jsonl");
+        // User and assistant text both come from EventMsg variants in
+        // Codex Limited-mode rollouts (policy.rs:137-153 — UserMessage /
+        // AgentMessage are persisted in Limited mode). The duplicate
+        // ResponseItem::Message records are present but ignored.
         fs::write(
             &rollout,
             r#"{"type":"session_meta","payload":{"id":"thread-1","cwd":"/workspace/project"}}"# .to_string()
                 + "\n"
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"user_message","message":"Review backend changes"}}"#
+                + "\n"
                 + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Review backend changes"}]}}"#
+                + "\n"
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"agent_message","message":"Done"}}"#
                 + "\n"
                 + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"message","role":"assistant","content":[{"text":"Done"}]}}"#,
         )
@@ -4753,15 +6045,33 @@ mod tests {
     fn codex_parses_visible_thread_messages_only() {
         let dir = TestDir::new("codex-messages");
         let path = dir.path().join("rollout.jsonl");
+        // Codex CLI persists rollout in Limited mode by default
+        // (codex-rs/tui/src/app_server_session.rs: `persist_extended_history:
+        // false`). In Limited mode the `EventMsg::ExecCommandEnd` event is
+        // NOT persisted, so shell command + output come only from
+        // `ResponseItem::FunctionCall` + `FunctionCallOutput`. Other
+        // content (user / assistant / reasoning) comes from `EventMsg`
+        // variants in BOTH modes — we prefer those and skip the
+        // duplicate ResponseItem::Message / Reasoning entries.
+        //
+        // The `FunctionCallOutput.output` field carries Codex's
+        // `ExecCommandToolOutput.response_text()` formatted string
+        // (Chunk ID / Wall time / Output: / ...). Termory strips that
+        // wrapper via `codex_extract_raw_command_output` so users see the
+        // same raw command output Codex's TUI does.
         fs::write(
             &path,
             r#"{"type":"session_meta","payload":{"id":"thread-2","cwd":"/workspace/project"}}"#.to_string()
+                + "\n"
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"user_message","message":"Fix the app"}}"#
                 + "\n"
                 + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the app"}]}}"#
                 + "\n"
                 + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:01Z","payload":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"}}"#
                 + "\n"
-                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:02Z","payload":{"type":"function_call_output","call_id":"call_1","output":"src"}}"#
+                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:02Z","payload":{"type":"function_call_output","call_id":"call_1","output":"Chunk ID: 209810\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 1\nOutput:\nsrc"}}"#
+                + "\n"
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:03Z","payload":{"type":"agent_message","message":"Done"}}"#
                 + "\n"
                 + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:03Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#,
         )
@@ -4769,37 +6079,512 @@ mod tests {
 
         let detail = parse_codex_session(&path, "thread-2").unwrap();
         assert_eq!(detail.session.title, "");
-        // function_call + function_call_output merge into one tool card via
-        // matching call_id, so the visible flow is: user → tool → assistant.
+        // Visible flow: user (from event_msg) → tool (merged from
+        // FunctionCall + FunctionCallOutput) → assistant (from
+        // event_msg). The duplicate ResponseItem::Message records are
+        // skipped.
         assert_eq!(detail.messages.len(), 3);
         assert_eq!(detail.messages[0].role, "user");
         assert_eq!(detail.messages[0].text, "Fix the app");
         assert_eq!(detail.messages[1].role, "tool");
-        // Body matches Codex TUI render: shell calls show `$ {command}` in
-        // a bash code block. The merged function_call_output appears in a
-        // 4-backtick fence so its contents (which may include ``` triple
-        // backticks) stay intact.
-        assert_eq!(
-            detail.messages[1].text,
-            "```bash\n$ ls\n```\n\n````\nsrc\n````"
-        );
+        // Unified tool card: `**Ran** \`<cmd>\`` header (Codex's "Ran" verb
+        // from exec_cell/render.rs:381-385) + raw output extracted from the
+        // `Chunk ID:...Output:\nsrc` formatted wrapper (so the metadata
+        // noise is gone, matching Codex TUI which uses aggregated_output).
+        assert_eq!(detail.messages[1].text, "⏺ **Ran** `ls`\n\n````\nsrc\n````");
         assert_eq!(detail.messages[2].role, "assistant");
         assert_eq!(detail.messages[2].text, "Done");
+    }
+
+    #[test]
+    fn codex_view_image_function_call_uses_inline_path() {
+        // function_call name="view_image" → `**Viewed image** \`{path}\``,
+        // matching Codex `new_view_image_tool_call` (patches.rs:63-72)
+        // which renders `• Viewed Image\n  └ {display_path}`.
+        let body = codex_function_call_message(
+            &serde_json::json!({
+                "type": "function_call",
+                "name": "view_image",
+                "arguments": "{\"path\":\"/tmp/shot.png\"}",
+                "call_id": "img_1"
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(body.text, "**Viewed image** `/tmp/shot.png`");
+        assert_eq!(body.kind, kind::TOOL_USE);
+    }
+
+    #[test]
+    fn codex_update_plan_emits_gfm_task_list() {
+        // Arguments shape matches Codex's `UpdatePlanArgs`
+        // (plan_tool::PlanItemArg with snake_case status).
+        let body = codex_update_plan_message(Some(
+            r#"{"explanation":"Sequenced work","plan":[
+                {"step":"Read repo layout","status":"completed"},
+                {"step":"Fix tests","status":"in_progress"},
+                {"step":"Ship release","status":"pending"}
+            ]}"#,
+        ));
+        assert_eq!(
+            body,
+            "**Updated plan**\n\n*Sequenced work*\n\n- [x] Read repo layout\n- [~] Fix tests\n- [ ] Ship release"
+        );
+
+        // No explanation, no steps — bare header.
+        assert_eq!(codex_update_plan_message(Some("{}")), "**Updated plan**");
+    }
+
+    #[test]
+    fn gemini_thoughts_array_emits_reasoning_messages() {
+        // Real Gemini JSONL format: `thoughts: [{subject, description, timestamp}, ...]`
+        // sibling to `content`. Gemini TUI renders each via
+        // `ThinkingMessage`. Termory surfaces them as separate reasoning
+        // messages (italic-blockquote) — same convention as Claude /
+        // Codex / OpenCode.
+        let messages = gemini_thought_messages_from_value(&serde_json::json!({
+            "type": "gemini",
+            "timestamp": "2026-04-30T06:49:18Z",
+            "content": "",
+            "thoughts": [
+                {
+                    "subject": "Examining Workspace State",
+                    "description": "Reviewing git status.\n\nWill check diff next.",
+                    "timestamp": "2026-04-30T06:49:14Z"
+                },
+                {
+                    "subject": "...",
+                    "description": "noise only"
+                }
+            ]
+        }));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].kind, kind::REASONING);
+        assert_eq!(
+            messages[0].text,
+            "> *Examining Workspace State*\n> *Reviewing git status.*\n> *Will check diff next.*"
+        );
+        // Second thought has noise-only subject (`...`) but a real
+        // description — subject is dropped, description rendered.
+        assert_eq!(messages[1].text, "> *noise only*");
+    }
+
+    #[test]
+    fn codex_lifecycle_event_messages_render_inline_notices() {
+        let make = |payload: serde_json::Value| codex_event_msg_to_message(&payload, None).unwrap();
+
+        // Error event — surface the human-readable message.
+        let msg = make(serde_json::json!({
+            "type": "error",
+            "message": "Network timeout"
+        }));
+        assert_eq!(msg.role, "system");
+        assert_eq!(msg.text, "**Error**: Network timeout");
+
+        // TurnAborted with reason=interrupted.
+        let msg = make(serde_json::json!({
+            "type": "turn_aborted",
+            "turn_id": "t1",
+            "reason": "interrupted"
+        }));
+        assert_eq!(msg.text, "*Turn interrupted by user*");
+
+        // TurnAborted with budget reason.
+        let msg = make(serde_json::json!({
+            "type": "turn_aborted",
+            "reason": "budget_limited"
+        }));
+        assert_eq!(msg.text, "*Turn stopped — budget limit reached*");
+
+        // ThreadRolledBack with a count.
+        let msg = make(serde_json::json!({
+            "type": "thread_rolled_back",
+            "dropped_turn_count": 3
+        }));
+        assert_eq!(msg.text, "*Rolled back 3 turns*");
+
+        let msg = make(serde_json::json!({
+            "type": "thread_rolled_back",
+            "dropped_turn_count": 1
+        }));
+        assert_eq!(msg.text, "*Rolled back 1 turn*");
+
+        // Review mode lifecycle.
+        let msg = make(serde_json::json!({"type": "entered_review_mode"}));
+        assert_eq!(msg.text, "*Entered review mode*");
+
+        let msg = make(serde_json::json!({"type": "exited_review_mode"}));
+        assert_eq!(msg.text, "*Exited review mode*");
+    }
+
+    #[test]
+    fn claude_tool_use_with_error_result_shows_message_above_cross() {
+        // Real-world Claude error pattern (e.g., InputValidationError
+        // wrapped in `<tool_use_error>...`). The unified format flips the
+        // status marker to `✗` at the front and adds an `Error:` prefix to
+        // the fence body. Claude has no exit_code so the prefix is just
+        // `Error:` without a number.
+        let messages = parse_claude_messages_for_test(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-05-01T00:00:00Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","is_error":true,"content":"<tool_use_error>InputValidationError: Write failed due to missing parameter file_path</tool_use_error>"}]},"timestamp":"2026-05-01T00:00:01Z"}"#,
+        );
+        let tool = messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool card present");
+        assert!(
+            tool.text.starts_with("✗ **Bash**"),
+            "failed tool card should start with ✗ marker; got: {}",
+            tool.text
+        );
+        assert!(
+            tool.text.contains("Error: InputValidationError"),
+            "fence body should be `Error: ` + the message inline; got: {}",
+            tool.text
+        );
+    }
+
+    #[test]
+    #[ignore = "manual diagnostic — reads the user's real session file"]
+    fn claude_real_session_dump_tool_messages() {
+        let path = std::path::Path::new(
+            "/Users/john/.claude/projects/-Users-john-Documents-copilot-is/34584c4e-6718-4027-99da-ac548d0aff8d.jsonl",
+        );
+        if !path.exists() {
+            return;
+        }
+        let detail = parse_claude_session(path).unwrap();
+        for (i, m) in detail.messages.iter().enumerate() {
+            if m.role != "tool" {
+                continue;
+            }
+            if i == 12 || i == 28 {
+                println!("--- msg #{i} kind={} BYTES ---", m.kind);
+                println!("{:?}", m.text);
+                println!("--- msg #{i} kind={} DISPLAY ---", m.kind);
+                println!("{}", m.text);
+                println!();
+            }
+        }
+    }
+
+    fn parse_claude_messages_for_test(line1: &str, line2: &str) -> Vec<SessionMessage> {
+        let mut out: Vec<SessionMessage> = Vec::new();
+        for line in [line1, line2] {
+            let v: Value = serde_json::from_str(line).unwrap();
+            out.extend(claude_message_from_value(&v));
+        }
+        merge_tool_outputs(out)
+    }
+
+    #[test]
+    fn claude_task_notification_collapses_to_summary_line() {
+        // Background task notifications wrap a summary + extra metadata
+        // (task-id / event / output-file). Claude Code's UI renders ONLY
+        // the summary via `UserAgentNotificationMessage.tsx`. Termory
+        // mirrors: `⏺ {summary}` and drops the rest.
+        let formatted = claude_display_text(
+            "<task-notification>\n<task-id>bd21wlkuh</task-id>\n<summary>Monitor event: \"Tauri dev startup progress\"</summary>\n<event>VITE v6.4.2 ready in 179 ms</event>\n</task-notification>",
+        );
+        assert_eq!(
+            formatted.as_deref(),
+            Some("⏺ Monitor event: \"Tauri dev startup progress\"")
+        );
+    }
+
+    #[test]
+    fn claude_image_content_block_emits_italic_notice() {
+        // base64 source — surface mime type so the user knows an image
+        // was attached (we can't render the actual bytes inline).
+        let text = claude_text_blocks(&serde_json::json!([
+            {"type":"text","text":"Look:"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},
+            {"type":"text","text":"end"}
+        ]))
+        .join("\n");
+        assert_eq!(text, "Look:\n*Image (image/png)*\nend");
+
+        // url source.
+        let text = claude_text_blocks(&serde_json::json!([
+            {"type":"image","source":{"type":"url","url":"https://x.example/a.png"}}
+        ]))
+        .join("\n");
+        assert_eq!(text, "*Image: https://x.example/a.png*");
+    }
+
+    #[test]
+    fn claude_extra_tool_names_render_aligned_verbs() {
+        // NotebookEdit (NotebookEditTool.ts userFacingName="Edit Notebook").
+        assert_eq!(
+            claude_tool_use_text(
+                "NotebookEdit",
+                &serde_json::json!({"notebook_path": "notes/a.ipynb"})
+            ),
+            "**Edit Notebook**(`notes/a.ipynb`)"
+        );
+
+        // ExitPlanMode (empty userFacingName in TUI; we keep a visible marker).
+        assert_eq!(
+            claude_tool_use_text("ExitPlanMode", &serde_json::json!({"plan": "..."})),
+            "**Exit Plan Mode**"
+        );
+
+        // AskUserQuestion with one question.
+        assert_eq!(
+            claude_tool_use_text(
+                "AskUserQuestion",
+                &serde_json::json!({
+                    "questions": [{"question": "Which path?"}]
+                })
+            ),
+            "**Ask** `Which path?`"
+        );
+
+        // AskUserQuestion with multiple questions.
+        assert_eq!(
+            claude_tool_use_text(
+                "AskUserQuestion",
+                &serde_json::json!({"questions": [{"question": "A?"}, {"question": "B?"}]})
+            ),
+            "**Ask** (2 questions)"
+        );
+
+        // ReadMcpResource.
+        assert_eq!(
+            claude_tool_use_text(
+                "ReadMcpResource",
+                &serde_json::json!({"uri": "mcp://figma/file/x"})
+            ),
+            "**Read MCP Resource**(`mcp://figma/file/x`)"
+        );
+
+        // Generic MCP tool name `mcp__{server}__{tool}` → `**MCP** {s}/{t}`
+        // (same shape as Codex `EventMsg::McpToolCallEnd`).
+        assert_eq!(
+            claude_tool_use_text("mcp__figma__inspect", &serde_json::json!({})),
+            "**MCP** figma/inspect"
+        );
+    }
+
+    #[test]
+    fn claude_extended_thinking_emits_reasoning_message() {
+        // Assistant content with a `thinking` block followed by `text`
+        // and `tool_use`. Claude Code TUI renders thinking via
+        // AssistantThinkingMessage (`∴ Thinking…` + dim markdown).
+        // Termory surfaces it as a separate reasoning message using the
+        // shared `> *content*` italic-blockquote format.
+        let messages = claude_message_from_value(&serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Let me check the tests"},
+                    {"type": "text", "text": "Done."},
+                    {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"command":"ls"}}
+                ]
+            },
+            "timestamp": "2026-05-01T00:00:00Z"
+        }));
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].kind, kind::REASONING);
+        assert_eq!(messages[0].text, "> *Let me check the tests*");
+        assert_eq!(messages[1].kind, kind::TEXT);
+        assert_eq!(messages[1].text, "Done.");
+        assert_eq!(messages[2].kind, kind::TOOL_USE);
+        assert!(messages[2].text.starts_with("**Bash**"));
+
+        // Redacted thinking → placeholder text (not silently dropped).
+        let messages = claude_message_from_value(&serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "redacted_thinking", "data": "encrypted-blob"}]
+            },
+            "timestamp": "2026-05-01T00:00:00Z"
+        }));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].kind, kind::REASONING);
+        assert_eq!(messages[0].text, "> *[redacted thinking]*");
+    }
+
+    #[test]
+    fn codex_event_msg_renders_web_search_mcp_image_compaction() {
+        // EventMsg::WebSearchEnd → `**Searched** \`{query}\`` (call_id
+        // surfaces as tool_use_id so the merge can match a potential
+        // future tool_result, though web search doesn't have one).
+        let msg = codex_event_msg_to_message(
+            &serde_json::json!({
+                "type": "web_search_end",
+                "call_id": "ws_1",
+                "query": "react markdown rendering",
+                "action": {"type": "search"}
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(msg.role, "tool");
+        assert_eq!(msg.text, "**Searched** `react markdown rendering`");
+        assert_eq!(msg.tool_use_id.as_deref(), Some("ws_1"));
+
+        // EventMsg::McpToolCallEnd → header `**MCP** {server}/{tool}`
+        // and body from CallToolResult.content[].text fenced in
+        // 4-backticks. Successful result keeps kind=tool_result.
+        let msg = codex_event_msg_to_message(
+            &serde_json::json!({
+                "type": "mcp_tool_call_end",
+                "call_id": "mcp_1",
+                "invocation": {
+                    "server": "figma",
+                    "tool": "inspect",
+                    "arguments": {}
+                },
+                "duration": {"secs":0,"nanos":0},
+                "result": {
+                    "Ok": {
+                        "content": [{"type":"text","text":"frame: 12px"}],
+                        "is_error": false
+                    }
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(msg.text, "**MCP** figma/inspect\n\n````\nframe: 12px\n````");
+        assert_eq!(msg.kind, kind::TOOL_RESULT);
+
+        // McpToolCallEnd with Err(_) → kind=tool_error so merge_tool_outputs
+        // can fold the `**Error**` footer in.
+        let msg = codex_event_msg_to_message(
+            &serde_json::json!({
+                "type": "mcp_tool_call_end",
+                "call_id": "mcp_fail",
+                "invocation": {"server":"x","tool":"y","arguments":{}},
+                "duration":{"secs":0,"nanos":0},
+                "result": {"Err":"connection refused"}
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(msg.kind, kind::TOOL_ERROR);
+        assert!(msg.text.contains("connection refused"));
+
+        // ImageGenerationEnd → `**Generated image** {prompt}` + saved path.
+        let msg = codex_event_msg_to_message(
+            &serde_json::json!({
+                "type": "image_generation_end",
+                "call_id": "img_1",
+                "status": "completed",
+                "revised_prompt": "A red cat",
+                "result": "ok",
+                "saved_path": "/tmp/img.png"
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            msg.text,
+            "**Generated image** A red cat\n\nSaved: `/tmp/img.png`"
+        );
+
+        // ContextCompacted → system notice.
+        let msg =
+            codex_event_msg_to_message(&serde_json::json!({"type": "context_compacted"}), None)
+                .unwrap();
+        assert_eq!(msg.role, "system");
+        assert_eq!(msg.text, "*Context compacted*");
+        assert_eq!(msg.kind, kind::COMPACTION);
+    }
+
+    #[test]
+    fn codex_failed_exec_appends_error_footer_below_output() {
+        // Non-zero `Process exited with code` flips the leading status
+        // marker to `✗` and prefixes the fence body with `Error: Exit
+        // code N`. Aligns with Claude Code's TUI `⎿ Error: Exit code N`
+        // line — same shape for both platforms.
+        let dir = TestDir::new("codex-failed-exec");
+        let path = dir.path().join("rollout.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"thread-fail","cwd":"/workspace/project"}}"#.to_string()
+                + "\n"
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"user_message","message":"Run tests"}}"#
+                + "\n"
+                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:01Z","payload":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"npm test\"}"}}"#
+                + "\n"
+                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:02Z","payload":{"type":"function_call_output","call_id":"call_1","output":"Wall time: 0.5 seconds\nProcess exited with code 1\nOutput:\nFAIL\ntrace"}}"#,
+        )
+        .unwrap();
+
+        let detail = parse_codex_session(&path, "thread-fail").unwrap();
+        let tool = detail
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool message present");
+        assert_eq!(
+            tool.text,
+            "✗ **Ran** `npm test`\n\n````\nError: Exit code 1\nFAIL\ntrace\n````"
+        );
+    }
+
+    #[test]
+    fn codex_failed_exec_with_empty_output_still_shows_exit_code() {
+        // User-reported scenario (rollout JSONL line copied verbatim from
+        // .codex/sessions/...): an `rg` call that finds no matches
+        // emits `Process exited with code 1` and an empty Output: section.
+        // Termory must report `✗ (1)` so the user knows the failure mode
+        // even when stdout/stderr were empty.
+        let dir = TestDir::new("codex-empty-error");
+        let path = dir.path().join("rollout.jsonl");
+        let function_call_payload = "exec_command";
+        let function_call_args = "{\"cmd\":\"rg --files -g '*release-airouter.yml' -g '!*node_modules*' -g '!web/**/node_modules/**'\",\"workdir\":\"/Users/john/Documents/airouter\",\"yield_time_ms\":1000,\"max_output_tokens\":4000}";
+        let function_call_output = "Chunk ID: 9593aa\\nWall time: 0.0000 seconds\\nProcess exited with code 1\\nOriginal token count: 0\\nOutput:\\n";
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"thread-empty","cwd":"/workspace/project"}}"#.to_string()
+                + "\n"
+                + &format!(
+                    r#"{{"type":"response_item","timestamp":"2026-05-20T13:39:48.676Z","payload":{{"type":"function_call","name":"{function_call_payload}","arguments":{:?},"call_id":"call_X"}}}}"#,
+                    function_call_args
+                )
+                + "\n"
+                + &format!(
+                    r#"{{"type":"response_item","timestamp":"2026-05-20T13:39:48.834Z","payload":{{"type":"function_call_output","call_id":"call_X","output":"{function_call_output}"}}}}"#
+                ),
+        )
+        .unwrap();
+
+        let detail = parse_codex_session(&path, "thread-empty").unwrap();
+        let tool = detail
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool message present");
+        assert_eq!(
+            tool.text,
+            "✗ **Ran** `rg --files -g '*release-airouter.yml' -g '!*node_modules*' -g '!web/**/node_modules/**'`\n\n````\nError: Exit code 1\n````"
+        );
     }
 
     #[test]
     fn codex_hides_environment_context_from_visible_messages() {
         let dir = TestDir::new("codex-environment-context");
         let path = dir.path().join("rollout.jsonl");
+        // EventMsg::UserMessage carries the user input verbatim — Codex's
+        // TUI never displays environment_context wrappers because they are
+        // synthetic prefixes added before sending to the model, not real
+        // user text. Termory applies the same filter (see
+        // `is_codex_contextual_user_text` invoked from
+        // `codex_user_message_event`).
         fs::write(
             &path,
             r#"{"type":"session_meta","payload":{"id":"thread-env","cwd":"/workspace/project"}}"#.to_string()
                 + "\n"
-                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/Users/john/Documents</cwd>\n  <shell>zsh</shell>\n  <current_date>2026-05-15</current_date>\n  <timezone>Asia/Shanghai</timezone>\n</environment_context>"}]}}"#
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"user_message","message":"<environment_context>\n  <cwd>/Users/john/Documents</cwd>\n  <shell>zsh</shell>\n  <current_date>2026-05-15</current_date>\n  <timezone>Asia/Shanghai</timezone>\n</environment_context>"}}"#
                 + "\n"
-                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Build the app"}]}}"#
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:01Z","payload":{"type":"user_message","message":"Build the app"}}"#
                 + "\n"
-                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#,
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:02Z","payload":{"type":"agent_message","message":"Done"}}"#,
         )
         .unwrap();
 
@@ -4815,17 +6600,20 @@ mod tests {
     fn codex_hides_official_contextual_user_fragments() {
         let dir = TestDir::new("codex-contextual-fragments");
         let path = dir.path().join("rollout.jsonl");
+        // Same contextual-fragment filter applied to EventMsg::UserMessage:
+        // synthetic prefixes (`<user_instructions>`, `<skill_instructions>`,
+        // etc.) never reach the display, while normal user input does.
         fs::write(
             &path,
             r#"{"type":"session_meta","payload":{"id":"thread-fragments","cwd":"/workspace/project"}}"#.to_string()
                 + "\n"
-                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>\nUse repo conventions.\n</user_instructions>"}]}}"#
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"user_message","message":"<user_instructions>\nUse repo conventions.\n</user_instructions>"}}"#
                 + "\n"
-                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<skill_instructions>\nTest carefully.\n</skill_instructions>"}]}}"#
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:01Z","payload":{"type":"user_message","message":"<skill_instructions>\nTest carefully.\n</skill_instructions>"}}"#
                 + "\n"
-                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:02Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix contextual filtering"}]}}"#
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:02Z","payload":{"type":"user_message","message":"Fix contextual filtering"}}"#
                 + "\n"
-                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:03Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#,
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:03Z","payload":{"type":"agent_message","message":"Done"}}"#,
         )
         .unwrap();
 
@@ -4837,27 +6625,114 @@ mod tests {
         assert_eq!(detail.messages[1].text, "Done");
     }
 
-    #[test]
-    fn codex_renders_resume_picker_tool_events() {
-        let dir = TestDir::new("codex-tool-events");
-        let path = dir.path().join("rollout.jsonl");
-        fs::write(
-            &path,
-            r#"{"type":"session_meta","payload":{"id":"thread-tools","cwd":"/workspace/project"}}"#.to_string()
-                + "\n"
-                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"command_execution","command":"npm test","status":"failed","exit_code":1,"aggregated_output":"fail\ntrace"}}"#
-                + "\n"
-                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:01Z","payload":{"type":"mcp_tool_call","server":"figma","tool":"inspect","status":"success"}}"#,
-        )
-        .unwrap();
+    // Removed: `codex_renders_resume_picker_tool_events`. The fixture used
+    // `command_execution` and `mcp_tool_call` payload types under
+    // `response_item` — neither exists in Codex's real `ResponseItem` enum
+    // (codex-rs/protocol/src/models.rs: variants are `Message`,
+    // `Reasoning`, `FunctionCall`, `FunctionCallOutput`, `LocalShellCall`,
+    // `CustomToolCall`, `WebSearchCall`, `ImageGenerationCall`, ...).
+    // Tool calls reach the TUI via `EventMsg` variants (PatchApplyEnd /
+    // McpToolCallEnd / WebSearchEnd / ExecCommandEnd), not as
+    // ResponseItem subtypes. The old test asserted a Termory-invented
+    // format that never appears in real Codex sessions.
 
-        let detail = parse_codex_session(&path, "thread-tools").unwrap();
-        assert_eq!(detail.messages.len(), 2);
-        assert_eq!(
-            detail.messages[0].text,
-            "$ npm test\nstatus: failed · exit 1\n  fail\n  trace"
+    #[test]
+    fn codex_parses_exec_output_extracts_raw_and_exit_code() {
+        // Exact shape Codex emits via ExecCommandToolOutput.response_text()
+        // (codex-rs/core/src/tools/context.rs:409-434). Termory must strip
+        // everything up to and including the `Output:` delimiter line, AND
+        // record the exit code from the `Process exited with code N` line
+        // so a non-zero exit can surface as a `**Error**` footer.
+        let parsed = codex_parse_exec_output(
+            "Chunk ID: 79f6dd\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 0\nOutput:\ndiff --git a/foo b/foo\n+changed",
         );
-        assert_eq!(detail.messages[1].text, "mcp tool: figma/inspect · success");
+        assert_eq!(parsed.raw, "diff --git a/foo b/foo\n+changed");
+        assert_eq!(parsed.exit_code, Some(0));
+
+        let parsed = codex_parse_exec_output(
+            "Wall time: 0.5000 seconds\nProcess exited with code 1\nOutput:\nboom",
+        );
+        assert_eq!(parsed.raw, "boom");
+        assert_eq!(parsed.exit_code, Some(1));
+
+        // Older single-chunk wrapper with `Exit code:` prefix.
+        let parsed = codex_parse_exec_output("Exit code: 2\nWall time: 0.1\nOutput:\nnope");
+        assert_eq!(parsed.raw, "nope");
+        assert_eq!(parsed.exit_code, Some(2));
+
+        // Non-exec output (e.g., raw mcp result) passes through unchanged
+        // and reports no exit code.
+        let parsed = codex_parse_exec_output("mcp call returned: ok");
+        assert_eq!(parsed.raw, "mcp call returned: ok");
+        assert_eq!(parsed.exit_code, None);
+
+        // Empty output after the delimiter — keep the delimiter trim.
+        let parsed = codex_parse_exec_output("Chunk ID: 1\nWall time: 0.0000 seconds\nOutput:\n");
+        assert_eq!(parsed.raw, "");
+    }
+
+    #[test]
+    fn codex_apply_patch_header_uses_per_file_verb() {
+        // Single-file add → `**Added** {path}` (matches Codex's
+        // render_changes_block, diff_render.rs:421-431).
+        let actions = codex_parse_patch_actions(
+            "*** Begin Patch\n*** Add File: src/new.rs\n+content\n*** End Patch",
+        );
+        assert_eq!(
+            actions,
+            vec![CodexPatchAction {
+                verb: "Added",
+                path: "src/new.rs".to_string(),
+                move_to: None,
+            }]
+        );
+        assert_eq!(codex_patch_header(&actions), "**Added** src/new.rs");
+
+        // Single-file edit with move → `**Edited** old → new`.
+        let actions = codex_parse_patch_actions(
+            "*** Update File: a/old.rs\n*** Move to: a/new.rs\n@@\n-x\n+y",
+        );
+        assert_eq!(
+            actions,
+            vec![CodexPatchAction {
+                verb: "Edited",
+                path: "a/old.rs".to_string(),
+                move_to: Some("a/new.rs".to_string()),
+            }]
+        );
+        assert_eq!(
+            codex_patch_header(&actions),
+            "**Edited** a/old.rs → a/new.rs"
+        );
+
+        // Delete.
+        let actions = codex_parse_patch_actions("*** Delete File: tmp/out.txt");
+        assert_eq!(codex_patch_header(&actions), "**Deleted** tmp/out.txt");
+
+        // Multi-file → counts collapse to a single `**Edited** N files`.
+        let actions = codex_parse_patch_actions(
+            "*** Update File: a.rs\n@@\n*** Add File: b.rs\n*** Delete File: c.rs",
+        );
+        assert_eq!(actions.len(), 3);
+        assert_eq!(codex_patch_header(&actions), "**Edited** 3 files");
+
+        // No recognized markers → generic fallback.
+        let actions = codex_parse_patch_actions("diff --git a/x b/x\n...");
+        assert!(actions.is_empty());
+        assert_eq!(codex_patch_header(&actions), "**Applied patch**");
+    }
+
+    #[test]
+    fn wrap_inline_code_picks_safe_delimiter_per_commonmark() {
+        // No backticks in content — single backticks suffice.
+        assert_eq!(wrap_inline_code("ls -la"), "`ls -la`");
+        // Content has a backtick run of length 1, AND ends with a backtick,
+        // so CommonMark 6.1 forces both: a length-2 delimiter AND padding
+        // spaces between delimiter and content.
+        assert_eq!(wrap_inline_code("echo `date`"), "`` echo `date` ``");
+        // Content starting/ending with backtick gets padding spaces per
+        // CommonMark spec section 6.1.
+        assert_eq!(wrap_inline_code("`code`"), "`` `code` ``");
     }
 
     #[test]
@@ -4921,13 +6796,14 @@ mod tests {
             .iter()
             .find(|m| m.kind == kind::TOOL_USE)
             .expect("merged tool card should exist");
-        // Claude TUI renders Bash tool_use as `**Bash**({command})` (no
-        // backticks around the command). The merged tool_result is appended
-        // in a 4-backtick fence so triple-backtick content in the result
-        // survives.
+        // Unified tool card: `⏺` status marker on success (matches Claude
+        // TUI's BLACK_CIRCLE prefix in constants/figures.ts:4) + bold verb
+        // + inline-code argument + 4-backtick fence with the merged
+        // tool_result body. Commands are wrapped in inline backticks for
+        // markdown-injection safety.
         assert_eq!(
             tool_card.text,
-            "**Bash**(ls)\n\n````\nsrc\nREADME.md\n````"
+            "⏺ **Bash**(`ls`)\n\n````\nsrc\nREADME.md\n````"
         );
     }
 
@@ -5217,24 +7093,58 @@ mod tests {
         // Must have non-empty timestamps; the value came from file mtime
         // (or fell through to "now"), so we only check non-empty.
         assert!(
-            detail.session.started_at.as_deref().is_some_and(|s| !s.is_empty()),
+            detail
+                .session
+                .started_at
+                .as_deref()
+                .is_some_and(|s| !s.is_empty()),
             "started_at should fall back to file mtime / now"
         );
         assert!(
-            detail.session.updated_at.as_deref().is_some_and(|s| !s.is_empty()),
+            detail
+                .session
+                .updated_at
+                .as_deref()
+                .is_some_and(|s| !s.is_empty()),
             "updated_at should fall back to file mtime / now"
         );
     }
 
     #[test]
     fn gemini_formats_parts_like_official_part_to_string() {
+        // inlineData parts carry base64 binary content (images / audio /
+        // etc.). We can't show them in markdown, so emit a small italic
+        // marker that tells the user what was attached.
         let text = gemini_content_text_raw(&serde_json::json!([
             {"text":"before"},
             {"inlineData":{"mimeType":"image/png","data":"AAAA"}},
             {"text":"after"}
         ]))
         .unwrap();
-        assert_eq!(text, "before[Image: image/png, 0.0 KB]after");
+        assert_eq!(text, "before*Inline data (image/png)*after");
+
+        // executableCode → fenced block tagged with the language so
+        // highlight.js can pick it up later if syntax highlighting is
+        // re-enabled (Gemini TUI renders these in `ExecutableCodeRenderer`).
+        let text = gemini_content_text_raw(&serde_json::json!([
+            {"executableCode":{"code":"print('hi')","language":"PYTHON"}}
+        ]))
+        .unwrap();
+        assert_eq!(text, "```python\nprint('hi')\n```");
+
+        // codeExecutionResult → 4-backtick output block, with an italic
+        // outcome footer only when the outcome is non-OK.
+        let text = gemini_content_text_raw(&serde_json::json!([
+            {"codeExecutionResult":{"output":"hi","outcome":"OUTCOME_OK"}}
+        ]))
+        .unwrap();
+        assert_eq!(text, "````\nhi\n````");
+
+        let text = gemini_content_text_raw(&serde_json::json!([
+            {"codeExecutionResult":{"output":"boom","outcome":"OUTCOME_FAILED"}}
+        ]))
+        .unwrap();
+        assert_eq!(text, "````\nboom\n````\n\n*Outcome: OUTCOME_FAILED*");
     }
 
     #[test]
@@ -5498,7 +7408,10 @@ mod tests {
         assert_eq!(detail.session.title, "New session");
         assert_eq!(detail.messages.len(), 2);
         assert_eq!(detail.messages[0].text, "Implement feature");
-        assert_eq!(detail.messages[1].text, "Done\n\n_Thinking:_ hidden");
+        // Reasoning content is rendered via the unified italic-blockquote
+        // pattern (`> *...*`) so it visually separates from the regular
+        // assistant text above.
+        assert_eq!(detail.messages[1].text, "Done\n\n> *hidden*");
     }
 
     #[test]
@@ -5581,10 +7494,7 @@ mod tests {
             "metadata":{"diff":"- old\n+ new"}
         }))
         .unwrap();
-        assert_eq!(
-            edit,
-            "← Edit src/main.ts\n\n```diff\n- old\n+ new\n```"
-        );
+        assert_eq!(edit, "← Edit src/main.ts\n\n```diff\n- old\n+ new\n```");
     }
 
     #[test]
@@ -5787,12 +7697,7 @@ mod tests {
     fn push_tagged_instruction_file_silently_skips_missing_files() {
         let dir = TestDir::new("tagged-missing");
         let mut out = Vec::new();
-        push_tagged_instruction_file(
-            &dir.path().join("nope.md"),
-            "label",
-            &["claude"],
-            &mut out,
-        );
+        push_tagged_instruction_file(&dir.path().join("nope.md"), "label", &["claude"], &mut out);
         assert!(out.is_empty());
     }
 
@@ -5839,7 +7744,9 @@ mod tests {
         );
         let gemini_path = gemini_md.to_string_lossy().to_string();
         assert!(
-            sessions.iter().any(|s| s.path == gemini_path && s.preview == "gemini"),
+            sessions
+                .iter()
+                .any(|s| s.path == gemini_path && s.preview == "gemini"),
             "GEMINI.md should always be shown with gemini tag"
         );
     }
@@ -5948,7 +7855,15 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        push_doc_files_recursive(base, base, "~/.claude/skills", "claude", "Skill", &[], &mut out);
+        push_doc_files_recursive(
+            base,
+            base,
+            "~/.claude/skills",
+            "claude",
+            "Skill",
+            &[],
+            &mut out,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].source, "Skill");
         assert_eq!(out[0].preview, "claude");

@@ -207,31 +207,93 @@ Implementation notes:
     - `.badge.memory` `#9333EA` (purple 600 — knowledge/recall)
     - `.badge.skill` `#059669` (emerald 600 — capability/action)
 
-### Tool-message rendering (per-provider TUI alignment)
+### Unified tool-message format
 
-The transcript view formats tool calls to match each provider's actual TUI rendering code (not docs, not guesses). Every branch carries a `// session-v2.tsx:LINE` / `// BashTool/UI.tsx` / etc. source reference in `src-tauri/src/sessions.rs`. Survey of cloned sources lives in `.audit-sources/{codex,gemini-cli,opencode,claude-code}/`.
+Every tool message — regardless of source platform — funnels into the same markdown shape so the detail pane reads consistently across Codex / Claude / Gemini / OpenCode.
 
-**Codex** (`codex_function_call_message`) — `.audit-sources/codex/codex-rs/tui/src/exec_cell/render.rs` + `render/highlight.rs:533`:
+**Shape:**
 
-- `shell` / `local_shell_exec` → ` ```bash\n$ {command}\n``` ` (TUI renders `$ {command}` via `highlight_bash_to_lines`; markdown's `bash` fence reproduces the highlight)
-- `apply_patch` → ` ```diff\n{patch}\n``` ` (TUI uses the diff renderer)
-- other → plain `{name}({compact args})`
+```
+{status} **{Verb}**({args})
 
-**Claude Code** (`claude_tool_use_text`) — `.audit-sources/claude-code/src/components/messages/AssistantToolUseMessage.tsx:152` wraps `<bold>{userFacingName}</bold>({renderToolUseMessage})`. Each Tool's `UI.tsx` provides both pieces:
+````
+{body — may include `Error: ...` prefix on failures}
+````
+```
 
-| Raw name | `userFacingName` source | Termory output |
+- `{status}` is the leading glyph: `⏺` on success, `✗` on failure. Inserted by `merge_tool_outputs` (for paired tool_use/tool_result) or by the tool emitter directly (for self-contained EventMsg-derived cards like MCP / WebSearch). Matches Claude TUI's BLACK_CIRCLE prefix in `constants/figures.ts:4` (`⏺` on darwin, `●` elsewhere) for success; `✗` mirrors Codex's failure badge in `exec_cell/render.rs:236`.
+- `{Verb}` and `{args}` are platform-native (Codex `**Ran**`, Claude `**Bash**`, etc.) — "各家用各家" per design call. The badge on each session list card already disambiguates the platform.
+- `{args}` content (commands, paths, URLs, patterns) is wrapped with `wrap_inline_code` (sessions.rs:48 — CommonMark §6.1 delimiter sizing) so embedded backticks / asterisks / parens don't escape into markdown formatting.
+- `Error:` prefix appears INSIDE the fence body on failures, replacing the old footer-style `**Error**` line. Format is `Error: Exit code N` for Codex (exit code parsed from the `Process exited with code N` wrapper line) or `Error: {message}` for Claude (`is_error: true` with no exit code).
+- Reasoning across all four platforms goes through `format_reasoning_body(content)` → `> *line*\n> *line*\n...` (italic blockquote) so the visual style is consistent.
+
+**Failure detection per platform** (`SessionMessage.exit_code: Option<i64>` carries the parsed value through `merge_tool_outputs`):
+
+| Platform | Signal source | Notes |
 |---|---|---|
-| `Bash` | `BashTool/UI.tsx` returns command | `**Bash**({command})` |
-| `Read` | `FileReadTool/UI.tsx:8` → "Read" | `**Read**({path} · lines X-Y)` |
-| `Write` | `FileWriteTool/UI.tsx` → "Write" | `**Write**({path})` |
-| `Edit` / `MultiEdit` / `str_replace*` | `FileEditTool/UI.tsx` → **"Update"** | `**Update**({path})` |
-| `Grep` | `GrepTool.ts:170` → **"Search"** | `**Search**(pattern: "...", path: "...")` |
-| `Glob` | `GlobTool/UI.tsx:13` → **"Search"** | `**Search**(pattern: "...", path: "...")` |
-| `WebFetch` | `WebFetchTool.ts:81` → **"Fetch"** | `**Fetch**({url})` |
-| `WebSearch` | `WebSearchTool.ts:160` → **"Web Search"** (space!) | `**Web Search**("{query}")` |
-| `TodoWrite` | (Termory uses GFM task-list) | `**TodoWrite**\n\n- [x]/[~]/[ ] ...` |
+| Codex | `Process exited with code N` / `Exit code: N` in the `function_call_output.output` wrapper (`ExecCommandToolOutput.response_text()` — context.rs:409) parsed by `codex_parse_exec_output` | Limited mode default; populates `exit_code` |
+| Claude | `tool_result.is_error: true` content block | No exit code field — `Error:` prefix has no `Exit code N` part |
+| OpenCode | `tool.error` / failed step state | Wired through `merge_tool_outputs` is_error flag |
+| Gemini | `result.error` on `toolCalls[]` entries | Optional; absent on most calls |
 
-Critical: Grep AND Glob both surface as **Search** in Claude TUI; WebFetch is **Fetch** (no "Web" prefix); WebSearch has a space. Earlier versions of this file claimed otherwise — those were guesses, now corrected against source.
+### Per-platform verb mapping
+
+Every Termory branch cites the exact source file that produces the verb in each TUI. Survey under `.audit-sources/{codex,gemini-cli,opencode,claude-code}/`.
+
+**Codex** (`codex_function_call_message`) — `.audit-sources/codex/codex-rs/tui/src/exec_cell/render.rs:381-385`:
+
+- `exec_command` / `shell` / `shell_command` / `local_shell` (all 4 names per `rollout-trace/src/tool_dispatch.rs:263`) → `**Ran** {wrap_inline_code(cmd)}`
+- `apply_patch` → `**{Verb}** {path}\n\n```diff\n{patch}\n```` ` — `codex_parse_patch_actions` scans `*** Add File:` / `*** Delete File:` / `*** Update File:` markers, picks `Added` / `Deleted` / `Edited` per `diff_render.rs:421-436`. Multi-file patches collapse to `**Edited** N files`.
+- `update_plan` → `**Updated plan**` + optional `*explanation*` + GFM task list `- [x]/[~]/[ ]` (matches PlanUpdateCell at `history_cell/plans.rs:138-194`)
+- `view_image` → `**Viewed image** {wrap_inline_code(path)}` (patches.rs:63-72)
+- other → `{name}({compact args})` fallback
+
+**Codex EventMsg dispatch** (`codex_event_msg_to_message`) — `RolloutItem::EventMsg` records are the canonical replay source for Codex; the wrapper `codex_message_from_value` routes `event_msg` records here. Handled variants:
+
+- `user_message` / `agent_message` / `agent_reasoning` / `agent_reasoning_raw_content`
+- `web_search_end` → `**Searched** {wrap_inline_code(query)}`
+- `mcp_tool_call_end` → `**MCP** {server}/{tool}` + 4-backtick result fence
+- `image_generation_end` → `**Generated image** {prompt}` + saved path
+- `view_image_tool_call` → same shape as the function_call variant
+- `plan_update` → same as the function_call `update_plan` (payload IS the UpdatePlanArgs)
+- `patch_apply_end` (Extended mode) → per-file `**Verb** {path}` lines; on failure appends stderr fence + `**Error**`
+- `context_compacted` → `*Context compacted*` system notice
+- `error` → `**Error**: {message}` system notice
+- `turn_aborted` → `*Turn interrupted by user*` / `*Turn stopped — budget limit reached*`
+- `thread_rolled_back` → `*Rolled back N turn(s)*`
+- `entered_review_mode` / `exited_review_mode` → italic notices
+
+`exec_command_end` (Extended-mode shell) is intentionally NOT dispatched yet — it would duplicate the ResponseItem-derived card. Need call_id-based dedup before enabling.
+
+`Limited` vs `Extended` mode (per `codex-rs/rollout/src/policy.rs:135-153`): the CLI default is Limited (`tui/src/app_server_session.rs: persist_extended_history: false`), so most rollouts only carry `ResponseItem::FunctionCall` + `FunctionCallOutput` for shell tools — NOT `EventMsg::ExecCommandEnd`. Termory's `codex_function_call_output_message` is the authoritative path for shell output in that mode; `codex_parse_exec_output` strips the wrapper to recover `aggregated_output`.
+
+**Claude Code** (`claude_tool_use_text`) — `.audit-sources/claude-code/src/components/messages/AssistantToolUseMessage.tsx:152` wraps `<bold>{userFacingName}</bold>({renderToolUseMessage})`. Each Tool's `UI.tsx` provides both pieces. All argument values pass through `wrap_inline_code` so markdown-special chars in user payloads can't leak:
+
+| Raw name | `userFacingName` | Termory output |
+|---|---|---|
+| `Bash` | BashTool/UI.tsx | `**Bash**({command})` (empty cmd → just `**Bash**`) |
+| `Read` / `View` | FileReadTool/UI.tsx:8 → "Read" | `**Read**({path} · lines X-Y / · pages N / · limit N)` |
+| `Write` | FileWriteTool/UI.tsx → "Write" | `**Write**({path})` |
+| `Edit` / `MultiEdit` / `str_replace*` | FileEditTool/UI.tsx → "Update" | `**Update**({path})` |
+| `Grep` | GrepTool.ts:170 → "Search" | `**Search**(pattern: ..., path: ...)` |
+| `Glob` | GlobTool/UI.tsx:13 → "Search" | `**Search**(pattern: ..., path: ...)` |
+| `WebFetch` | WebFetchTool.ts:81 → "Fetch" | `**Fetch**({url})` |
+| `WebSearch` | WebSearchTool.ts:160 → "Web Search" (space) | `**Web Search**({query})` |
+| `TodoWrite` | (Termory uses GFM task-list) | `**TodoWrite**\n\n- [x]/[~]/[ ] ...` |
+| `Task` | TaskCreateTool/etc. | `**Task**({description}, agent: ...)` |
+| `NotebookEdit` | NotebookEditTool.ts → "Edit Notebook" | `**Edit Notebook**({notebook_path})` |
+| `ExitPlanMode` / `EnterPlanMode` | empty userFacingName (suppressed in TUI) | `**Exit/Enter Plan Mode**` minimal marker |
+| `AskUserQuestion` | empty userFacingName | `**Ask** {question}` (one) / `**Ask** (N questions)` |
+| `ReadMcpResource` | ReadMcpResourceTool/UI.tsx → "readMcpResource" | `**Read MCP Resource**({uri})` |
+| `ListMcpResources` | "listMcpResources" | `**List MCP Resources**({server})` |
+| `McpAuth` | "{server} - authenticate (MCP)" | `**MCP Auth** {server}` |
+| `mcp__{server}__{tool}` (generic MCP) | — | `**MCP** {server}/{tool}` (same shape as Codex MCP) |
+
+**Claude content blocks** beyond `text` / `tool_use`:
+
+- `thinking` and `redacted_thinking` → reasoning message via `claude_thinking_blocks` + `format_reasoning_body`. Claude TUI renders `∴ Thinking…` (AssistantThinkingMessage.tsx); Termory emits the unified `> *content*` blockquote instead.
+- `image` (`{source: {type: "base64"|"url", media_type, ...}}`) → italic `*Image ({mime})*` or `*Image: {url}*` notice via `claude_image_part_label`.
+- `tool_result.content` may be `Value::String` or `Value::Array` of `text` blocks. The `<tool_use_error>...</tool_use_error>` wrapper Anthropic adds for internal validation failures is stripped by `claude_display_text` so only the human-readable error text remains.
 
 **OpenCode** (`opencode_v2_tool_part_text`) — every branch cites a line in `.audit-sources/opencode/packages/opencode/src/cli/cmd/tui/feature-plugins/system/session-v2.tsx`:
 
@@ -249,22 +311,43 @@ Critical: Grep AND Glob both surface as **Search** in Claude TUI; WebFetch is **
 - `Skill` (l.1022): `Skill "{name}"`
 - `Task` (l.1030): `{Titlecase(subagent_type ?? "General")} Task — {description}`
 - generic (l.522): `{name} {input}` inline, or `**{name} {input}**\n\n```\n{output}\n```` block
+- `reasoning` part → `format_reasoning_body` (unified italic blockquote — replaces the old `_Thinking:_` inline prefix)
 
-**Gemini CLI** (`gemini_tool_messages_from_value`) — `.audit-sources/gemini-cli/packages/cli/src/ui/components/messages/ToolShared.tsx:202` `ToolInfo` component + `types.ts:119` `IndividualToolCallDisplay`:
+Audit reference is OpenCode `1.15.5` (commit `9324ef0`). Compared against `v1.15.7`: only cosmetic reasoning collapse-icon change in session-v2.tsx (`▼/▶` → `-/+`), no structural / schema diffs. No re-audit needed.
 
-- Format: `**{displayName}** {description}` — bold name + space + description in secondary text (no parens, no equals signs)
-- `resultDisplay` content rendered separately below in a 4-backtick fence (approximates the TUI's `ToolResultDisplay`)
+**Gemini CLI** (`gemini_tool_messages_from_value` + `gemini_thought_messages_from_value` + `gemini_part_to_string`) — `.audit-sources/gemini-cli/packages/cli/src/ui/components/messages/`:
+
+- `toolCalls[]` entries (ToolShared.tsx:202 `ToolInfo`) → `**{displayName}** {description}` + 4-backtick `resultDisplay` fence
+- `thoughts[{subject, description}]` array (ThinkingMessage.tsx:22 `normalizeThoughtLines`) → one reasoning message per entry via `format_reasoning_body`. Noise filtering matches the source (skip whitespace-only or `...` runs)
+- Parts with `executableCode: {code, language}` → ```{lang}\n{code}\n``` fence
+- Parts with `codeExecutionResult: {outcome, output}` → 4-backtick output fence + italic `*Outcome: OUTCOME_FAILED*` footer when non-OK
+- Parts with `inlineData: {mimeType, ...}` → `*Inline data ({mime})*` italic notice
+- Parts with `fileData: {fileUri}` → `*File: {uri}*` italic notice
+- Parts with `functionCall: {name}` → `*Tool call: {name}*` (inline marker; the structured card comes from `toolCalls[]`)
+- Parts with `functionResponse: {name}` → `*Tool response: {name}*`
+
+### Helpers used across all four platforms
+
+- `wrap_inline_code(content)` (sessions.rs:48) — CommonMark §6.1: pick a backtick delimiter longer than the longest run inside the content; pad with spaces when content starts or ends with a backtick. Used everywhere an unsafe user payload (path, command, URL, query, pattern) becomes inline `\`code\`` in markdown.
+- `format_reasoning_body(content)` (sessions.rs:71) — line-by-line `> *...*` italic blockquote, escapes stray `*` / `_` so italic spans can't break mid-line.
+- `merge_tool_outputs(messages)` (sessions.rs runs in `parse_claude_session` and `parse_codex_session`): folds matching `tool_result` / `tool_error` into the leading `tool_use` card. On a matched failure it prefixes the leading line with `✗ ` (instead of `⏺ `) and prepends the fence body with `Error:` (plus `Exit code N` when `SessionMessage.exit_code` is set). Orphan results (no matching tool_use) keep their text but also get a `⏺` / `✗` status prefix.
+- `codex_parse_exec_output(text)` returns `CodexExecOutput { raw, exit_code }` — strips Codex's `Chunk ID: ... Output:` wrapper line-by-line so the visible body is just `aggregated_output`, AND extracts the exit code for the `Error: Exit code N` line.
+- `codex_parse_patch_actions(patch_text)` scans `*** Add/Delete/Update File:` markers and returns `Vec<CodexPatchAction>` for the apply_patch header builder.
 
 ### Tool message metadata + UI
 
-- `SessionMessage` carries `tool_use_id: Option<String>` (`#[serde(skip)]`, never exposed to the frontend). Claude `tool_use.id` and Codex `function_call.call_id` populate it.
-- `merge_tool_outputs(messages)` runs in `parse_claude_session` and `parse_codex_session`: it folds matching `tool_result` / `tool_error` messages back into the `tool_use` card body, wrapping the output in a 4-backtick code fence (so embedded ``` triple backticks survive). Provider-native combined formats (OpenCode parts and Gemini toolCalls) skip this merge — they already arrive combined.
+- `SessionMessage` carries two `#[serde(skip)]` fields used only during parsing/merging:
+  - `tool_use_id: Option<String>` — links `tool_use` ↔ `tool_result` by provider id (Claude `tool_use.id` / Codex `function_call.call_id`).
+  - `exit_code: Option<i64>` — Codex shell exit code parsed from `function_call_output` metadata; surfaced in the `Error: Exit code N` fence line.
+- Provider-native combined formats (OpenCode parts, Gemini toolCalls, Codex EventMsg-derived cards) skip `merge_tool_outputs` — they already arrive complete with their own fence and add the `⏺` / `✗` prefix at emission time.
 
-### Markdown rendering
+### Markdown rendering (frontend)
 
 - The detail-pane body uses `react-markdown` + `remark-gfm` (tables / task lists / strikethrough). No syntax-highlight pass: code blocks render as plain monospace until a per-language renderer is added intentionally.
 - No DOMPurify / rehype-sanitize: react-markdown emits React elements (not HTML strings), so raw `<tag>` in session content is auto-escaped by React's text node rendering and displays as literal text — same characters the CLI shows.
 - No raw / rendered toggle and no `viewMode` state — every message renders through the same react-markdown pipeline. The "open original file" affordance in the detail header still lets the user inspect the underlying JSONL / db row outside Termory.
+- Inline `<code>` carries `word-break: break-all` so a long no-space path inside `**Read**(\`/very/long/path\`)` wraps with the surrounding paragraph instead of overflowing the message card.
+- Unordered lists render with the `- ` text marker via `list-style-type: "- "` (matching Codex TUI's `start_item` output at `codex-rs/tui/src/markdown_render.rs:754-760`).
 
 ## History and Preview Behavior
 
