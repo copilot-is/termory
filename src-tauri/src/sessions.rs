@@ -4371,14 +4371,15 @@ fn claude_format_structured_patch(tool_use_result: &Value) -> Option<String> {
         return None;
     }
     let mut out = String::from("```diff\n");
-    for hunk in hunks {
-        let old_start = hunk.get("oldStart").and_then(Value::as_i64).unwrap_or(0);
-        let old_lines = hunk.get("oldLines").and_then(Value::as_i64).unwrap_or(0);
-        let new_start = hunk.get("newStart").and_then(Value::as_i64).unwrap_or(0);
-        let new_lines = hunk.get("newLines").and_then(Value::as_i64).unwrap_or(0);
-        out.push_str(&format!(
-            "@@ -{old_start},{old_lines} +{new_start},{new_lines} @@\n"
-        ));
+    for (idx, hunk) in hunks.iter().enumerate() {
+        // Claude TUI's `formatDiff` (StructuredDiff/Fallback.tsx:373-440)
+        // does NOT emit `@@ -X,N +Y,M @@` header lines. Hunk boundaries
+        // are conveyed by line-number jumps in the gutter. Termory has
+        // no gutter in markdown, so we use a blank line between hunks
+        // for visual separation but skip the `@@` text to match Claude.
+        if idx > 0 {
+            out.push('\n');
+        }
         if let Some(lines) = hunk.get("lines").and_then(Value::as_array) {
             for line in lines.iter().filter_map(Value::as_str) {
                 out.push_str(line);
@@ -4826,6 +4827,17 @@ fn claude_user_content_is_tool_result_only(value: &Value) -> bool {
 }
 
 fn claude_display_text(text: &str) -> Option<String> {
+    // `({tool} completed with no output)` is the placeholder that
+    // `toolResultStorage.ts:293` writes into JSONL tool_result.content
+    // when stdout+stderr are both empty. Claude TUI's
+    // `BashToolResultMessage.tsx:107-121` detects empty streams and
+    // renders the cleaner `(No output)` instead. Termory matches that.
+    {
+        let trimmed = text.trim();
+        if trimmed.starts_with('(') && trimmed.ends_with(" completed with no output)") {
+            return Some("(No output)".to_string());
+        }
+    }
     // Claude's internal `<tool_use_error>...</tool_use_error>` wrapper is
     // not meaningful to humans — it's an Anthropic-internal marker. Strip
     // it to show just the inner error message.
