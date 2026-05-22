@@ -5019,27 +5019,6 @@ fn codex_message_from_value(value: &Value) -> Option<SessionMessage> {
     None
 }
 
-fn codex_content_text(value: &Value) -> Option<String> {
-    let mut parts = Vec::new();
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                if let Some(text) = item.get("text").and_then(value_to_string) {
-                    parts.push(text);
-                }
-            }
-        }
-        Value::String(text) => parts.push(text.clone()),
-        _ => {}
-    }
-    let text = parts.join("\n").trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
 fn codex_visible_assistant_markdown(markdown: &str) -> String {
     let mut visible_lines = markdown
         .lines()
@@ -5100,43 +5079,6 @@ fn codex_plan_message(payload: &Value, timestamp: Option<String>) -> Option<Sess
         text: text.trim().to_string(),
         timestamp,
         kind: kind::PLAN.to_string(),
-        tool_use_id: None,
-        exit_code: None,
-    })
-}
-
-fn codex_reasoning_message(payload: &Value, timestamp: Option<String>) -> Option<SessionMessage> {
-    let summary = payload
-        .get("summary")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(value_to_string)
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        })
-        .or_else(|| payload.get("summary").and_then(value_to_string));
-    let content = payload
-        .get("content")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(value_to_string)
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        })
-        .or_else(|| payload.get("content").and_then(value_to_string));
-    let text = summary.or(content)?;
-    if text.trim().is_empty() {
-        return None;
-    }
-    Some(SessionMessage {
-        role: "assistant".to_string(),
-        text: text.trim().to_string(),
-        timestamp,
-        kind: kind::REASONING.to_string(),
         tool_use_id: None,
         exit_code: None,
     })
@@ -6075,13 +6017,18 @@ fn codex_agent_reasoning_event(
 }
 
 /// Build a tool message from `EventMsg::ExecCommandEnd` (the canonical source
-/// for shell-tool replay rendering in Codex). Codex's TUI feeds these to
-/// `ExecCell` and renders:
+/// for shell-tool replay rendering in Codex's Extended mode). Codex's
+/// TUI feeds these to `ExecCell` and renders:
 ///   `$ {command}` (bash-highlighted, magenta `$`)
 ///   {aggregated_output}     (dim, `└ ` / `    ` prefixed)
 ///   `✓` / `✗ ({exit})` • {duration}
-/// We approximate that in markdown — the raw output is the actual command
-/// output (no `Chunk ID:` / `Wall time:` metadata).
+///
+/// Currently NOT dispatched from `codex_event_msg_to_message` — Extended
+/// mode emits both this AND a `ResponseItem::FunctionCallOutput`, so
+/// wiring this requires call_id-based dedup (see CLAUDE.md "Limited vs
+/// Extended mode"). Kept as a reference implementation for that future
+/// wiring; `#[allow(dead_code)]` silences the unused warning meanwhile.
+#[allow(dead_code)]
 fn codex_exec_command_end_message(
     payload: &Value,
     timestamp: Option<String>,
