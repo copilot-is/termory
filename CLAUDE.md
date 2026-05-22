@@ -300,10 +300,26 @@ Without these handlers, modern apply_patch was silently dropped and no ```diff f
 
 - `thinking` and `redacted_thinking` → reasoning message via `claude_thinking_blocks` + `format_reasoning_body`. Claude TUI renders `∴ Thinking…` (AssistantThinkingMessage.tsx); Termory emits the unified `> *content*` blockquote instead.
 - `image` (`{source: {type: "base64"|"url", media_type, ...}}`) → italic `*Image ({mime})*` or `*Image: {url}*` notice via `claude_image_part_label`.
-- `tool_result.content` may be `Value::String` or `Value::Array` of `text` blocks. `claude_display_text` strips Claude-internal wrappers:
-  - `<tool_use_error>…</tool_use_error>` → inner error text only
-  - `<bash-stdout>…</bash-stdout>` + `<bash-stderr>…</bash-stderr>` → unwrapped + concatenated (stdout, then stderr). Also strips the inner `<persisted-output>` wrapper from long captured bash output. Matches `UserBashOutputMessage.tsx`.
-- `<task-notification>...</task-notification>` blocks (emitted by LocalShellTask / LocalAgentTask / RemoteAgentTask in claude-code) are collapsed to `⏺ {summary}` — matches `UserAgentNotificationMessage.tsx` which only renders the `<summary>` tag. The `<task-id>` / `<event>` / `<output-file>` siblings are dropped.
+- `tool_result.content` may be `Value::String` or `Value::Array` of `text` blocks. For `Edit` / `MultiEdit` / `Write` tools, Termory prefers the structured diff over the brief tool_result text — `claude_format_structured_patch` reads the JSONL line's sibling `toolUseResult.structuredPatch` field (the same data Claude TUI's `StructuredDiff.tsx` consumes) and emits a `**Added N lines, removed M lines**` summary header on its own line, then a ```diff fence with the actual hunks. NO `@@ -X,N +Y,M @@` text in the fence — Claude's `formatDiff` (StructuredDiff/Fallback.tsx:373-440) conveys hunk boundaries via gutter line-number jumps, not the unified-diff header. Multi-hunk patches get a blank line between hunks instead.
+
+`claude_display_text` strips / rewrites the following Claude-internal text wrappers and constants (per `UserTextMessage.tsx:40-197` dispatch chain and `constants/messages.ts`):
+
+| Wrapper / signal | Claude TUI | Termory output |
+|---|---|---|
+| `(no content)` (NO_CONTENT_MESSAGE) | null (UserTextMessage.tsx:48) | drop |
+| `[Request interrupted by user]` / `[Request interrupted by user for tool use]` | `<InterruptedByUser>` italic (l.83-92) | `*[Interrupted by user]*` |
+| `<tick>...</tick>` | null (l.57-59) | drop |
+| `<local-command-caveat>...` | null (l.61-64) | drop |
+| `<bash-stdout>...` / `<bash-stderr>...` | `<UserBashOutputMessage>` → stdout + stderr (l.66-71) | unwrapped + concatenated (stdout then `\n\n` + stderr); inner `<persisted-output>` also stripped |
+| `<local-command-stdout>` / `<local-command-stderr>` | `<UserLocalCommandOutputMessage>` indented w/ Markdown (l.74-79) | inner text passed through |
+| `<bash-input>...` | `<UserBashInputMessage>` `! {input}` (l.110-113) | `! {input}` |
+| `<command-message>...` | `<UserCommandMessage>` `❯ /cmd args` (l.115-118) | `/cmd args` |
+| `<user-memory-input>...` | `<UserMemoryInputMessage>` `# {content}` chip (l.120-122) | `\# {content}` (H1-escape so markdown doesn't render as heading) |
+| `<task-notification>...<summary>...</summary>...` | `<UserAgentNotificationMessage>` `⏺ {summary}` (l.139-141) | `⏺ {summary}` |
+| `<tool_use_error>...` (inside tool_result.content only) | stripped to inner text | inner error text only |
+| `({tool} completed with no output)` (toolResultStorage.ts:293 placeholder) | `(No output)` summary via `BashToolResultMessage.tsx:107-121` | `(No output)` |
+
+Feature-gated wrappers not handled: `<github-webhook-activity>` (KAIROS_GITHUB_WEBHOOKS), `<teammate-message>` (swarms), `<fork-boilerplate>` (FORK_SUBAGENT), `<cross-session-message>`, `<channel source=...>`, `<mcp-resource-update>` / `<mcp-polling-update>`. All are dropped silently via the generic `strip_display_tags` fallback.
 
 **Claude top-level record types** (per Message.tsx:103-281 dispatch):
 
@@ -370,6 +386,8 @@ Audit reference is OpenCode `1.15.5` (commit `9324ef0`). Compared against `v1.15
 - No raw / rendered toggle and no `viewMode` state — every message renders through the same react-markdown pipeline. The "open original file" affordance in the detail header still lets the user inspect the underlying JSONL / db row outside Termory.
 - Inline `<code>` carries `word-break: break-all` so a long no-space path inside `**Read**(\`/very/long/path\`)` wraps with the surrounding paragraph instead of overflowing the message card.
 - `.messageBody pre` has `margin: 0; padding: 0 0 0 1em` — code fences sit flush with the verb header above, with a 1em left indent so the fence content visually aligns with the verb under the `⏺` marker.
+- `.message.tool .messageBody p + p { padding-left: 1em }` — second-and-later paragraphs inside tool cards (e.g. the `**Added N lines, removed M lines**` summary above an Edit diff) indent 1em to align with the verb past the `⏺` glyph. Scoped to `.message.tool` so plain-text assistant messages with multi-paragraph layouts stay flush-left.
+- `.messageBody p + pre { margin-top: -0.4em }` — pulls a fence visually onto the preceding paragraph when they form a logical pair (summary + diff). The CommonMark-required blank line between them stays in the markdown source so the fence is still recognized as a block.
 - Unordered lists render with the `- ` text marker via `list-style-type: "- "` (matching Codex TUI's `start_item` output at `codex-rs/tui/src/markdown_render.rs:754-760`).
 - Tool detail-pane loading state shows only the spinner icon (no `Loading transcript` label) so the brief delay between session select and detail load is unobtrusive.
 
