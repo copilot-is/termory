@@ -769,6 +769,25 @@ input {
   word-break: break-all;
 }
 
+/* Italic summary line directly before a code fence (e.g. the
+ * `*Added N lines, removed M lines*` line above an Edit/Update diff
+ * fence) — pull the fence up so it visually attaches to the summary
+ * without an extra blank-line gap. Markdown source needs the blank
+ * line so CommonMark recognizes the fence; CSS removes the visible
+ * gap. */
+.messageBody p + pre {
+  margin-top: -0.4em;
+}
+
+/* Tool messages: indent the secondary paragraph(s) under the verb
+ * line (e.g. the `*Added N lines, removed M lines*` summary or any
+ * follow-up text) to align with the verb text, past the `⏺ ` glyph.
+ * Scoped to `.message.tool` so plain-text assistant messages with
+ * multiple paragraphs aren't visually inset. */
+.message.tool .messageBody p + p {
+  padding-left: 1em;
+}
+
 .messageBody pre {
   margin: 0;
   /* Left indent aligns the fence content with the start of the verb in

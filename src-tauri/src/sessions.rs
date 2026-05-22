@@ -229,9 +229,15 @@ fn merge_tool_outputs(messages: Vec<SessionMessage>) -> Vec<SessionMessage> {
                         // markdown layer sees a single fence — wrapping
                         // it in another 4-backtick fence would make the
                         // inner fence render as literal characters.
-                        // Otherwise, wrap in 4-backticks (handles
-                        // triple-backtick content inside plain output).
-                        if body.starts_with("```") {
+                        // Also pass through verbatim when the body
+                        // already has a triple-backtick fence anywhere
+                        // (e.g. the Claude structuredPatch builder emits
+                        // `*Added N lines, removed M lines*\n\n```diff\n...`
+                        // — the leading italic summary precedes the fence,
+                        // so `starts_with("```")` is false but the body is
+                        // already structured markdown).
+                        let already_markdown = body.starts_with("```") || body.contains("\n```");
+                        if already_markdown {
                             msg.text.push_str(&body);
                         } else {
                             msg.text.push_str("````\n");
@@ -4370,7 +4376,9 @@ fn claude_format_structured_patch(tool_use_result: &Value) -> Option<String> {
     if hunks.is_empty() {
         return None;
     }
-    let mut out = String::from("```diff\n");
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut body = String::new();
     for (idx, hunk) in hunks.iter().enumerate() {
         // Claude TUI's `formatDiff` (StructuredDiff/Fallback.tsx:373-440)
         // does NOT emit `@@ -X,N +Y,M @@` header lines. Hunk boundaries
@@ -4378,15 +4386,42 @@ fn claude_format_structured_patch(tool_use_result: &Value) -> Option<String> {
         // no gutter in markdown, so we use a blank line between hunks
         // for visual separation but skip the `@@` text to match Claude.
         if idx > 0 {
-            out.push('\n');
+            body.push('\n');
         }
         if let Some(lines) = hunk.get("lines").and_then(Value::as_array) {
             for line in lines.iter().filter_map(Value::as_str) {
-                out.push_str(line);
-                out.push('\n');
+                // Count line types for the summary header.
+                // `+++` / `---` are file headers (unified diff
+                // convention) — Claude's structuredPatch doesn't emit
+                // those into `lines`, but guard anyway.
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    added += 1;
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    removed += 1;
+                }
+                body.push_str(line);
+                body.push('\n');
             }
         }
     }
+    // Summary line above the fence, italic notice. Mirrors the
+    // `Added N lines, removed M lines` phrasing Claude TUI uses for
+    // edit summaries (see DiffFileList.tsx:139-148 for the compact
+    // `+N -M` form; Termory uses the readable long form).
+    let mut out = String::new();
+    let added_part = format!("{added} {}", if added == 1 { "line" } else { "lines" });
+    let removed_part = format!("{removed} {}", if removed == 1 { "line" } else { "lines" });
+    // Blank line between the bold summary and the fence is required
+    // by CommonMark for the fence to be recognized — without it the
+    // `**Added ...**` line and ` ```diff ` get merged into one paragraph
+    // and render as literal asterisks + backticks. CSS in styles.css
+    // tightens the visual gap via `.messageBody p + pre` and indents
+    // the summary 1em via `.message.tool .messageBody p + p`.
+    out.push_str(&format!(
+        "**Added {added_part}, removed {removed_part}**\n\n"
+    ));
+    out.push_str("```diff\n");
+    out.push_str(&body);
     out.push_str("```");
     Some(out)
 }
@@ -4579,6 +4614,9 @@ fn claude_tool_use_text(name: &str, input: &Value) -> Option<String> {
             // FileEditTool/UI.tsx:28-87 — verb defaults to "Update", but
             // becomes "Create" when `old_string === ''` (new file being
             // written via edit). MultiEdit checks the first edit.
+            // Use `Value::as_str` directly (NOT `get` helper) because
+            // `value_to_string` drops empty strings as None — and an
+            // empty string is the exact signal we need to detect here.
             let creating = match lower.as_str() {
                 "multiedit" => input
                     .get("edits")
@@ -4587,7 +4625,10 @@ fn claude_tool_use_text(name: &str, input: &Value) -> Option<String> {
                     .and_then(|e| e.get("old_string"))
                     .and_then(Value::as_str)
                     .is_some_and(str::is_empty),
-                _ => get("old_string").is_some_and(|s| s.is_empty()),
+                _ => input
+                    .get("old_string")
+                    .and_then(Value::as_str)
+                    .is_some_and(str::is_empty),
             };
             let verb = if creating { "Create" } else { "Update" };
             if path.is_empty() {
@@ -6986,6 +7027,382 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].kind, kind::REASONING);
         assert_eq!(messages[0].text, "> *[redacted thinking]*");
+    }
+
+    #[test]
+    fn claude_attachment_messages_render_rendered_subtypes() {
+        // `file` with text content → `Read {path} (N lines)`.
+        let msgs = claude_attachment_messages(
+            &serde_json::json!({
+                "type": "attachment",
+                "attachment": {
+                    "type": "file",
+                    "displayPath": "src/main.tsx",
+                    "content": {"type": "text", "file": {"numLines": 42}}
+                }
+            }),
+            None,
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].text, "Read `src/main.tsx` (42 lines)");
+        assert_eq!(msgs[0].role, "system");
+
+        // `file_unchanged`.
+        let msgs = claude_attachment_messages(
+            &serde_json::json!({
+                "attachment": {
+                    "type": "file",
+                    "displayPath": "src/cache.ts",
+                    "content": {"type": "file_unchanged"}
+                }
+            }),
+            None,
+        );
+        assert_eq!(msgs[0].text, "Read `src/cache.ts` (unchanged)");
+
+        // `notebook`.
+        let msgs = claude_attachment_messages(
+            &serde_json::json!({
+                "attachment": {
+                    "type": "file",
+                    "displayPath": "notes.ipynb",
+                    "content": {"type": "notebook", "file": {"cells": [1, 2, 3]}}
+                }
+            }),
+            None,
+        );
+        assert_eq!(msgs[0].text, "Read `notes.ipynb` (3 cells)");
+
+        // `compact_file_reference`.
+        let msgs = claude_attachment_messages(
+            &serde_json::json!({
+                "attachment": {"type": "compact_file_reference", "displayPath": "x.md"}
+            }),
+            None,
+        );
+        assert_eq!(msgs[0].text, "Referenced file `x.md`");
+
+        // `skill_listing` with isInitial → drop.
+        let msgs = claude_attachment_messages(
+            &serde_json::json!({
+                "attachment": {"type": "skill_listing", "isInitial": true, "skillCount": 5}
+            }),
+            None,
+        );
+        assert!(msgs.is_empty());
+
+        // `skill_listing` without isInitial → `N skills available`.
+        let msgs = claude_attachment_messages(
+            &serde_json::json!({
+                "attachment": {"type": "skill_listing", "skillCount": 3}
+            }),
+            None,
+        );
+        assert_eq!(msgs[0].text, "3 skills available");
+
+        // `queued_command` with plain prompt → runs through claude_display_text.
+        let msgs = claude_attachment_messages(
+            &serde_json::json!({
+                "attachment": {"type": "queued_command", "prompt": "Run tests"}
+            }),
+            None,
+        );
+        assert_eq!(msgs[0].text, "Run tests");
+
+        // NULL_RENDERING subtypes drop silently — match nullRenderingAttachments.ts.
+        for sub in &[
+            "task_reminder",
+            "deferred_tools_delta",
+            "command_permissions",
+            "date_change",
+            "hook_success",
+            "async_hook_response",
+        ] {
+            let msgs =
+                claude_attachment_messages(&serde_json::json!({"attachment": {"type": sub}}), None);
+            assert!(msgs.is_empty(), "subtype {sub} should drop");
+        }
+    }
+
+    #[test]
+    fn claude_system_subtype_dispatch() {
+        // turn_duration: `*※ Worked for {duration}*` (SystemTextMessage.tsx:342).
+        let msg = claude_system_message(
+            &serde_json::json!({"subtype": "turn_duration", "durationMs": 45269}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(msg.text, "*※ Worked for 45.3s*");
+
+        // away_summary: `*※ {content}*`.
+        let msg = claude_system_message(
+            &serde_json::json!({"subtype": "away_summary", "content": "Tauri running"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(msg.text, "*※ Tauri running*");
+
+        // agents_killed: error notice.
+        let msg =
+            claude_system_message(&serde_json::json!({"subtype": "agents_killed"}), None).unwrap();
+        assert_eq!(msg.text, "**Error** All background agents stopped");
+
+        // compact_boundary: `---` divider + italic content.
+        let msg = claude_system_message(
+            &serde_json::json!({"subtype": "compact_boundary", "content": "Conversation compacted"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(msg.text, "---\n\n*Conversation compacted*\n\n---");
+
+        // Unhandled subtypes drop silently (verbose-only / null in TUI).
+        for sub in &["microcompact_boundary", "api_error", "unknown_xyz"] {
+            let msg = claude_system_message(&serde_json::json!({"subtype": sub}), None);
+            assert!(msg.is_none(), "subtype {sub} should drop");
+        }
+
+        // Duration formatter edge cases.
+        assert_eq!(format_duration_short(0), "0.0s");
+        assert_eq!(format_duration_short(59999), "60.0s");
+        assert_eq!(format_duration_short(60000), "1m 0s");
+        assert_eq!(format_duration_short(3_600_000), "1h 0m");
+    }
+
+    #[test]
+    fn claude_suppress_hidden_tool_cards() {
+        // Claude TUI's `userFacingName: ''` + `renderToolUseMessage: () => null`
+        // tools — Termory returns None so no card is emitted.
+        for name in &[
+            "TodoWrite",
+            "AskUserQuestion",
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "ExitPlanModeV2",
+            "TaskCreate",
+            "TaskUpdate",
+            "TaskGet",
+            "TaskList",
+            "TaskStop",
+            "TaskOutput",
+            "ToolSearch",
+        ] {
+            assert_eq!(
+                claude_tool_use_text(name, &serde_json::json!({"foo": "bar"})),
+                None,
+                "tool {name} should be suppressed"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_display_text_unwraps_bash_and_special_markers() {
+        // `<bash-stdout>...</bash-stdout>` → just the stdout content.
+        assert_eq!(
+            claude_display_text("<bash-stdout>hello\nworld</bash-stdout>"),
+            Some("hello\nworld".to_string())
+        );
+        // `<bash-stderr>...</bash-stderr>` → just the stderr content.
+        assert_eq!(
+            claude_display_text("<bash-stderr>oops</bash-stderr>"),
+            Some("oops".to_string())
+        );
+        // Both → stdout then stderr separated by blank line.
+        assert_eq!(
+            claude_display_text("<bash-stdout>ok</bash-stdout>\n<bash-stderr>warn</bash-stderr>"),
+            Some("ok\n\nwarn".to_string())
+        );
+        // `<persisted-output>` wrapper inside `<bash-stdout>` is unwrapped.
+        assert_eq!(
+            claude_display_text(
+                "<bash-stdout><persisted-output>/tmp/log.txt</persisted-output></bash-stdout>"
+            ),
+            Some("/tmp/log.txt".to_string())
+        );
+
+        // `(no content)` (NO_CONTENT_MESSAGE) → drop.
+        assert_eq!(claude_display_text("(no content)"), None);
+
+        // `[Request interrupted by user]` / `[Request interrupted by user for tool use]`
+        // → italic notice.
+        assert_eq!(
+            claude_display_text("[Request interrupted by user]"),
+            Some("*[Interrupted by user]*".to_string())
+        );
+        assert_eq!(
+            claude_display_text("[Request interrupted by user for tool use]"),
+            Some("*[Interrupted by user]*".to_string())
+        );
+
+        // `<tick>` wrapper → drop.
+        assert_eq!(claude_display_text("<tick>ignored</tick>"), None);
+
+        // `<local-command-caveat>` → drop.
+        assert_eq!(
+            claude_display_text("<local-command-caveat>hidden</local-command-caveat>"),
+            None
+        );
+
+        // `<user-memory-input>...</user-memory-input>` → `\# {content}` memory line.
+        assert_eq!(
+            claude_display_text("<user-memory-input>remember this</user-memory-input>"),
+            Some("\\# remember this".to_string())
+        );
+
+        // `({tool} completed with no output)` placeholder → `(No output)`.
+        assert_eq!(
+            claude_display_text("(Bash completed with no output)"),
+            Some("(No output)".to_string())
+        );
+        assert_eq!(
+            claude_display_text("(Read completed with no output)"),
+            Some("(No output)".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_agent_skill_edit_read_variants() {
+        // Agent — subagent_type 'worker' / 'general-purpose' / missing →
+        // "Agent" verb.
+        for st in &["worker", "general-purpose"] {
+            let out = claude_tool_use_text(
+                "Task",
+                &serde_json::json!({"description": "do thing", "subagent_type": st}),
+            )
+            .unwrap();
+            assert_eq!(out, "**Agent**(`do thing`)");
+        }
+        // Custom subagent_type used verbatim.
+        let out = claude_tool_use_text(
+            "Task",
+            &serde_json::json!({"description": "review", "subagent_type": "code-reviewer"}),
+        )
+        .unwrap();
+        assert_eq!(out, "**code-reviewer**(`review`)");
+
+        // Skill → `**Skill**({name})`.
+        let out =
+            claude_tool_use_text("Skill", &serde_json::json!({"skill": "format-md"})).unwrap();
+        assert_eq!(out, "**Skill**(`format-md`)");
+
+        // Edit with empty `old_string` → `**Create**(path)`.
+        let out = claude_tool_use_text(
+            "Edit",
+            &serde_json::json!({"file_path": "/tmp/new.ts", "old_string": "", "new_string": "x"}),
+        )
+        .unwrap();
+        assert_eq!(out, "**Create**(`/tmp/new.ts`)");
+        // Edit with non-empty `old_string` → `**Update**`.
+        let out = claude_tool_use_text(
+            "Edit",
+            &serde_json::json!({"file_path": "/tmp/x.ts", "old_string": "old", "new_string": "new"}),
+        )
+        .unwrap();
+        assert_eq!(out, "**Update**(`/tmp/x.ts`)");
+        // MultiEdit branch: first edit's old_string drives the verb.
+        let out = claude_tool_use_text(
+            "MultiEdit",
+            &serde_json::json!({
+                "file_path": "/tmp/x.ts",
+                "edits": [{"old_string": "", "new_string": "first"}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(out, "**Create**(`/tmp/x.ts`)");
+
+        // Read with agent-output path → "Read agent output" verb + taskId.
+        let out = claude_tool_use_text(
+            "Read",
+            &serde_json::json!({"file_path": "/tmp/proj-cache/tasks/abc123.output"}),
+        )
+        .unwrap();
+        assert_eq!(out, "**Read agent output**(`abc123`)");
+        // Plain read still uses "Read".
+        let out =
+            claude_tool_use_text("Read", &serde_json::json!({"file_path": "/src/foo.ts"})).unwrap();
+        assert_eq!(out, "**Read**(`/src/foo.ts`)");
+
+        // claude_agent_output_task_id heuristics.
+        assert_eq!(
+            claude_agent_output_task_id("/a/tasks/abc-1.output"),
+            Some("abc-1".to_string())
+        );
+        assert_eq!(claude_agent_output_task_id("/a/tasks/no-ext.txt"), None);
+        assert_eq!(
+            claude_agent_output_task_id("/a/tasks/way-too-long-id-over-twenty.output"),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_mcp_tool_verbs_match_official_casing() {
+        // ListMcpResources — literal lowerCamelCase verb.
+        assert_eq!(
+            claude_tool_use_text("ListMcpResources", &serde_json::json!({"server": "figma"})),
+            Some("**listMcpResources**(`figma`)".to_string())
+        );
+        // McpAuth — whole label is the bold verb.
+        assert_eq!(
+            claude_tool_use_text("McpAuth", &serde_json::json!({"server": "github"})),
+            Some("**github - authenticate (MCP)**".to_string())
+        );
+        // ReadMcpResource already covered in `claude_extra_tool_names_render_aligned_verbs`.
+    }
+
+    #[test]
+    fn claude_format_structured_patch_summary_and_no_at_at_header() {
+        // 2 added + 1 removed across one hunk.
+        let body = claude_format_structured_patch(&serde_json::json!({
+            "structuredPatch": [
+                {
+                    "oldStart": 1, "oldLines": 3, "newStart": 1, "newLines": 4,
+                    "lines": [
+                        " context",
+                        "+added one",
+                        "+added two",
+                        "-removed one",
+                        " context"
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        // Output must include the **Added .. removed ..** summary on its own
+        // line, blank line, then the ```diff fence — NO `@@` hunk header.
+        assert!(
+            body.starts_with("**Added 2 lines, removed 1 line**\n\n```diff\n"),
+            "missing or wrong summary header; got:\n{body}"
+        );
+        assert!(!body.contains("@@ "), "should not include `@@` hunk header");
+        assert!(body.ends_with("```"));
+
+        // Multi-hunk: blank line separator between hunks but still no `@@`.
+        let body = claude_format_structured_patch(&serde_json::json!({
+            "structuredPatch": [
+                {
+                    "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+                    "lines": ["+a"]
+                },
+                {
+                    "oldStart": 10, "oldLines": 1, "newStart": 10, "newLines": 0,
+                    "lines": ["-b"]
+                }
+            ]
+        }))
+        .unwrap();
+        assert!(body.starts_with("**Added 1 line, removed 1 line**\n\n```diff\n"));
+        assert!(!body.contains("@@ "));
+        assert!(
+            body.contains("+a\n\n-b\n"),
+            "hunks should be separated by blank line; got:\n{body}"
+        );
+
+        // Empty structuredPatch → None.
+        assert_eq!(
+            claude_format_structured_patch(&serde_json::json!({"structuredPatch": []})),
+            None
+        );
+        // Missing structuredPatch → None.
+        assert_eq!(claude_format_structured_patch(&serde_json::json!({})), None);
     }
 
     #[test]
