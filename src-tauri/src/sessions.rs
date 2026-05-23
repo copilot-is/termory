@@ -3251,11 +3251,25 @@ fn read_opencode_db_messages(
                     let Some(body) = opencode_v2_tool_part_text(&part) else {
                         continue;
                     };
+                    // Per session-v2.tsx:572 + l.669, a tool state of
+                    // `"error"` flips the InlineTool / BlockTool to the
+                    // error color and surfaces `state.error.message`.
+                    // Termory reflects this through `kind` so future UI
+                    // can colour the card uniformly across platforms.
+                    let failed = part
+                        .get("state")
+                        .and_then(|s| s.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("error");
                     out.push(SessionMessage {
                         role: "tool".to_string(),
                         text: body,
                         timestamp: timestamp.clone(),
-                        kind: kind::TOOL_USE.to_string(),
+                        kind: if failed {
+                            kind::TOOL_ERROR.to_string()
+                        } else {
+                            kind::TOOL_USE.to_string()
+                        },
                         tool_use_id: part.get("callID").and_then(value_to_string),
                         exit_code: None,
                     });
@@ -3312,25 +3326,63 @@ fn opencode_v2_message_from_value(value: &Value, created: i64) -> Option<Session
         .and_then(normalize_time)
         .or_else(|| normalize_time(created.to_string()));
     match message_type {
-        "user" => value
-            .get("text")
-            .and_then(value_to_string)
-            .map(|text| SessionMessage {
+        "user" => {
+            let text = value.get("text").and_then(value_to_string)?;
+            // Per session-v2.tsx:176-194, UserMessage renders file +
+            // agent attachments as colored pills beneath the prompt
+            // body (references are NOT rendered — see the JSX). Termory
+            // surfaces them as `` `kind` `name` `` code-span pairs on a
+            // line below the text so the markdown reader sees a
+            // visually-distinct row.
+            let mut body = text.trim().to_string();
+            let attachments = opencode_v2_user_attachments(value);
+            if !attachments.is_empty() {
+                if !body.is_empty() {
+                    body.push_str("\n\n");
+                }
+                body.push_str(&attachments);
+            }
+            Some(SessionMessage {
                 role: "user".to_string(),
-                text: text.trim().to_string(),
+                text: body,
                 timestamp,
                 kind: kind::TEXT.to_string(),
                 tool_use_id: None,
                 exit_code: None,
-            }),
-        "assistant" => opencode_v2_assistant_text(value).map(|text| SessionMessage {
-            role: "assistant".to_string(),
-            text,
-            timestamp,
-            kind: kind::TEXT.to_string(),
-            tool_use_id: None,
-            exit_code: None,
-        }),
+            })
+        }
+        "assistant" => {
+            let mut text = opencode_v2_assistant_text(value).unwrap_or_default();
+            // Per session-v2.tsx:339-353, AssistantMessage shows an
+            // error box (red border + error message) when `error` is
+            // set. Surface as an italic error notice on its own line.
+            if let Some(error_message) = value
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(value_to_string)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&format!("*✕ {error_message}*"));
+            }
+            if text.is_empty() {
+                return None;
+            }
+            Some(SessionMessage {
+                role: "assistant".to_string(),
+                text,
+                timestamp,
+                kind: kind::TEXT.to_string(),
+                tool_use_id: None,
+                exit_code: None,
+            })
+        }
+        // session-v2.tsx:105-107 — synthetic messages render nothing
+        // in the TUI; drop them silently.
+        "synthetic" => None,
         "shell" => {
             let command = value.get("command").and_then(value_to_string)?;
             let mut lines = vec![format!("$ {command}")];
@@ -3356,13 +3408,24 @@ fn opencode_v2_message_from_value(value: &Value, created: i64) -> Option<Session
         "compaction" => value
             .get("summary")
             .and_then(value_to_string)
-            .map(|summary| SessionMessage {
-                role: "system".to_string(),
-                text: summary.trim().to_string(),
-                timestamp,
-                kind: kind::COMPACTION.to_string(),
-                tool_use_id: None,
-                exit_code: None,
+            .map(|summary| {
+                // session-v2.tsx:237 — title is "Auto Compaction" when
+                // `reason === "auto"`, else just "Compaction". Surface the
+                // reason in a bold header so users can tell auto-triggered
+                // compactions apart from manual `/compact` invocations.
+                let title = if value.get("reason").and_then(Value::as_str) == Some("auto") {
+                    "Auto Compaction"
+                } else {
+                    "Compaction"
+                };
+                SessionMessage {
+                    role: "system".to_string(),
+                    text: format!("**{title}**\n\n{}", summary.trim()),
+                    timestamp,
+                    kind: kind::COMPACTION.to_string(),
+                    tool_use_id: None,
+                    exit_code: None,
+                }
             }),
         "agent-switched" => {
             value
@@ -3370,7 +3433,8 @@ fn opencode_v2_message_from_value(value: &Value, created: i64) -> Option<Session
                 .and_then(value_to_string)
                 .map(|agent| SessionMessage {
                     role: "system".to_string(),
-                    text: format!("Switched agent to {}", title_case(&agent)),
+                    // session-v2.tsx:267 prepends `▣ ` in agent color.
+                    text: format!("▣ Switched agent to {}", title_case(&agent)),
                     timestamp,
                     kind: kind::AGENT_SWITCHED.to_string(),
                     tool_use_id: None,
@@ -3396,7 +3460,8 @@ fn opencode_v2_message_from_value(value: &Value, created: i64) -> Option<Session
             }
             SessionMessage {
                 role: "system".to_string(),
-                text: format!("Switched model to {label}"),
+                // session-v2.tsx:284 prepends `◇ ` in secondary color.
+                text: format!("◇ Switched model to {label}"),
                 timestamp,
                 kind: kind::MODEL_SWITCHED.to_string(),
                 tool_use_id: None,
@@ -3405,6 +3470,50 @@ fn opencode_v2_message_from_value(value: &Value, created: i64) -> Option<Session
         }),
         _ => None,
     }
+}
+
+/// Format the user-message attachment row as code-span pills, per
+/// session-v2.tsx:176-194. Renders one inline-code "kind" tag + one
+/// inline-code "name" tag per attachment, separated by spaces:
+///
+/// ```text
+/// `image/png` `screenshot.png` `agent` `code-reviewer`
+/// ```
+///
+/// `references` (PromptReferenceAttachment) are persisted but NOT
+/// rendered by the TUI — we mirror that and ignore them.
+fn opencode_v2_user_attachments(value: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(files) = value.get("files").and_then(Value::as_array) {
+        for file in files {
+            let mime = file.get("mime").and_then(Value::as_str).unwrap_or("");
+            let name = file
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| file.get("uri").and_then(Value::as_str))
+                .unwrap_or("");
+            if mime.is_empty() && name.is_empty() {
+                continue;
+            }
+            if !mime.is_empty() {
+                parts.push(wrap_inline_code(mime));
+            }
+            if !name.is_empty() {
+                parts.push(wrap_inline_code(name));
+            }
+        }
+    }
+    if let Some(agents) = value.get("agents").and_then(Value::as_array) {
+        for agent in agents {
+            let name = agent.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            parts.push(wrap_inline_code("agent"));
+            parts.push(wrap_inline_code(name));
+        }
+    }
+    parts.join(" ")
 }
 
 fn opencode_v2_assistant_text(value: &Value) -> Option<String> {
@@ -3444,6 +3553,37 @@ fn opencode_v2_assistant_part_text(part: &Value) -> Option<String> {
 // `↳ Loaded`, `"pattern" in path` quoted format) are dropped in favor
 // of the unified shape so all four platforms read consistently.
 fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
+    let card = opencode_v2_tool_part_card(part)?;
+    let state = part.get("state");
+    let failed = state.and_then(|s| s.get("status")).and_then(Value::as_str) == Some("error");
+    let error_message = if failed {
+        state
+            .and_then(|s| s.get("error"))
+            .and_then(|e| e.get("message"))
+            .and_then(value_to_string)
+    } else {
+        None
+    };
+    let marker = status_marker(failed);
+    let mut out = format!("{marker}{card}");
+    // Per session-v2.tsx:669-702, the error text is rendered separately
+    // beneath the tool card in `theme.error`. Wrap in a 4-backtick fence
+    // with the `Error: {message}` prefix used by Codex / Claude / Gemini.
+    if let Some(message) = error_message.as_deref().map(str::trim) {
+        if !message.is_empty() {
+            out.push_str("\n\n````\nError: ");
+            out.push_str(message);
+            out.push_str("\n````");
+        }
+    } else if failed {
+        // Failure with no message — still surface "Error" so the user
+        // sees the failure indicator.
+        out.push_str("\n\n````\nError\n````");
+    }
+    Some(out)
+}
+
+fn opencode_v2_tool_part_card(part: &Value) -> Option<String> {
     let name = part
         .get("name")
         .and_then(value_to_string)
@@ -9394,7 +9534,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             bash,
-            "**Shell**(`npm test`)\n\n\\# Run tests\n\n```bash\n$ npm test\nok\n```"
+            "⏺ **Shell**(`npm test`)\n\n\\# Run tests\n\n```bash\n$ npm test\nok\n```"
         );
 
         // Read — `[other=...]` continues to display the other input fields
@@ -9408,7 +9548,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             read,
-            "**Read**(`src/main.ts` [limit=20, offset=10])\\\n↳ Loaded src/main.ts"
+            "⏺ **Read**(`src/main.ts` [limit=20, offset=10])\\\n↳ Loaded src/main.ts"
         );
 
         // TodoWrite — todos rendered as a list with status icons.
@@ -9424,7 +9564,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             todos,
-            "**Todos**\n\n✓ Read code\n~ Patch parser\n☐ Run tests"
+            "⏺ **Todos**\n\n✓ Read code\n~ Patch parser\n☐ Run tests"
         );
 
         // Glob — `**Glob**(pattern: ..., path: ... — N matches)`.
@@ -9437,7 +9577,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             glob,
-            "**Glob**(pattern: `**/*.ts`, path: `src` — 12 matches)"
+            "⏺ **Glob**(pattern: `**/*.ts`, path: `src` — 12 matches)"
         );
 
         // Grep — singular/plural still respected in the trailing summary.
@@ -9450,7 +9590,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             grep,
-            "**Grep**(pattern: `TODO`, path: `src/lib.rs` — 1 match)"
+            "⏺ **Grep**(pattern: `TODO`, path: `src/lib.rs` — 1 match)"
         );
 
         // Edit — diff content in ```diff fence; `←` arrow dropped.
@@ -9463,7 +9603,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             edit,
-            "**Edit**(`src/main.ts`)\n\n```diff\n- old\n+ new\n```"
+            "⏺ **Edit**(`src/main.ts`)\n\n```diff\n- old\n+ new\n```"
         );
     }
 
@@ -9491,7 +9631,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             bash,
-            "**Shell**(`ls`)\n\n\\# List\n\n```bash\n$ ls\nred line\nline2\n```"
+            "⏺ **Shell**(`ls`)\n\n\\# List\n\n```bash\n$ ls\nred line\nline2\n```"
         );
     }
 
@@ -9508,7 +9648,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             parallel,
-            "**Parallel Web Search**(`tauri v2 docs` — 5 results)"
+            "⏺ **Parallel Web Search**(`tauri v2 docs` — 5 results)"
         );
 
         let exa = opencode_v2_tool_part_text(&serde_json::json!({
@@ -9517,7 +9657,7 @@ mod tests {
             "metadata":{"provider":"exa","numResults":3}
         }))
         .unwrap();
-        assert_eq!(exa, "**Exa Web Search**(`rust async` — 3 results)");
+        assert_eq!(exa, "⏺ **Exa Web Search**(`rust async` — 3 results)");
 
         // No provider → default "Web Search" (with a space, matching the
         // TUI default at websearch.ts:42).
@@ -9526,7 +9666,7 @@ mod tests {
             "state":{"input":{"query":"q"}}
         }))
         .unwrap();
-        assert_eq!(default, "**Web Search**(`q`)");
+        assert_eq!(default, "⏺ **Web Search**(`q`)");
     }
 
     #[test]
@@ -9540,7 +9680,7 @@ mod tests {
             "metadata":{"files":[{"type":"delete","relativePath":"a.txt","deletions":1}]}
         }))
         .unwrap();
-        assert!(one.starts_with("**Deleted**(`a.txt`)"));
+        assert!(one.starts_with("⏺ **Deleted**(`a.txt`)"));
         assert!(one.contains("```diff\n-1 line\n```"), "got: {one}");
 
         let many = opencode_v2_tool_part_text(&serde_json::json!({
@@ -9568,6 +9708,169 @@ mod tests {
         )
         .unwrap();
         assert_eq!(msg.text, "$ ls\nbold plain");
+    }
+
+    #[test]
+    fn opencode_tool_error_marks_card_and_appends_error_body() {
+        // Per session-v2.tsx:572 + l.669, a tool whose state.status ==
+        // "error" gets the error color and a `state.error.message` text
+        // beneath the tool body. Termory should:
+        //   * flip the leading marker to `✗`
+        //   * append a 4-backtick fence body `Error: {message}`
+        let failed = opencode_v2_tool_part_text(&serde_json::json!({
+            "type":"tool",
+            "name":"bash",
+            "state":{
+                "status":"error",
+                "input":{"command":"./missing.sh","description":"Run"},
+                "error":{"type":"unknown","message":"command not found"}
+            }
+        }))
+        .unwrap();
+        // No output → Bash branch returns just the header; wrapper
+        // prepends `✗ ` and appends the `Error:` fence below.
+        assert_eq!(
+            failed,
+            "✗ **Shell**(`./missing.sh`)\n\n````\nError: command not found\n````"
+        );
+
+        // No `error.message` — still surface "Error" so the user sees
+        // the failure indicator instead of a confusingly-clean card.
+        let bare = opencode_v2_tool_part_text(&serde_json::json!({
+            "type":"tool",
+            "name":"bash",
+            "state":{"status":"error","input":{"command":"./x"}}
+        }))
+        .unwrap();
+        assert_eq!(bare, "✗ **Shell**(`./x`)\n\n````\nError\n````");
+    }
+
+    #[test]
+    fn opencode_user_message_surfaces_file_and_agent_attachments() {
+        // session-v2.tsx:176-194 — UserMessage renders attached files
+        // (mime + name pills) and agents (`agent` + name pills) under
+        // the prompt text. `references` are intentionally NOT rendered.
+        let msg = opencode_v2_message_from_value(
+            &serde_json::json!({
+                "type":"user",
+                "text":"please review",
+                "files":[
+                    {"uri":"file:///a.png","mime":"image/png","name":"shot.png"},
+                    {"uri":"file:///b.md","mime":"text/markdown"}
+                ],
+                "agents":[{"name":"reviewer"}],
+                "references":[{"name":"ignored","kind":"local"}],
+                "time":{"created":1_714_000_000_000_i64}
+            }),
+            1_714_000_000_000,
+        )
+        .unwrap();
+        // Second file has no `name` → falls back to `uri` per TUI
+        // `file.name ?? file.uri` at session-v2.tsx:182.
+        assert_eq!(
+            msg.text,
+            "please review\n\n`image/png` `shot.png` `text/markdown` `file:///b.md` `agent` `reviewer`"
+        );
+
+        // No attachments — message body is just the trimmed text.
+        let plain = opencode_v2_message_from_value(
+            &serde_json::json!({
+                "type":"user",
+                "text":"hi",
+                "time":{"created":1_714_000_000_000_i64}
+            }),
+            1_714_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(plain.text, "hi");
+    }
+
+    #[test]
+    fn opencode_compaction_title_reflects_auto_vs_manual_reason() {
+        // session-v2.tsx:237 — title is `Auto Compaction` for
+        // `reason === "auto"`, otherwise `Compaction`. Surface as a
+        // bold markdown header so users can tell auto-triggered
+        // compactions apart from manual `/compact` invocations.
+        let auto = opencode_v2_message_from_value(
+            &serde_json::json!({
+                "type":"compaction","reason":"auto","summary":"summary text",
+                "time":{"created":1_714_000_000_000_i64}
+            }),
+            1_714_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(auto.text, "**Auto Compaction**\n\nsummary text");
+
+        let manual = opencode_v2_message_from_value(
+            &serde_json::json!({
+                "type":"compaction","reason":"manual","summary":"summary text",
+                "time":{"created":1_714_000_000_000_i64}
+            }),
+            1_714_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(manual.text, "**Compaction**\n\nsummary text");
+    }
+
+    #[test]
+    fn opencode_agent_and_model_switch_messages_carry_tui_icons() {
+        // session-v2.tsx:267 prepends `▣ ` for agent switches, l.284
+        // prepends `◇ ` for model switches.
+        let agent = opencode_v2_message_from_value(
+            &serde_json::json!({
+                "type":"agent-switched","agent":"build",
+                "time":{"created":1_714_000_000_000_i64}
+            }),
+            1_714_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(agent.text, "▣ Switched agent to Build");
+
+        let model = opencode_v2_message_from_value(
+            &serde_json::json!({
+                "type":"model-switched",
+                "model":{"providerID":"anthropic","id":"claude","variant":"default"},
+                "time":{"created":1_714_000_000_000_i64}
+            }),
+            1_714_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(model.text, "◇ Switched model to anthropic/claude");
+    }
+
+    #[test]
+    fn opencode_assistant_error_surfaces_below_text() {
+        // session-v2.tsx:339-353 — when assistant.error is set, a red
+        // notice box renders below the message body. Termory mirrors
+        // with an italic `*✕ {message}*` line.
+        let msg = opencode_v2_message_from_value(
+            &serde_json::json!({
+                "type":"assistant",
+                "agent":"general",
+                "model":{"providerID":"x","id":"y","variant":""},
+                "content":[{"type":"text","text":"Working on it"}],
+                "error":{"type":"unknown","message":"Connection reset"},
+                "time":{"created":1_714_000_000_000_i64}
+            }),
+            1_714_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(msg.text, "Working on it\n\n*✕ Connection reset*");
+    }
+
+    #[test]
+    fn opencode_synthetic_messages_drop_silently() {
+        // session-v2.tsx:105-107 — synthetic messages render `<></>`
+        // (nothing). Termory drops them so they don't pollute the
+        // transcript.
+        let msg = opencode_v2_message_from_value(
+            &serde_json::json!({
+                "type":"synthetic","text":"system-generated",
+                "sessionID":"s","time":{"created":1_714_000_000_000_i64}
+            }),
+            1_714_000_000_000,
+        );
+        assert!(msg.is_none());
     }
 
     #[test]
@@ -9664,7 +9967,7 @@ mod tests {
         assert_eq!(detail.messages[1].kind, "tool_use");
         assert_eq!(
             detail.messages[1].text,
-            "**Shell**(`npm test`)\n\n\\# Run tests\n\n```bash\n$ npm test\nok\n```"
+            "⏺ **Shell**(`npm test`)\n\n\\# Run tests\n\n```bash\n$ npm test\nok\n```"
         );
     }
 

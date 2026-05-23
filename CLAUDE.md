@@ -233,7 +233,7 @@ Every tool message — regardless of source platform — funnels into the same m
 |---|---|---|
 | Codex | `Process exited with code N` / `Exit code: N` in the `function_call_output.output` wrapper (`ExecCommandToolOutput.response_text()` — context.rs:409) parsed by `codex_parse_exec_output` | Limited mode default; populates `exit_code` |
 | Claude | `tool_result.is_error: true` content block | No exit code field — `Error:` prefix has no `Exit code N` part |
-| OpenCode | `tool.error` / failed step state | Wired through `merge_tool_outputs` is_error flag |
+| OpenCode | `state.status === "error"` on a tool part (and `state.error.message` for the text); `assistant.error` for whole-message failures (`SessionErrorUnknown` shape per types.gen.ts:2905) | Body gets `✗ ` marker + 4-backtick `Error: {message}` fence; kind = `tool_error` so future UI can colour the card |
 | Gemini | `status` field on each `toolCalls[]` entry; per `sessionUtils.ts:654-657` anything other than `'success'` (e.g. `'error'`, `'cancelled'`) maps to `CoreToolCallStatus.Error` | No exit code; body gets an `Error:` prefix |
 
 ### Per-platform verb mapping
@@ -350,6 +350,18 @@ Feature-gated wrappers not handled: `<github-webhook-activity>` (KAIROS_GITHUB_W
 - `Task` (l.1030): `**{Titlecase(subagent_type ?? "General")} Task**({wrap_inline_code(description)})` — verb includes the agent name prefix, matching the original `{Agent} Task — description` heading.
 - generic (l.522): `**{name}**({input})` header + 4-backtick output fence when present.
 - `reasoning` part → `format_reasoning_body` (unified italic blockquote — replaces the old `_Thinking:_` inline prefix).
+
+All tool cards emit a `⏺` / `✗` leading marker (`status_marker` per session-v2.tsx:572 + l.669 — error state flips the InlineTool/BlockTool color). Failed parts append a 4-backtick `Error: {message}` body from `state.error.message`, mirroring Codex / Claude / Gemini failure formatting.
+
+Top-level `SessionMessage` types beyond the tool parts (session-v2.tsx Match arms l.92-122):
+
+- `user` (l.159 UserMessage) → `text` body + attachment row built by `opencode_v2_user_attachments`. Files surface as `` `{mime}` `` `` `{name ?? uri}` `` code-span pairs (l.176-185); agents as `` `agent` `` `` `{name}` `` (l.186-193). `references` (PromptReferenceAttachment) are persisted but TUI skips them, so Termory does too.
+- `assistant` (l.296 AssistantMessage) → text from parts; if `message.error.message` is set (l.339-353), append `*✕ {message}*` italic notice on its own line.
+- `synthetic` (l.105-107) → TUI renders `<></>`; Termory returns `None` so they don't appear in the transcript.
+- `shell` (l.200 ShellMessage) → `$ {command}` + `strip_ansi(output)` on a second line.
+- `compaction` (l.231) → bold header `**Auto Compaction**` (when `reason === "auto"`) or `**Compaction**`, followed by the `summary` body.
+- `agent-switched` (l.261) → `▣ Switched agent to {Titlecase(agent)}` (prefix matches the TUI agent-color glyph at l.267).
+- `model-switched` (l.275) → `◇ Switched model to {provider}/{id}[/{variant}]` (prefix matches l.284 secondary-color glyph).
 
 Audit reference is OpenCode `1.15.5` (commit `9324ef0`). Compared against `v1.15.7`: only cosmetic reasoning collapse-icon change in session-v2.tsx (`▼/▶` → `-/+`), no structural / schema diffs. No re-audit needed.
 
