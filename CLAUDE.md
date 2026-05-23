@@ -213,13 +213,13 @@ Every tool message — regardless of source platform — funnels into the same m
 
 **Shape:**
 
-```
+`````
 {status} **{Verb}**({args})
 
 ````
 {body — may include `Error: ...` prefix on failures}
 ````
-```
+`````
 
 - `{status}` is the leading glyph: `⏺` on success, `✗` on failure. Inserted by `merge_tool_outputs` (for paired tool_use/tool_result) or by the tool emitter directly (for self-contained EventMsg-derived cards like MCP / WebSearch). Matches Claude TUI's BLACK_CIRCLE prefix in `constants/figures.ts:4` (`⏺` on darwin, `●` elsewhere) for success; `✗` mirrors Codex's failure badge in `exec_cell/render.rs:236`.
 - `{Verb}` text is platform-native (per `session-v2.tsx` for OpenCode, `userFacingName` for Claude, `exec_cell/render.rs` for Codex, `displayName` for Gemini) — but the wrapper SHAPE `**Verb**(args)` is unified across all four. Platform-native verbs preserved: OpenCode keeps `Shell` / `Todos` / `Questions` / `{Agent} Task`; Codex shell uses `Bash` (was `Ran`, unified with Claude per design call so users don't see two different verbs for the same operation); apply_patch uses `Added` / `Deleted` / `Edited`.
