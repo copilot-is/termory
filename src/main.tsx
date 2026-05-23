@@ -559,7 +559,9 @@ function App() {
 
             <div className="detailStats">
               <InfoPill icon={<CalendarDays size={15} />} label={formatDate(selected.updated_at ?? selected.started_at)} />
-              <InfoPill icon={<Bot size={15} />} label={`${selected.message_count} messages`} />
+              {isSessionItem(selected) && (
+                <InfoPill icon={<Bot size={15} />} label={`${selected.message_count} messages`} />
+              )}
               <InfoPill icon={<Tags size={15} />} label={selected.path} />
             </div>
 
@@ -569,7 +571,7 @@ function App() {
                   <Loader2 className="spin" />
                 </div>
               )}
-              {!detailLoading &&
+              {!detailLoading && isSessionItem(selected) &&
                 detail?.messages.map((message, index) => (
                   <article key={`${message.timestamp ?? "msg"}:${index}`} className={`message ${roleClass(message.role)}`}>
                     <div className="messageTop">
@@ -579,6 +581,15 @@ function App() {
                     <MessageBody text={message.text} />
                   </article>
                 ))}
+              {!detailLoading && !isSessionItem(selected) && detail?.messages.length ? (
+                // Memory / Skill files are single-document .md previews;
+                // drop the message-card chrome (role label, timestamp,
+                // padded wrapper) and render the body as a single
+                // continuous document.
+                <div className="docBody">
+                  <MessageBody text={detail.messages.map((m) => m.text).join("\n\n")} />
+                </div>
+              ) : null}
             </div>
           </>
         )}

@@ -645,6 +645,17 @@ input {
   background: #ffffff;
 }
 
+/* Memory / Skill detail — render the .md content as a single
+   continuous document. No card chrome, no role label; the .messageBody
+   styles still apply so headings / code / lists stay consistent with
+   session messages. */
+.docBody {
+  background: #ffffff;
+  border: 1px solid #e0e5e7;
+  border-radius: 8px;
+  padding: 18px 22px;
+}
+
 .message.user {
   border-color: #bdd7d2;
 }
