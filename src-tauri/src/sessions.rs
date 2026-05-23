@@ -2409,6 +2409,16 @@ fn gemini_messages_from_values(values: &[Value]) -> Vec<SessionMessage> {
 /// `.audit-sources/gemini-cli/packages/cli/src/ui/components/messages/ThinkingMessage.tsx:22`
 /// — subject + description joined, noise lines (whitespace / `...` runs)
 /// filtered out.
+///
+/// Per the TUI's render at l.82-93, the subject is **bold italic** while
+/// description lines are plain italic. We wrap the subject in `**...**`
+/// before joining so `format_reasoning_body` preserves it as a bold
+/// blockquote header (with description lines as italic body) — matches
+/// Codex's reasoning bold-header path.
+///
+/// Source also applies `normalizeEscapedNewlines` (textUtils.ts:168) to
+/// both subject and description so persisted `\\n` / `\\r\\n` literals
+/// render as real line breaks. Termory does the same before splitting.
 fn gemini_thought_messages_from_value(value: &Value) -> Vec<SessionMessage> {
     let Some(thoughts) = value.get("thoughts").and_then(Value::as_array) else {
         return Vec::new();
@@ -2419,30 +2429,35 @@ fn gemini_thought_messages_from_value(value: &Value) -> Vec<SessionMessage> {
         .and_then(normalize_time);
     let mut out = Vec::new();
     for thought in thoughts {
-        let subject = thought
+        let subject_raw = thought
             .get("subject")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        let description = thought
+            .map(gemini_normalize_escaped_newlines)
+            .unwrap_or_default();
+        let description_raw = thought
             .get("description")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
+            .map(gemini_normalize_escaped_newlines)
+            .unwrap_or_default();
+        let subject = subject_raw.trim();
+        let description = description_raw.trim();
         let is_noise = |line: &str| {
             let trimmed = line.trim();
             trimmed.is_empty() || trimmed.chars().all(|c| c == '.')
         };
-        let mut lines: Vec<&str> = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
         if !subject.is_empty() && !is_noise(subject) {
-            lines.push(subject);
+            // Bold subject so format_reasoning_body keeps it as a bold
+            // header line in the blockquote (matches TUI bold-italic).
+            lines.push(format!("**{subject}**"));
         }
         if !description.is_empty() {
             lines.extend(
                 description
                     .lines()
                     .map(str::trim)
-                    .filter(|line| !is_noise(line)),
+                    .filter(|line| !is_noise(line))
+                    .map(str::to_string),
             );
         }
         if lines.is_empty() {
@@ -2478,13 +2493,25 @@ fn gemini_message_from_value(value: &Value) -> Option<SessionMessage> {
         "info" | "error" | "warning" => raw_type.as_str(),
         _ => return None,
     };
-    let text = value
+    let raw_text = value
         .get("displayContent")
         .and_then(gemini_content_text_raw)
         .or_else(|| value.get("content").and_then(gemini_content_text_raw))?;
-    if text.trim().is_empty() {
+    if raw_text.trim().is_empty() {
         return None;
     }
+    // System notices (info / error / warning) get a leading TUI icon +
+    // italic body so they're visually distinct from regular assistant /
+    // user text. Prefixes come straight from the TUI components:
+    //   * info     → `ℹ ` (InfoMessage.tsx:30, warning color)
+    //   * error    → `✕ ` (ErrorMessage.tsx:16, error color)
+    //   * warning  → `⚠ ` (WarningMessage.tsx:17, warning color)
+    let text = match raw_type.as_str() {
+        "info" => format_gemini_system_notice("ℹ", &raw_text),
+        "error" => format_gemini_system_notice("✕", &raw_text),
+        "warning" => format_gemini_system_notice("⚠", &raw_text),
+        _ => raw_text,
+    };
     let timestamp = value
         .get("timestamp")
         .and_then(value_to_string)
@@ -2524,6 +2551,14 @@ fn gemini_tool_messages_from_value(value: &Value) -> Vec<SessionMessage> {
                 .get("description")
                 .and_then(value_to_string)
                 .unwrap_or_default();
+            // Per `sessionUtils.ts:654-657`, Gemini's session loader maps
+            // `status === 'success'` → Success, anything else → Error. So
+            // any non-'success' status (e.g. 'error', 'cancelled') flips
+            // the leading marker to `✗` and the body gets an `Error:`
+            // prefix — matching Codex / Claude failure handling.
+            let status = tool.get("status").and_then(Value::as_str).unwrap_or("");
+            let failed = !status.is_empty() && status != "success";
+
             // Unified `**Verb**(args)` shape — description (Gemini's TUI
             // secondary text from `ToolShared.tsx:202`) goes inside parens
             // so the card reads the same as Codex / Claude / OpenCode tool
@@ -2533,29 +2568,242 @@ fn gemini_tool_messages_from_value(value: &Value) -> Vec<SessionMessage> {
             } else {
                 format!("**{display_name}**({description})")
             };
-            let mut text = header;
-            if let Some(result) = tool.get("resultDisplay").and_then(gemini_content_text_raw) {
-                let trimmed = result.trim();
+            let mut text = String::from(status_marker(failed));
+            text.push_str(&header);
+
+            let body = tool
+                .get("resultDisplay")
+                .and_then(gemini_result_display_to_text);
+            if let Some(b) = body {
+                let trimmed = b.trim();
                 if !trimmed.is_empty() {
-                    // resultDisplay can be plain text or structured. Wrap in
-                    // a 4-backtick fence so the markdown renderer applies
-                    // monospace + highlight.js can infer a language,
-                    // approximating ToolResultDisplay's per-tool formatting.
-                    text.push_str("\n\n````\n");
-                    text.push_str(trimmed);
-                    text.push_str("\n````");
+                    text.push_str("\n\n");
+                    if failed {
+                        // Failures: `Error: ` prefix inside a 4-backtick
+                        // fence (matches Codex / Claude failure shape).
+                        text.push_str("````\nError: ");
+                        text.push_str(trimmed);
+                        text.push_str("\n````");
+                    } else if trimmed.starts_with("```") {
+                        // Diff / structured fence already present (the
+                        // body is a complete ```diff … ``` block from
+                        // `gemini_result_display_to_text`).
+                        text.push_str(trimmed);
+                    } else {
+                        // Plain string / pretty-printed JSON output:
+                        // wrap in 4-backtick fence so embedded triple
+                        // backticks in the content survive.
+                        text.push_str("````\n");
+                        text.push_str(trimmed);
+                        text.push_str("\n````");
+                    }
                 }
+            } else if failed {
+                // No body but failed status — still surface the failure.
+                text.push_str("\n\n````\nError\n````");
             }
             Some(SessionMessage {
                 role: "tool".to_string(),
                 text,
                 timestamp: timestamp.clone(),
-                kind: kind::TOOL_USE.to_string(),
+                kind: if failed {
+                    kind::TOOL_ERROR.to_string()
+                } else {
+                    kind::TOOL_USE.to_string()
+                },
                 tool_use_id: None,
                 exit_code: None,
             })
         })
         .collect()
+}
+
+/// Convert a Gemini `resultDisplay` value to a markdown body string per
+/// `ToolResultDisplay.tsx`:
+///
+/// * `null` / empty → `None` (no body)
+/// * `string` → returned verbatim (markdown / plain-text rendered as-is)
+/// * `Array<AnsiLine>` where each line is `Array<AnsiToken>` → join token
+///   `text` fields with `\n` between lines, trim per-line trailing
+///   whitespace (xterm-headless pads each line to terminal width). Detect
+///   by checking whether the first element is itself an array.
+/// * `Array<Part>` (legacy Gemini content parts) → fall through to
+///   `gemini_content_text_raw`.
+/// * `{ todos }` → drop (TUI hides it; TodoTray renders todos separately —
+///   `ToolResultDisplay.tsx:84-87`).
+/// * `{ isSubagentProgress: true, ... }` → drop (complex live-progress
+///   widget; no useful static representation).
+/// * `{ fileDiff, fileName? }` → ```diff fence wrapping the unified diff
+///   (the diff already embeds file headers, so `fileName` is not surfaced
+///   separately — `ToolResultDisplay.tsx:145-161`).
+/// * `{ summary, ... }` (StructuredToolResult — GrepResult / ListDirectory /
+///   ReadManyFiles all share this shape) → return the `summary` string.
+/// * other object → `serde_json::to_string_pretty` (matches the TUI's
+///   `JSON.stringify(obj, null, 2)` fallback at
+///   `ToolResultDisplay.tsx:179-184`).
+fn gemini_result_display_to_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => {
+            if s.trim().is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        Value::Array(items) => {
+            // AnsiOutput detection per `isAnsiOutput` in types.ts:105-106:
+            // an array whose first element is itself an array.
+            if items.first().is_some_and(Value::is_array) {
+                let mut lines = Vec::with_capacity(items.len());
+                for line in items {
+                    let Some(tokens) = line.as_array() else {
+                        continue;
+                    };
+                    let mut row = String::new();
+                    for tok in tokens {
+                        if let Some(text) = tok.get("text").and_then(Value::as_str) {
+                            row.push_str(text);
+                        }
+                    }
+                    lines.push(row.trim_end().to_string());
+                }
+                let joined = lines.join("\n");
+                if joined.trim().is_empty() {
+                    None
+                } else {
+                    Some(joined)
+                }
+            } else {
+                gemini_content_text_raw(value)
+            }
+        }
+        Value::Object(map) => {
+            if map.contains_key("todos") {
+                return None;
+            }
+            if map
+                .get("isSubagentProgress")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            if let Some(file_diff) = map.get("fileDiff").and_then(Value::as_str) {
+                let file_name = map.get("fileName").and_then(Value::as_str);
+                return Some(gemini_format_file_diff(file_diff, file_name));
+            }
+            if let Some(summary) = map.get("summary").and_then(Value::as_str) {
+                if !summary.trim().is_empty() {
+                    return Some(summary.to_string());
+                }
+            }
+            serde_json::to_string_pretty(value).ok()
+        }
+        _ => None,
+    }
+}
+
+/// Mirror Gemini TUI's `normalizeEscapedNewlines`
+/// (`packages/cli/src/ui/utils/textUtils.ts:168`): convert escaped CRLF
+/// (`\r\n`) and LF (`\n`) literals to real line breaks. Persisted
+/// `subject` / `description` strings sometimes carry the escaped form
+/// literally; without this they render as a single line with visible
+/// `\n` sequences.
+fn gemini_normalize_escaped_newlines(value: &str) -> String {
+    value.replace("\\r\\n", "\n").replace("\\n", "\n")
+}
+
+/// Wrap an info / warning / error system notice in italic with the
+/// TUI's icon glyph. Multi-line bodies stay italic across each line so
+/// the entire notice reads as one styled block (matches the way
+/// InfoMessage/ErrorMessage/WarningMessage colors the whole text).
+fn format_gemini_system_notice(icon: &str, body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (idx, line) in trimmed.lines().enumerate() {
+        if idx > 0 {
+            // Markdown line breaks via two trailing spaces, so the italic
+            // span continues across visual lines without a paragraph
+            // break (which would terminate the italic).
+            out.push_str("  \n");
+        }
+        if idx == 0 {
+            out.push('*');
+            out.push_str(icon);
+            out.push(' ');
+            out.push_str(line.trim());
+            // Close italic at the very end (handled outside the loop)
+        } else {
+            out.push_str(line.trim());
+        }
+    }
+    out.push('*');
+    out
+}
+
+/// Render a Gemini `resultDisplay: {fileDiff, fileName?}` body. Per
+/// `DiffRenderer.tsx:204-214`, a "new file" diff (every non-context line
+/// is an add / hunk / header) is rendered as raw added content in a
+/// syntax-highlighted code block, not as a diff. Termory mirrors:
+///   * new file → ```{lang}\n{added lines}\n```` (lang inferred from
+///     the filename extension)
+///   * normal patch → ```diff\n{full diff}\n````
+fn gemini_format_file_diff(file_diff: &str, file_name: Option<&str>) -> String {
+    let diff = file_diff.trim_end_matches('\n');
+    if gemini_is_new_file_diff(diff) {
+        let added: Vec<&str> = diff
+            .lines()
+            .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+            .map(|line| &line[1..])
+            .collect();
+        let body = added.join("\n");
+        let lang = file_name
+            .and_then(|name| name.rsplit_once('.').map(|(_, ext)| ext))
+            .map(str::to_lowercase)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+        if lang.is_empty() {
+            format!("```\n{body}\n```")
+        } else {
+            format!("```{lang}\n{body}\n```")
+        }
+    } else {
+        format!("```diff\n{diff}\n```")
+    }
+}
+
+/// Approximation of TUI's `isNewFile` predicate (DiffRenderer.tsx:204-214):
+/// at least one `+` line is present, AND every meaningful line is either
+/// an addition, a hunk header `@@`, or a unified-diff header. We treat
+/// any non-empty content line starting with `-` or ` ` (context) as
+/// proof the file is not new.
+fn gemini_is_new_file_diff(diff: &str) -> bool {
+    let mut has_add = false;
+    for line in diff.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with("@@") {
+            continue;
+        }
+        if line.starts_with("diff --git") || line.starts_with("new file mode") {
+            continue;
+        }
+        if line.starts_with('+') {
+            has_add = true;
+            continue;
+        }
+        // Any deletion / context line → not a new file.
+        return false;
+    }
+    has_add
 }
 
 fn gemini_content_text_raw(value: &Value) -> Option<String> {
@@ -6932,13 +7180,124 @@ mod tests {
         }));
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].kind, kind::REASONING);
+        // Per ThinkingMessage.tsx:84-93, the subject renders as bold +
+        // italic and description lines render as plain italic. We map to
+        // the unified blockquote shape: subject becomes a bold header
+        // line (`> **subject**`) and description lines stay italic.
         assert_eq!(
             messages[0].text,
-            "> *Examining Workspace State*\n> *Reviewing git status.*\n> *Will check diff next.*"
+            "> **Examining Workspace State**\n> *Reviewing git status.*\n> *Will check diff next.*"
         );
         // Second thought has noise-only subject (`...`) but a real
         // description — subject is dropped, description rendered.
         assert_eq!(messages[1].text, "> *noise only*");
+    }
+
+    #[test]
+    fn gemini_thought_normalizes_escaped_newlines_in_description() {
+        // Persisted `description` strings sometimes carry literal `\\n`
+        // escape sequences instead of real newlines. TUI applies
+        // `normalizeEscapedNewlines` (textUtils.ts:168) before splitting,
+        // and Termory mirrors so multi-paragraph reasoning renders as
+        // multiple italic lines instead of one long line with visible
+        // backslash-n.
+        let messages = gemini_thought_messages_from_value(&serde_json::json!({
+            "type": "gemini",
+            "thoughts": [{
+                "subject": "Plan",
+                "description": "Step one.\\nStep two.\\r\\nStep three."
+            }]
+        }));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].text,
+            "> **Plan**\n> *Step one.*\n> *Step two.*\n> *Step three.*"
+        );
+    }
+
+    #[test]
+    fn gemini_system_notices_get_tui_icon_prefix() {
+        // `info` / `error` / `warning` are persisted message types but
+        // were previously rendered as plain text with no visual cue.
+        // TUI uses `ℹ`, `✕`, `⚠` icons (InfoMessage / ErrorMessage /
+        // WarningMessage); Termory now prefixes the same icons inside an
+        // italic span so they stand out under the unified markdown
+        // renderer.
+        let m = gemini_message_from_value(&serde_json::json!({
+            "type": "info",
+            "content": "Request cancelled.",
+            "timestamp": "2026-04-30T10:32:22Z"
+        }))
+        .unwrap();
+        assert_eq!(m.role, "info");
+        assert_eq!(m.text, "*ℹ Request cancelled.*");
+
+        let m = gemini_message_from_value(&serde_json::json!({
+            "type": "error",
+            "content": "Tool failed"
+        }))
+        .unwrap();
+        assert_eq!(m.text, "*✕ Tool failed*");
+
+        let m = gemini_message_from_value(&serde_json::json!({
+            "type": "warning",
+            "content": "Approaching token limit"
+        }))
+        .unwrap();
+        assert_eq!(m.text, "*⚠ Approaching token limit*");
+
+        // Multi-line bodies wrap each subsequent line with a CommonMark
+        // hard-break (`  \n`) so the italic span continues across lines
+        // without a paragraph break terminating it.
+        let m = gemini_message_from_value(&serde_json::json!({
+            "type": "info",
+            "content": "Line one\nLine two"
+        }))
+        .unwrap();
+        assert_eq!(m.text, "*ℹ Line one  \nLine two*");
+    }
+
+    #[test]
+    fn gemini_new_file_diff_unwraps_to_code_block() {
+        // Per DiffRenderer.tsx:204-214 `isNewFile` predicate, when every
+        // non-header line in the diff is an addition the TUI renders the
+        // raw added content as a syntax-highlighted code block instead of
+        // a unified diff. Termory mirrors: ```{lang}\n{adds}\n``` for
+        // new files (lang from filename extension), ```diff\n...\n``` for
+        // normal patches.
+        let msgs = gemini_tool_messages_from_value(&serde_json::json!({
+            "toolCalls": [{
+                "id": "t1",
+                "name": "write_file",
+                "displayName": "Write",
+                "description": "greeting.py",
+                "status": "success",
+                "resultDisplay": {
+                    "fileDiff": "--- a/greeting.py\n+++ b/greeting.py\n@@ -0,0 +1,2 @@\n+def hello():\n+    print('hi')\n",
+                    "fileName": "greeting.py"
+                }
+            }]
+        }));
+        assert_eq!(
+            msgs[0].text,
+            "⏺ **Write**(greeting.py)\n\n```py\ndef hello():\n    print('hi')\n```"
+        );
+
+        // Normal patch (has a deletion) → ```diff fence (unchanged).
+        let msgs = gemini_tool_messages_from_value(&serde_json::json!({
+            "toolCalls": [{
+                "id": "t2",
+                "name": "replace",
+                "displayName": "Edit",
+                "description": "greeting.py",
+                "status": "success",
+                "resultDisplay": {
+                    "fileDiff": "--- a/greeting.py\n+++ b/greeting.py\n@@ -1 +1 @@\n-old\n+new\n",
+                    "fileName": "greeting.py"
+                }
+            }]
+        }));
+        assert!(msgs[0].text.contains("```diff\n"));
     }
 
     #[test]
@@ -8535,6 +8894,125 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(text, "````\nboom\n````\n\n*Outcome: OUTCOME_FAILED*");
+    }
+
+    #[test]
+    fn gemini_tool_card_renders_status_and_structured_result_display() {
+        // Success → `⏺` marker, plain-string resultDisplay wraps in
+        // 4-backtick fence. Matches Codex / Claude success shape.
+        let msgs = gemini_tool_messages_from_value(&serde_json::json!({
+            "toolCalls": [{
+                "id": "t1",
+                "name": "run_shell_command",
+                "displayName": "Shell",
+                "description": "Ran tests",
+                "status": "success",
+                "resultDisplay": "ok"
+            }]
+        }));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].text, "⏺ **Shell**(Ran tests)\n\n````\nok\n````");
+        assert_eq!(msgs[0].kind, kind::TOOL_USE);
+
+        // Error status → `✗` marker, body prefixed with `Error: ` inside
+        // the fence. Per sessionUtils.ts:654-657, anything other than
+        // `'success'` is mapped to Error in Gemini's own session loader.
+        let msgs = gemini_tool_messages_from_value(&serde_json::json!({
+            "toolCalls": [{
+                "id": "t2",
+                "name": "run_shell_command",
+                "displayName": "Shell",
+                "description": "Ran failing cmd",
+                "status": "error",
+                "resultDisplay": "command not found"
+            }]
+        }));
+        assert_eq!(
+            msgs[0].text,
+            "✗ **Shell**(Ran failing cmd)\n\n````\nError: command not found\n````"
+        );
+        assert_eq!(msgs[0].kind, kind::TOOL_ERROR);
+
+        // `{summary, files}` → ListDirectoryResult shape (one of several
+        // StructuredToolResult variants). TUI's ToolResultDisplay reads
+        // `.summary` as markdown body; Termory mirrors by passing the
+        // summary through and dropping the rest.
+        let msgs = gemini_tool_messages_from_value(&serde_json::json!({
+            "toolCalls": [{
+                "id": "t3",
+                "name": "list_directory",
+                "displayName": "ReadFolder",
+                "description": "Listed src",
+                "status": "success",
+                "resultDisplay": {
+                    "summary": "Found 3 item(s).",
+                    "files": ["a.ts", "b.ts", "c.ts"]
+                }
+            }]
+        }));
+        assert_eq!(
+            msgs[0].text,
+            "⏺ **ReadFolder**(Listed src)\n\n````\nFound 3 item(s).\n````"
+        );
+
+        // `{fileDiff, fileName}` → DiffRenderer in TUI
+        // (ToolResultDisplay.tsx:145-161). Termory emits a complete
+        // ```diff fence so the markdown viewer styles it as a diff.
+        let msgs = gemini_tool_messages_from_value(&serde_json::json!({
+            "toolCalls": [{
+                "id": "t4",
+                "name": "replace",
+                "displayName": "Edit",
+                "description": "constants.ts",
+                "status": "success",
+                "resultDisplay": {
+                    "fileDiff": "--- a/constants.ts\n+++ b/constants.ts\n@@ -1 +1 @@\n-x\n+y\n",
+                    "fileName": "constants.ts"
+                }
+            }]
+        }));
+        assert_eq!(
+            msgs[0].text,
+            "⏺ **Edit**(constants.ts)\n\n```diff\n--- a/constants.ts\n+++ b/constants.ts\n@@ -1 +1 @@\n-x\n+y\n```"
+        );
+
+        // `{todos: ...}` → TUI shows nothing (TodoTray renders todos
+        // elsewhere). Termory drops the body but still emits the header
+        // card so the user sees that the tool ran.
+        let msgs = gemini_tool_messages_from_value(&serde_json::json!({
+            "toolCalls": [{
+                "id": "t5",
+                "name": "todo_write",
+                "displayName": "Todos",
+                "description": "Updated plan",
+                "status": "success",
+                "resultDisplay": {"todos": [{"content": "x", "status": "done"}]}
+            }]
+        }));
+        assert_eq!(msgs[0].text, "⏺ **Todos**(Updated plan)");
+
+        // AnsiOutput (array of AnsiLine arrays) → join token `text`
+        // fields, trim per-line trailing whitespace (xterm-headless pads
+        // each line to terminal width). Detect by checking the first
+        // element is itself an array (matches `isAnsiOutput` in
+        // types.ts:105-106).
+        let msgs = gemini_tool_messages_from_value(&serde_json::json!({
+            "toolCalls": [{
+                "id": "t6",
+                "name": "run_shell_command",
+                "displayName": "Shell",
+                "description": "git status",
+                "status": "success",
+                "resultDisplay": [
+                    [{"text": "On branch main      "}],
+                    [{"text": "nothing to commit   "}]
+                ]
+            }]
+        }));
+        assert_eq!(
+            msgs[0].text,
+            "⏺ **Shell**(git status)\n\n````\nOn branch main\nnothing to commit\n````"
+        );
     }
 
     #[test]

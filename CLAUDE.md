@@ -234,7 +234,7 @@ Every tool message — regardless of source platform — funnels into the same m
 | Codex | `Process exited with code N` / `Exit code: N` in the `function_call_output.output` wrapper (`ExecCommandToolOutput.response_text()` — context.rs:409) parsed by `codex_parse_exec_output` | Limited mode default; populates `exit_code` |
 | Claude | `tool_result.is_error: true` content block | No exit code field — `Error:` prefix has no `Exit code N` part |
 | OpenCode | `tool.error` / failed step state | Wired through `merge_tool_outputs` is_error flag |
-| Gemini | `result.error` on `toolCalls[]` entries | Optional; absent on most calls |
+| Gemini | `status` field on each `toolCalls[]` entry; per `sessionUtils.ts:654-657` anything other than `'success'` (e.g. `'error'`, `'cancelled'`) maps to `CoreToolCallStatus.Error` | No exit code; body gets an `Error:` prefix |
 
 ### Per-platform verb mapping
 
@@ -355,8 +355,16 @@ Audit reference is OpenCode `1.15.5` (commit `9324ef0`). Compared against `v1.15
 
 **Gemini CLI** (`gemini_tool_messages_from_value` + `gemini_thought_messages_from_value` + `gemini_part_to_string`) — `.audit-sources/gemini-cli/packages/cli/src/ui/components/messages/`:
 
-- `toolCalls[]` entries (ToolShared.tsx:202 `ToolInfo`) → `**{displayName}**({description})` + 4-backtick `resultDisplay` fence
-- `thoughts[{subject, description}]` array (ThinkingMessage.tsx:22 `normalizeThoughtLines`) → one reasoning message per entry via `format_reasoning_body`. Noise filtering matches the source (skip whitespace-only or `...` runs)
+- `toolCalls[]` entries (ToolShared.tsx:202 `ToolInfo`) → `{status_marker} **{displayName}**({description})` with status-aware body. `status === 'success'` → `⏺` marker, body fenced verbatim. Otherwise `✗` marker + `Error: ` prefix inside the fence (per sessionUtils.ts:654-657 only `'success'` is success). `resultDisplay` body shapes per `ToolResultDisplay.tsx` are dispatched in `gemini_result_display_to_text`:
+  - `string` → as-is (markdown / plain text)
+  - `Array<AnsiLine>` (each line is `Array<AnsiToken {text, ...}>`, detected via `isAnsiOutput`) → join token `text` fields, trim per-line trailing whitespace (xterm-headless pads to terminal width)
+  - `{todos: ...}` → drop body (TUI hides it; TodoTray renders todos separately, ToolResultDisplay.tsx:84-87)
+  - `{isSubagentProgress: true, ...}` → drop body (live-progress widget, no useful static representation)
+  - `{fileDiff, fileName?}` → `gemini_format_file_diff` (DiffRenderer.tsx:204-214 `isNewFile`): when every non-header line is an addition, emit ```{lang}\n{added lines}\n``` (lang inferred from the filename extension); otherwise ```diff\n{full diff}\n```
+  - `{summary, ...}` (StructuredToolResult / GrepResult / ListDirectoryResult / ReadManyFilesResult) → emit the `summary` string
+  - other object → `serde_json::to_string_pretty` fallback (matches TUI's `JSON.stringify(obj, null, 2)`)
+- `thoughts[{subject, description}]` array (ThinkingMessage.tsx:22 `normalizeThoughtLines`) → one reasoning message per entry. Subject is wrapped in `**...**` so `format_reasoning_body` keeps it as a bold blockquote header line (mirrors the TUI's bold-italic subject + italic body at l.84-93); description lines render italic. `gemini_normalize_escaped_newlines` applies the same `\\n` / `\\r\\n` → real-newline pass as `textUtils.ts:168` so persisted escaped literals split into multiple lines. Noise filtering matches the source (skip whitespace-only or `...` runs)
+- System-notice records (`type: 'info' | 'error' | 'warning'`) → `format_gemini_system_notice` wraps the body in an italic span with the TUI icon prefix (`ℹ` per InfoMessage.tsx:30 / `✕` per ErrorMessage.tsx:16 / `⚠` per WarningMessage.tsx:17). Multi-line bodies use CommonMark hard breaks (`  \n`) so the italic span survives across visual lines without a paragraph break terminating it
 - Parts with `executableCode: {code, language}` → ```{lang}\n{code}\n``` fence
 - Parts with `codeExecutionResult: {outcome, output}` → 4-backtick output fence + italic `*Outcome: OUTCOME_FAILED*` footer when non-OK
 - Parts with `inlineData: {mimeType, ...}` → `*Inline data ({mime})*` italic notice
