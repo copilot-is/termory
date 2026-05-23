@@ -244,16 +244,16 @@ Every Termory branch cites the exact source file that produces the verb in each 
 
 - `exec_command` / `shell` / `shell_command` / `local_shell` (all 4 names per `rollout-trace/src/tool_dispatch.rs:263`) → `**Bash**({wrap_inline_code(cmd)})` — verb unified with Claude per design call (was `**Ran** \`cmd\`` before unification).
 - `apply_patch` → `**{Verb}**({wrap_inline_code(path)})\n\n```diff\n{patch}\n```` ` — `codex_parse_patch_actions` scans `*** Add File:` / `*** Delete File:` / `*** Update File:` markers, picks `Added` / `Deleted` / `Edited` per `diff_render.rs:421-436`. Multi-file patches collapse to `**Edited**({N} files)`. Modern Codex stores apply_patch as `payload.type = "custom_tool_call"` with `input` field (raw patch text); legacy form is `function_call` with `arguments`. Both shapes route to the same patch-header builder.
-- `update_plan` → `**Updated plan**` + optional `*explanation*` + GFM task list `- [x]/[~]/[ ]` (matches PlanUpdateCell at `history_cell/plans.rs:138-194`)
-- `view_image` → `**Viewed image**({wrap_inline_code(path)})` (patches.rs:63-72)
+- `update_plan` → `**Updated Plan**` + optional `*explanation*` + GFM task list `- [x]/[~]/[ ]` (matches PlanUpdateCell at `history_cell/plans.rs:138-194` — TUI uses ✔/□ symbols with crossed-out / bold / dim styling; Termory stays on GFM markers so checkboxes render natively in react-markdown)
+- `view_image` → `**Viewed Image**({wrap_inline_code(path)})` (patches.rs:63-72 — capital `I` per TUI)
 - other → `**{name}**({compact args})` fallback
 
 **Codex EventMsg dispatch** (`codex_event_msg_to_message`) — `RolloutItem::EventMsg` records are the canonical replay source for Codex; the wrapper `codex_message_from_value` routes `event_msg` records here. Handled variants:
 
 - `user_message` / `agent_message` / `agent_reasoning` / `agent_reasoning_raw_content`
-- `web_search_end` → `**Searched**({wrap_inline_code(query)})`
-- `mcp_tool_call_end` → `**MCP**({server}/{tool})` + 4-backtick result fence
-- `image_generation_end` → `**Generated image**({wrap_inline_code(prompt)})` + saved path
+- `web_search_end` → `**Searched**({wrap_inline_code(detail)})` where `detail` follows Codex's `web_search_action_detail` (search.rs:13-38): `query` for `Search` (or first of `queries` with ` ...` suffix when multiple), `url` for `OpenPage`, `'pattern' in url` / `'pattern'` / `url` for `FindInPage`
+- `mcp_tool_call_end` → `**MCP**({server}.{tool})` (dot separator per Codex `format_mcp_invocation` mcp.rs:761-780); when `arguments` is a non-empty / non-`null` JSON value, appends `, {compact_json}` inside the parens
+- `image_generation_end` → `**Generated Image**({wrap_inline_code(prompt)})` + saved path (capital `I` per TUI patches.rs:74-93)
 - `view_image_tool_call` → same shape as the function_call variant
 - `plan_update` → same as the function_call `update_plan` (payload IS the UpdatePlanArgs)
 - `patch_apply_end` (Extended mode) → per-file `**Verb**({path})` lines; on failure appends stderr fence + `**Error**`

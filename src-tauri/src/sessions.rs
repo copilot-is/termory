@@ -93,12 +93,33 @@ fn format_reasoning_body(content: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    // Italic doesn't survive multiple paragraphs cleanly, so wrap each
-    // non-empty line in `> *...*` so the entire block renders as one
-    // styled blockquote.
+    // Codex's `agent_reasoning` text often starts with a bold header
+    // line (`**Identifying X**\n\nbody...`) — TUI's ReasoningSummaryCell
+    // (messages.rs:429-455) renders that as a bold title + italic body.
+    // Detect the leading `**...**` and keep it as bold inside the
+    // blockquote (no italic escaping), so the title visually stands
+    // apart from the body lines below.
     let mut out = String::new();
-    for (idx, line) in trimmed.lines().enumerate() {
-        if idx > 0 {
+    let mut lines = trimmed.lines().peekable();
+    let mut handled_first = false;
+    if let Some(first) = lines.peek() {
+        let first_trim = first.trim();
+        if first_trim.starts_with("**")
+            && first_trim.ends_with("**")
+            && first_trim.len() > 4
+            && !first_trim[2..first_trim.len() - 2].contains("**")
+        {
+            out.push_str("> ");
+            out.push_str(first_trim);
+            handled_first = true;
+            lines.next();
+        }
+    }
+    // Italic doesn't survive multiple paragraphs cleanly, so wrap each
+    // remaining non-empty line in `> *...*` so the entire block renders
+    // as one styled blockquote.
+    for (idx, line) in lines.enumerate() {
+        if handled_first || idx > 0 {
             out.push('\n');
         }
         let line = line.trim_end();
@@ -5208,7 +5229,7 @@ fn codex_function_call_message(
         //   - [ ] pending
         "update_plan" => codex_update_plan_message(arguments.as_deref()),
         // Codex `view_image` tool — TUI shows `• Viewed Image` + indented
-        // path (history_cell/patches.rs:63-72). We map to `**Viewed image**
+        // path (history_cell/patches.rs:63-72). We map to `**Viewed Image**
         // \`{path}\`` so the path stays monospaced.
         "view_image" => {
             let path = arguments
@@ -5220,9 +5241,33 @@ fn codex_function_call_message(
                 })
                 .unwrap_or_default();
             if path.is_empty() {
-                "**Viewed image**".to_string()
+                "**Viewed Image**".to_string()
             } else {
-                format!("**Viewed image**({})", wrap_inline_code(&path))
+                format!("**Viewed Image**({})", wrap_inline_code(&path))
+            }
+        }
+        // Codex `write_stdin` tool (unified_exec/write_stdin.rs:WriteStdinArgs)
+        // — args: `{session_id, chars, yield_time_ms?, max_output_tokens?}`.
+        // TUI renders via `UnifiedExecInteractionCell` (history_cell/exec.rs:20-95):
+        //   * Empty/absent `chars` → `• Waited for background terminal`
+        //   * With `chars` → `↳ Interacted with background terminal · {cmd}\n  └ {stdin}`
+        // We can't resolve `session_id` → `command_display` from a flat
+        // rollout, so we collapse the "with input" case to
+        // `**Stdin**({wrap_inline_code(chars)})` and the empty case to
+        // `**Waited for background terminal**`.
+        "write_stdin" => {
+            let chars = arguments
+                .as_deref()
+                .and_then(|args| {
+                    serde_json::from_str::<Value>(args)
+                        .ok()
+                        .and_then(|v| v.get("chars").and_then(Value::as_str).map(str::to_string))
+                })
+                .unwrap_or_default();
+            if chars.trim().is_empty() {
+                "**Waited for background terminal**".to_string()
+            } else {
+                format!("**Stdin**({})", wrap_inline_code(chars.trim()))
             }
         }
         _ => {
@@ -5250,11 +5295,11 @@ fn codex_function_call_message(
 
 /// Build the unified-markdown body for a Codex `update_plan` tool call.
 /// Matches the structure of `PlanUpdateCell.display_lines`:
-///   * `**Updated plan**` header
+///   * `**Updated Plan**` header
 ///   * optional explanation in italic
 ///   * each plan step rendered as a GFM task list entry with status marker
 fn codex_update_plan_message(arguments: Option<&str>) -> String {
-    let mut text = String::from("**Updated plan**");
+    let mut text = String::from("**Updated Plan**");
     let Some(args) = arguments else {
         return text;
     };
@@ -5676,24 +5721,94 @@ fn codex_event_msg_to_message(
 }
 
 /// `EventMsg::WebSearchEnd` — Codex renders this via WebSearchCell with a
-/// `Searched ...` header showing the query (or the structured action).
-/// Unified-markdown form: `**Searched** "{query}"`.
+/// `Searched ...` header showing the query or, for structured actions
+/// (`OpenPage` / `FindInPage`), the URL / "'pattern' in url" detail.
+/// Mirrors `web_search_action_detail` at
+/// `.audit-sources/codex/codex-rs/tui/src/history_cell/search.rs:13-38`.
 fn codex_web_search_end_event(
     payload: &Value,
     timestamp: Option<String>,
 ) -> Option<SessionMessage> {
-    let query = payload
+    let action = payload.get("action");
+    let detail = action
+        .and_then(codex_web_search_action_detail)
+        .filter(|s| !s.is_empty());
+    let fallback_query = payload
         .get("query")
         .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())?;
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let text = match detail.or(fallback_query) {
+        Some(d) => format!("**Searched**({})", wrap_inline_code(&d)),
+        None => "**Searched**".to_string(),
+    };
     Some(SessionMessage {
         role: "tool".to_string(),
-        text: format!("**Searched**({})", wrap_inline_code(query)),
+        text,
         timestamp,
         kind: kind::TOOL_USE.to_string(),
         tool_use_id: payload.get("call_id").and_then(value_to_string),
         exit_code: None,
     })
+}
+
+/// Codex `WebSearchAction` → human-readable detail string per
+/// `search.rs:13-38`. Returns:
+///   * `Search` → `query` (falls back to first of `queries`, with `...`
+///     suffix if multiple)
+///   * `OpenPage` → `url`
+///   * `FindInPage` → `'{pattern}' in {url}` / `'{pattern}'` / `{url}`
+///   * `Other` / unknown → empty string
+fn codex_web_search_action_detail(action: &Value) -> Option<String> {
+    let ty = action.get("type").and_then(Value::as_str)?;
+    match ty {
+        "search" => {
+            if let Some(q) = action
+                .get("query")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(q.to_string());
+            }
+            let queries = action.get("queries").and_then(Value::as_array)?;
+            let first = queries.first().and_then(Value::as_str).unwrap_or("").trim();
+            if first.is_empty() {
+                Some(String::new())
+            } else if queries.len() > 1 {
+                Some(format!("{first} ..."))
+            } else {
+                Some(first.to_string())
+            }
+        }
+        "open_page" => Some(
+            action
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ),
+        "find_in_page" => {
+            let pattern = action
+                .get("pattern")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let url = action
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            Some(match (pattern, url) {
+                (Some(p), Some(u)) => format!("'{p}' in {u}"),
+                (Some(p), None) => format!("'{p}'"),
+                (None, Some(u)) => u.to_string(),
+                (None, None) => String::new(),
+            })
+        }
+        _ => Some(String::new()),
+    }
 }
 
 /// `EventMsg::McpToolCallEnd` — Codex renders via McpToolCallCell. The
@@ -5714,7 +5829,22 @@ fn codex_mcp_tool_call_end_event(
     if server.is_empty() && tool.is_empty() {
         return None;
     }
-    let header = format!("**MCP**({server}/{tool})");
+    // Codex TUI's `format_mcp_invocation` (mcp.rs:761-780) renders MCP
+    // calls as `{server}.{tool}({args_json})` (dot separator, compact
+    // args). The cell prefix is `• Called` (mcp.rs:133-140). We adapt
+    // to the unified `**Verb**(args)` shape:
+    //   * verb keeps `MCP` for cross-platform consistency with Claude's
+    //     generic `mcp__server__tool` mapping
+    //   * server/tool uses Codex's dot separator
+    //   * args (when present) appear inline as compact JSON
+    let args_str = invocation
+        .get("arguments")
+        .map(|v| serde_json::to_string(v).unwrap_or_default())
+        .filter(|s| !s.is_empty() && s != "null" && s != "{}");
+    let header = match args_str {
+        Some(args) => format!("**MCP**({server}.{tool}, {})", compact(&args, 200)),
+        None => format!("**MCP**({server}.{tool})"),
+    };
     // `result` is either `{"Ok": CallToolResult}` or `{"Err": "..."}`
     // (Rust `Result` serialization). Inspect both arms.
     let result = payload.get("result");
@@ -5770,7 +5900,7 @@ fn mcp_call_tool_result_text(result: &Value) -> String {
 
 /// `EventMsg::ImageGenerationEnd` — Codex shows "Generated Image:"
 /// with the (optional) revised prompt and saved file URL.
-/// Unified-markdown form: `**Generated image** {revised_prompt}` +
+/// Unified-markdown form: `**Generated Image** {revised_prompt}` +
 /// optional `\nSaved: {path}` line.
 fn codex_image_generation_end_event(
     payload: &Value,
@@ -5789,7 +5919,7 @@ fn codex_image_generation_end_event(
     if revised.is_none() && saved.is_none() {
         return None;
     }
-    let mut text = String::from("**Generated image**");
+    let mut text = String::from("**Generated Image**");
     if let Some(prompt) = revised {
         text.push('(');
         text.push_str(&wrap_inline_code(prompt));
@@ -5872,8 +6002,13 @@ fn codex_thread_rolled_back_event(
     payload: &Value,
     timestamp: Option<String>,
 ) -> Option<SessionMessage> {
+    // Real JSONL field is `num_turns` (confirmed by inspecting user's
+    // `~/.codex/sessions/.../*.jsonl` records); `dropped_turn_count` /
+    // `count` were guesses from earlier drafts. Per protocol.rs the
+    // canonical field is `num_turns`.
     let dropped = payload
-        .get("dropped_turn_count")
+        .get("num_turns")
+        .or_else(|| payload.get("dropped_turn_count"))
         .or_else(|| payload.get("count"))
         .and_then(Value::as_i64);
     let text = match dropped {
@@ -5899,14 +6034,22 @@ fn codex_patch_apply_end_event(
     payload: &Value,
     timestamp: Option<String>,
 ) -> Option<SessionMessage> {
+    // PatchApplyEndEvent.changes is a HashMap<PathBuf, FileChange> where
+    // FileChange (protocol.rs) is `#[serde(tag = "type")]`:
+    //   * Add { content }
+    //   * Delete { content }
+    //   * Update { unified_diff, move_path }
+    // Earlier Termory only emitted the verb + path header; the full diff
+    // / content was dropped — for `update` that's the unified diff text,
+    // for `add` / `delete` it's the full file body. Match Codex TUI's
+    // `PatchHistoryCell` (patches.rs:11-23 → create_diff_summary at
+    // diff_render.rs) which shows per-file diff content.
     let changes = payload.get("changes").and_then(Value::as_object);
-    let mut lines: Vec<String> = Vec::new();
+    let mut blocks: Vec<String> = Vec::new();
     if let Some(changes) = changes {
         let mut entries: Vec<(&String, &Value)> = changes.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (path, change) in entries {
-            // `FileChange` is `#[serde(tag = "type")]`. The type discriminant
-            // is `add` / `delete` / `update` (snake_case enum).
             let kind = change.get("type").and_then(Value::as_str).unwrap_or("");
             let verb = match kind {
                 "add" => "Added",
@@ -5920,17 +6063,43 @@ fn codex_patch_apply_end_event(
                 }
                 _ => path.clone(),
             };
-            lines.push(format!("**{verb}** {display_path}"));
+            // Body: unified_diff for `update`, content for `add`/`delete`,
+            // empty otherwise. Wrap in ```diff for update (renders +/-
+            // colored via hljs); for add/delete pick a language tag from
+            // the file extension via `filetype_hint` so syntax highlights
+            // when registered.
+            let body_field = if kind == "update" {
+                "unified_diff"
+            } else {
+                "content"
+            };
+            let body = change
+                .get(body_field)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim_end()
+                .to_string();
+            let header = format!("**{verb}**({})", wrap_inline_code(&display_path));
+            if body.is_empty() {
+                blocks.push(header);
+            } else {
+                let lang = if kind == "update" {
+                    "diff"
+                } else {
+                    filetype_hint(path)
+                };
+                blocks.push(format!("{header}\n\n```{lang}\n{body}\n```"));
+            }
         }
     }
     let success = payload
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let mut text = if lines.is_empty() {
+    let mut text = if blocks.is_empty() {
         "**Applied patch**".to_string()
     } else {
-        lines.join("\n")
+        blocks.join("\n\n")
     };
     if !success {
         let err = payload
@@ -5962,7 +6131,7 @@ fn codex_patch_apply_end_event(
 
 /// `EventMsg::ViewImageToolCall` — `{call_id, path}` payload. Same
 /// surface as the `function_call::view_image` ResponseItem variant
-/// (codex_function_call_message): `**Viewed image** \`{path}\``.
+/// (codex_function_call_message): `**Viewed Image** \`{path}\``.
 fn codex_view_image_tool_call_event(
     payload: &Value,
     timestamp: Option<String>,
@@ -5973,7 +6142,7 @@ fn codex_view_image_tool_call_event(
     }
     Some(SessionMessage {
         role: "tool".to_string(),
-        text: format!("**Viewed image**({})", wrap_inline_code(path)),
+        text: format!("**Viewed Image**({})", wrap_inline_code(path)),
         timestamp,
         kind: kind::TOOL_USE.to_string(),
         tool_use_id: payload.get("call_id").and_then(value_to_string),
@@ -6701,7 +6870,7 @@ mod tests {
 
     #[test]
     fn codex_view_image_function_call_uses_inline_path() {
-        // function_call name="view_image" → `**Viewed image** \`{path}\``,
+        // function_call name="view_image" → `**Viewed Image** \`{path}\``,
         // matching Codex `new_view_image_tool_call` (patches.rs:63-72)
         // which renders `• Viewed Image\n  └ {display_path}`.
         let body = codex_function_call_message(
@@ -6714,7 +6883,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(body.text, "**Viewed image**(`/tmp/shot.png`)");
+        assert_eq!(body.text, "**Viewed Image**(`/tmp/shot.png`)");
         assert_eq!(body.kind, kind::TOOL_USE);
     }
 
@@ -6731,11 +6900,11 @@ mod tests {
         ));
         assert_eq!(
             body,
-            "**Updated plan**\n\n*Sequenced work*\n\n- [x] Read repo layout\n- [~] Fix tests\n- [ ] Ship release"
+            "**Updated Plan**\n\n*Sequenced work*\n\n- [x] Read repo layout\n- [~] Fix tests\n- [ ] Ship release"
         );
 
         // No explanation, no steps — bare header.
-        assert_eq!(codex_update_plan_message(Some("{}")), "**Updated plan**");
+        assert_eq!(codex_update_plan_message(Some("{}")), "**Updated Plan**");
     }
 
     #[test]
@@ -6799,18 +6968,28 @@ mod tests {
         }));
         assert_eq!(msg.text, "*Turn stopped — budget limit reached*");
 
-        // ThreadRolledBack with a count.
+        // ThreadRolledBack — real JSONL field is `num_turns` (confirmed by
+        // inspecting user's rollouts). The earlier guesses
+        // `dropped_turn_count` / `count` still work as fallbacks but the
+        // canonical field is checked first.
         let msg = make(serde_json::json!({
             "type": "thread_rolled_back",
-            "dropped_turn_count": 3
+            "num_turns": 3
         }));
         assert_eq!(msg.text, "*Rolled back 3 turns*");
 
         let msg = make(serde_json::json!({
             "type": "thread_rolled_back",
-            "dropped_turn_count": 1
+            "num_turns": 1
         }));
         assert_eq!(msg.text, "*Rolled back 1 turn*");
+
+        // Fallback to legacy field names still works for forward-compat.
+        let msg = make(serde_json::json!({
+            "type": "thread_rolled_back",
+            "dropped_turn_count": 2
+        }));
+        assert_eq!(msg.text, "*Rolled back 2 turns*");
 
         // Review mode lifecycle.
         let msg = make(serde_json::json!({"type": "entered_review_mode"}));
@@ -6818,6 +6997,124 @@ mod tests {
 
         let msg = make(serde_json::json!({"type": "exited_review_mode"}));
         assert_eq!(msg.text, "*Exited review mode*");
+    }
+
+    #[test]
+    fn codex_write_stdin_function_call_renders_bg_terminal_card() {
+        // Real-world write_stdin args from user's rollout:
+        //   {"session_id":85980,"yield_time_ms":1000,"max_output_tokens":20000}
+        // (no `chars` field → empty stdin → `Waited for background terminal`)
+        let msg = codex_function_call_message(
+            &serde_json::json!({
+                "type": "function_call",
+                "name": "write_stdin",
+                "arguments": "{\"session_id\":85980,\"yield_time_ms\":1000}",
+                "call_id": "ws_1"
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(msg.text, "**Waited for background terminal**");
+
+        // With chars → `**Stdin**(\`chars\`)`.
+        let msg = codex_function_call_message(
+            &serde_json::json!({
+                "type": "function_call",
+                "name": "write_stdin",
+                "arguments": "{\"session_id\":85980,\"chars\":\"y\\n\"}",
+                "call_id": "ws_2"
+            }),
+            None,
+        )
+        .unwrap();
+        // chars are trim()-ed so trailing newline is dropped.
+        assert_eq!(msg.text, "**Stdin**(`y`)");
+    }
+
+    #[test]
+    fn codex_patch_apply_end_renders_unified_diff_per_file() {
+        // PatchApplyEndEvent.changes is HashMap<PathBuf, FileChange>
+        // where FileChange::Update { unified_diff, move_path } carries
+        // the actual diff text — previously dropped by Termory which only
+        // emitted `**Verb** {path}` headers.
+        let msg = codex_patch_apply_end_event(
+            &serde_json::json!({
+                "type": "patch_apply_end",
+                "call_id": "patch_1",
+                "stdout": "",
+                "stderr": "",
+                "success": true,
+                "changes": {
+                    "/tmp/foo.ts": {
+                        "type": "update",
+                        "unified_diff": "@@ -1,2 +1,2 @@\n-old\n+new",
+                        "move_path": null
+                    }
+                },
+                "status": "completed"
+            }),
+            None,
+        )
+        .unwrap();
+        // Should contain the unified diff text inside a ```diff fence.
+        assert!(
+            msg.text.contains("**Edited**(`/tmp/foo.ts`)"),
+            "expected per-file header, got: {}",
+            msg.text
+        );
+        assert!(
+            msg.text
+                .contains("```diff\n@@ -1,2 +1,2 @@\n-old\n+new\n```"),
+            "expected unified_diff in ```diff fence; got: {}",
+            msg.text
+        );
+
+        // FileChange::Add { content } — full file body in lang fence.
+        let msg = codex_patch_apply_end_event(
+            &serde_json::json!({
+                "type": "patch_apply_end",
+                "call_id": "patch_2",
+                "stdout": "", "stderr": "", "success": true,
+                "changes": {
+                    "/tmp/new.py": {
+                        "type": "add",
+                        "content": "def hello():\n    pass"
+                    }
+                },
+                "status": "completed"
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(msg.text.contains("**Added**(`/tmp/new.py`)"));
+        assert!(msg.text.contains("```python\ndef hello():\n    pass\n```"));
+    }
+
+    #[test]
+    fn format_reasoning_body_preserves_codex_bold_header() {
+        // Codex `agent_reasoning` text often opens with `**Header**\n\nbody…`.
+        // The first bold line should stay as bold in the blockquote (not
+        // get its `*` chars escaped); subsequent lines stay italic-wrapped.
+        let body = format_reasoning_body("**Identifying issue**\n\nReviewing the code path now.");
+        assert_eq!(
+            body,
+            "> **Identifying issue**\n>\n> *Reviewing the code path now.*"
+        );
+
+        // Lone header (no body) keeps just the bold line.
+        let body = format_reasoning_body("**Just a title**");
+        assert_eq!(body, "> **Just a title**");
+
+        // Text WITHOUT bold header — every line escaped + italic-wrapped
+        // as before.
+        let body = format_reasoning_body("plain body line\nsecond line");
+        assert_eq!(body, "> *plain body line*\n> *second line*");
+
+        // First line `**...**` with nested `**` inside doesn't qualify as
+        // a clean header; falls back to italic-wrap so the nested `**`
+        // get escaped instead of producing malformed bold.
+        let body = format_reasoning_body("**not **clean** header**\nbody");
+        assert!(body.starts_with("> *\\*\\*not"), "got: {body}");
     }
 
     #[test]
@@ -7449,7 +7746,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             msg.text,
-            "**MCP**(figma/inspect)\n\n````\nframe: 12px\n````"
+            "**MCP**(figma.inspect)\n\n````\nframe: 12px\n````"
         );
         assert_eq!(msg.kind, kind::TOOL_RESULT);
 
@@ -7469,7 +7766,7 @@ mod tests {
         assert_eq!(msg.kind, kind::TOOL_ERROR);
         assert!(msg.text.contains("connection refused"));
 
-        // ImageGenerationEnd → `**Generated image** {prompt}` + saved path.
+        // ImageGenerationEnd → `**Generated Image** {prompt}` + saved path.
         let msg = codex_event_msg_to_message(
             &serde_json::json!({
                 "type": "image_generation_end",
@@ -7484,7 +7781,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             msg.text,
-            "**Generated image**(`A red cat`)\n\nSaved: `/tmp/img.png`"
+            "**Generated Image**(`A red cat`)\n\nSaved: `/tmp/img.png`"
         );
 
         // ContextCompacted → system notice.
@@ -7494,6 +7791,98 @@ mod tests {
         assert_eq!(msg.role, "system");
         assert_eq!(msg.text, "*Context compacted*");
         assert_eq!(msg.kind, kind::COMPACTION);
+    }
+
+    #[test]
+    fn codex_mcp_includes_compact_args_when_non_empty() {
+        // Codex `format_mcp_invocation` (mcp.rs:761-780) renders args
+        // inline as compact JSON. Non-empty objects are surfaced; `{}`,
+        // `null`, and missing fields drop the args entirely.
+        let with_args = codex_event_msg_to_message(
+            &serde_json::json!({
+                "type": "mcp_tool_call_end",
+                "call_id": "mcp_args",
+                "invocation": {
+                    "server": "figma",
+                    "tool": "inspect",
+                    "arguments": {"frame": "Hero", "tokens": true}
+                },
+                "duration": {"secs":0,"nanos":0},
+                "result": {"Ok": {"content": [], "is_error": false}}
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(
+            with_args
+                .text
+                .starts_with("**MCP**(figma.inspect, {\"frame\":\"Hero\",\"tokens\":true})"),
+            "got: {}",
+            with_args.text
+        );
+
+        let empty_obj = codex_event_msg_to_message(
+            &serde_json::json!({
+                "type": "mcp_tool_call_end",
+                "call_id": "mcp_empty",
+                "invocation": {"server": "x", "tool": "y", "arguments": {}},
+                "duration": {"secs":0,"nanos":0},
+                "result": {"Ok": {"content": [], "is_error": false}}
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(empty_obj.text, "**MCP**(x.y)");
+    }
+
+    #[test]
+    fn codex_web_search_renders_action_details() {
+        // OpenPage → URL is the detail.
+        let m = codex_event_msg_to_message(
+            &serde_json::json!({
+                "type": "web_search_end",
+                "call_id": "ws_open",
+                "query": "",
+                "action": {"type": "open_page", "url": "https://example.com/x"}
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(m.text, "**Searched**(`https://example.com/x`)");
+
+        // FindInPage with pattern + url → `'pattern' in url`.
+        let m = codex_event_msg_to_message(
+            &serde_json::json!({
+                "type": "web_search_end",
+                "call_id": "ws_find",
+                "query": "",
+                "action": {
+                    "type": "find_in_page",
+                    "url": "https://example.com",
+                    "pattern": "TODO"
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(m.text, "**Searched**(`'TODO' in https://example.com`)");
+
+        // Search with `queries: [a, b]` (no `query`) → `a ...` suffix
+        // because there are multiple queries.
+        let m = codex_event_msg_to_message(
+            &serde_json::json!({
+                "type": "web_search_end",
+                "call_id": "ws_multi",
+                "query": "",
+                "action": {
+                    "type": "search",
+                    "queries": ["alpha", "beta"]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(m.text, "**Searched**(`alpha ...`)");
     }
 
     #[test]
