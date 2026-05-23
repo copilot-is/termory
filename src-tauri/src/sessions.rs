@@ -7752,6 +7752,123 @@ mod tests {
     }
 
     #[test]
+    fn gemini_parses_official_large_chat_session_without_panicking() {
+        // Real Gemini chat-history fixture committed verbatim from
+        // gemini-cli's own repo (`memory-tests/large-chat-session.json`,
+        // ≈54MB, pre-anonymized by Google). Vendored at
+        // `src-tauri/tests/fixtures/gemini-large-chat-session.json`
+        // so this test is self-contained — no `.audit-sources/`
+        // dependency, no opt-in `--ignored` flag.
+        //
+        // We bypass `parse_gemini_session_file` (which requires a
+        // `.project_root` sibling) and drive the lower-level
+        // `load_gemini_json_conversation` + `gemini_messages_from_values`
+        // path directly. Path is anchored on `CARGO_MANIFEST_DIR` so
+        // the test works regardless of the runner's cwd.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/gemini-large-chat-session.json");
+        let path = fixture.as_path();
+
+        let conversation = load_gemini_json_conversation(path, /*metadata_only=*/ false)
+            .expect("load_gemini_json_conversation");
+
+        // Metadata sanity — sessionId is non-empty, real chat has
+        // hundreds of messages, the firstUserMessage was extracted.
+        assert!(
+            !conversation.session_id.is_empty(),
+            "sessionId should be populated"
+        );
+        assert!(conversation.message_count > 100, "expected a real chat");
+        assert!(conversation.has_user_or_assistant);
+        assert!(
+            conversation.first_user_message.is_some(),
+            "firstUserMessage extraction should not silently fail"
+        );
+
+        // Per-message rendering — every record must produce a result
+        // without panicking. Track counts by role / kind so a future
+        // regression that silently drops (say) all `info` notices or
+        // all reasoning fails the assertion below.
+        let messages = gemini_messages_from_values(&conversation.messages);
+        assert!(
+            !messages.is_empty(),
+            "gemini_messages_from_values dropped every record"
+        );
+
+        let mut user_count = 0;
+        let mut assistant_count = 0;
+        let mut reasoning_count = 0;
+        let mut tool_count = 0;
+        let mut info_count = 0;
+        let mut error_count = 0;
+        let mut warning_count = 0;
+        for m in &messages {
+            match (m.role.as_str(), m.kind.as_str()) {
+                ("user", _) => user_count += 1,
+                ("assistant", k) if k == kind::REASONING => reasoning_count += 1,
+                ("assistant", _) => assistant_count += 1,
+                ("tool", _) => tool_count += 1,
+                ("info", _) => info_count += 1,
+                ("error", _) => error_count += 1,
+                ("warning", _) => warning_count += 1,
+                _ => {}
+            }
+        }
+
+        // The fixture is a multi-day real chat — we should see all
+        // four major flavors. Pin loose lower bounds so additions to
+        // the fixture don't break the assertion, but a regression that
+        // wipes out a whole category (e.g. all reasoning messages) is
+        // still caught.
+        assert!(user_count > 0, "no user messages parsed");
+        assert!(assistant_count > 0, "no assistant text messages parsed");
+        assert!(reasoning_count > 0, "no thoughts → reasoning messages");
+        assert!(tool_count > 0, "no toolCalls → tool messages");
+
+        // Spot-check that the new TUI-aligned formatting actually
+        // fires on real data: at least one tool card should carry the
+        // `⏺` success marker, and any info/error/warning notice should
+        // wear its TUI icon prefix.
+        let any_tool_marker = messages
+            .iter()
+            .any(|m| m.role == "tool" && m.text.starts_with("⏺ "));
+        assert!(any_tool_marker, "no tool card carries the ⏺ marker");
+
+        for m in &messages {
+            match m.role.as_str() {
+                "info" => assert!(
+                    m.text.starts_with("*ℹ "),
+                    "info notice missing ℹ prefix: {:?}",
+                    &m.text[..m.text.len().min(80)]
+                ),
+                "error" => assert!(
+                    m.text.starts_with("*✕ "),
+                    "error notice missing ✕ prefix: {:?}",
+                    &m.text[..m.text.len().min(80)]
+                ),
+                "warning" => assert!(
+                    m.text.starts_with("*⚠ "),
+                    "warning notice missing ⚠ prefix: {:?}",
+                    &m.text[..m.text.len().min(80)]
+                ),
+                _ => {}
+            }
+        }
+
+        eprintln!(
+            "parsed {} records → {} user / {} assistant / {} reasoning / {} tool / {} info / {} error / {} warning",
+            conversation.message_count,
+            user_count,
+            assistant_count,
+            reasoning_count,
+            tool_count,
+            info_count,
+            error_count,
+            warning_count
+        );
+    }
+
+    #[test]
     #[ignore = "manual diagnostic — reads the user's real session file"]
     fn claude_real_session_dump_tool_messages() {
         let path = std::path::Path::new(
