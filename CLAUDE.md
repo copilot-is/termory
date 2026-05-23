@@ -451,3 +451,35 @@ npm run build
 ```
 
 Parser/formatter tests should cover the relevant official storage shape, title extraction, visible messages, hidden metadata, and command/tool preview formatting. Skill/memory tests should cover the actual scan paths and the per-tool tag string (e.g. `claude,opencode` for `.claude/skills/`).
+
+## Pending feature work
+
+The current UI shell is settled: activity rail (Records / Search / Stats / CLI Config / Settings), routed via URL hash, with a passive bottom freshness footer fed by the Rust filesystem watcher. Records is fully implemented; the other four rail destinations render placeholder cards.
+
+Roadmap below is grouped by priority. Pick top-down within a tier.
+
+### P0 — core capabilities for v1
+
+- **Search page + Cmd-K palette** — global content search across Sessions / Memories / Skills. Backend `search_all_sessions` IPC exists; frontend needs the page (results grouped by source with snippet highlight) and a Cmd-K overlay reusing the same store. Recent search history persists once P1 store lands.
+- **Message content rendering polish** — `renderMessages` / `shouldInsertTimeSeparator` / `TimeSeparator` helpers are staged in `main.tsx` from an earlier abandoned attempt. The first cut (drop role label, left color stripe, demote tool messages) was rejected as too aggressive — revisit only with a concrete pain point.
+- **Empty states per route** — first-launch / no-data / search-no-results all currently render blank.
+
+### P1 — new pages & persistence
+
+- **`tauri-plugin-store`** — single JSON file for all user prefs (theme, default pane, search history, starred sessions). Prereq for the remaining P1 / P3 items that need persistence.
+- **CLI Config page** — CC Switch-style profile editor per platform (base URL, API key, model, env vars). Writes the official CLI config files atomically with a `.bak` sidecar. Per-platform schemas differ — Codex uses TOML at `~/.codex/config.toml`, OpenCode uses YAML, Claude / Gemini have their own shapes.
+- **Stats page** — dashboards (sessions/day, tokens/tool, top projects, model distribution). Requires extending the four parsers in `sessions.rs` to extract token counts (currently dropped); each platform exposes the field differently.
+- **App Settings page** — theme, scan-path overrides, keyboard shortcuts, watcher toggle.
+
+### P2 — quality of life
+
+- **Right-click context menus** — on list items ("Re-read this file", "Reveal in Finder", "Copy ID") and on sidebar source rows ("Re-scan this source").
+- **Keyboard navigation** — arrow keys in lists, Enter to open, Esc to close, Cmd-1..5 to switch rail, Cmd-F to summon search.
+- **Watcher completion** — current Rust watcher in `watcher.rs` skips cwd / per-project files (CLAUDE.md, AGENTS.md, etc.) to avoid `node_modules` noise. Either add a targeted cwd watcher or trigger a force-rescan on route change.
+- **Frontend test baseline** — zero tests today. Start with Vitest + React Testing Library on `CopyMenu`, `FreshnessFooter`, the route reducer.
+
+### P3 — nice to have
+
+- **New-item badges** — watcher detects new session → rail Records icon + sidebar source row get an unread badge; cleared on view. Needs P1 store for cross-restart state.
+- **Export session** — single session → markdown / PDF, surfaced via the detail header's existing action row.
+- **Starred sessions / tags** — virtual "Starred" source in sidebar; custom labels per record. Needs P1 store.
