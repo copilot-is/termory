@@ -1,23 +1,30 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
+  AlertTriangle,
+  BarChart3,
   Bot,
   BookOpen,
-  CalendarDays,
+  Check,
   ChevronDown,
   ChevronRight,
+  Clock,
+  Copy,
+  File,
   Folder,
   ExternalLink,
   FileJson,
+  History,
   Loader2,
   MessageSquare,
-  MessagesSquare,
+  Plug,
   RefreshCw,
   Search,
-  Sparkles,
-  Tags
+  Settings as SettingsIcon,
+  Sparkles
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -115,6 +122,18 @@ function memoryToolsOf(session: AppSession): MemoryTool[] {
 
 const MEMORY_TOOL_ORDER: MemoryTool[] = ["Claude", "Codex", "Gemini", "OpenCode", "Other"];
 
+type Route = "records" | "search" | "stats" | "config" | "settings";
+const ROUTES: Route[] = ["records", "search", "stats", "config", "settings"];
+
+function isRoute(value: string): value is Route {
+  return (ROUTES as string[]).includes(value);
+}
+
+function readRouteFromHash(): Route {
+  const raw = window.location.hash.replace(/^#/, "");
+  return isRoute(raw) ? raw : "records";
+}
+
 function App() {
   const [sessions, setSessions] = React.useState<AppSession[]>([]);
   const [selected, setSelected] = React.useState<AppSession | null>(null);
@@ -130,23 +149,66 @@ function App() {
   const [searchingContent, setSearchingContent] = React.useState(false);
   const [contentQuery, setContentQuery] = React.useState("");
   const [pane, setPane] = React.useState<"sessions" | "memory" | "skills">("sessions");
+  const [route, setRoute] = React.useState<Route>(() => readRouteFromHash());
+  const [lastRefreshedAt, setLastRefreshedAt] = React.useState<number | null>(null);
+
+  // Sync route ↔ URL hash so refresh / back-forward / deeplink work.
+  React.useEffect(() => {
+    const wanted = `#${route}`;
+    if (window.location.hash !== wanted) {
+      window.history.replaceState(null, "", wanted);
+    }
+  }, [route]);
+  React.useEffect(() => {
+    const onHashChange = () => setRoute(readRouteFromHash());
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  const applyScanResult = React.useCallback((result: AppSession[]) => {
+    setSessions(result);
+    setSelected((current) => {
+      if (!current) return result[0] ?? null;
+      return (
+        result.find(
+          (session) =>
+            session.source === current.source &&
+            session.path === current.path &&
+            session.id === current.id
+        ) ?? result[0] ?? null
+      );
+    });
+    setLastRefreshedAt(Date.now());
+  }, []);
 
   const refresh = React.useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const result = await invoke<AppSession[]>("scan_all_sessions");
-      setSessions(result);
-      setSelected((current) => {
-        if (!current) return result[0] ?? null;
-        return result.find((session) => session.source === current.source && session.path === current.path && session.id === current.id) ?? result[0] ?? null;
-      });
+      applyScanResult(result);
     } catch (err) {
       setError(String(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyScanResult]);
+
+  // Subscribe to background filesystem-watcher pushes. The Rust side
+  // detects changes in any source dir, debounces, runs a fresh
+  // `scan_sessions`, and emits the result here. We swap state in
+  // silently (no "Syncing…" middle state — these events aren't
+  // user-initiated, so the just-synced pulse alone is enough feedback).
+  React.useEffect(() => {
+    const unlisten = listen<AppSession[]>("termory:sources-changed", (event) => {
+      setError(null);
+      applyScanResult(event.payload);
+    });
+    return () => {
+      void unlisten.then((fn) => fn()).catch(() => {});
+    };
+  }, [applyScanResult]);
+
 
   React.useEffect(() => {
     refresh();
@@ -291,12 +353,6 @@ function App() {
   }, [skillItems, query, source, project, contentHits, contentQuery]);
 
 
-  const stats = React.useMemo(() => {
-    const totalMessages = sessionItems.reduce((sum, item) => sum + item.message_count, 0);
-    const projects = new Set(sessionItems.map((item) => item.project).filter(Boolean)).size;
-    return { totalMessages, projects };
-  }, [sessionItems]);
-
   const sourceGroups = React.useMemo(() => {
     return sources.map((item) => {
       const sourceSessions = item === "All" ? sessionItems : sessionItems.filter((session) => session.source === item);
@@ -314,6 +370,12 @@ function App() {
   }, [sessionItems]);
 
   return (
+    <div className="appShell">
+      <div className="appBody">
+      <ActivityRail route={route} onChange={setRoute} />
+      <div className="routeContent">
+        {route !== "records" && <RoutePlaceholder route={route} />}
+        {route === "records" && (
     <main className="app">
       <aside className="sidebar">
         <div className="sourceList">
@@ -386,37 +448,9 @@ function App() {
           </div>
         </div>
 
-        <div className="metricGrid" aria-label="Library statistics">
-          <div title={`${formatFullNumber(stats.projects)} Projects`}>
-            <span className="metricIcon"><Folder size={11} /></span>
-            <span className="metricValue">{formatCompactNumber(stats.projects)}</span>
-          </div>
-          <div title={`${formatFullNumber(sessionItems.length)} Sessions`}>
-            <span className="metricIcon"><MessagesSquare size={11} /></span>
-            <span className="metricValue">{formatCompactNumber(sessionItems.length)}</span>
-          </div>
-          <div title={`${formatFullNumber(stats.totalMessages)} Messages`}>
-            <span className="metricIcon"><MessageSquare size={11} /></span>
-            <span className="metricValue">{formatCompactNumber(stats.totalMessages)}</span>
-          </div>
-        </div>
       </aside>
 
       <section className="sessionsPane">
-        <header className="toolbar">
-          <div className="searchBox">
-            <Search size={17} />
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search sessions, projects, message content"
-            />
-            {searchingContent && <Loader2 size={14} className="spin searchSpinner" />}
-          </div>
-          <button className="iconButton" onClick={refresh} disabled={loading} title="Refresh sessions">
-            {loading ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />}
-          </button>
-        </header>
 
         <div className="paneTabs" role="tablist">
           <button
@@ -473,7 +507,10 @@ function App() {
                     </div>
                     <h2>{session.title}</h2>
                     <div className="sessionMeta">
-                      <span>{session.project}</span>
+                      <span className="sessionMetaProject" title={session.project}>
+                        <Folder size={12} />
+                        <span>{projectDisplayName(session.project)}</span>
+                      </span>
                       <span>{session.message_count} messages</span>
                     </div>
                     {showSnippet && (
@@ -540,30 +577,61 @@ function App() {
         {selected && (
           <>
             <header className="detailHeader">
-              <div>
-                <div className="detailKicker">
-                  <span className={`badge ${typeLabelOf(selected).toLowerCase()}`}>{typeLabelOf(selected)}</span>
-                </div>
-                <h2>{selected.title}</h2>
-                <p>{selected.project}</p>
+              <h2 className="detailTitle" title={selected.title}>{selected.title || "(untitled)"}</h2>
+
+              <div className="detailMeta">
+                <span className="detailMetaItem" title={selected.updated_at ?? selected.started_at ?? ""}>
+                  <Clock size={13} />
+                  {formatDate(selected.updated_at ?? selected.started_at)}
+                </span>
                 {isSessionItem(selected) && (
-                  <p className="detailGuid" title="Session GUID">{selected.id}</p>
+                  <>
+                    <span className="detailMetaSep">·</span>
+                    <span className="detailMetaItem" title={`${selected.message_count} messages`}>
+                      <MessageSquare size={13} />
+                      {selected.message_count}
+                    </span>
+                  </>
                 )}
+                <span className="detailMetaSep">·</span>
+                <span className="detailMetaItem detailMetaProject" title={selected.project}>
+                  <Folder size={13} />
+                  <span>{projectDisplayName(selected.project)}</span>
+                </span>
               </div>
-              <div className="detailHeaderActions">
-                <button className="iconButton" onClick={() => revealItemInDir(selected.path)} title="Show original file">
-                  <ExternalLink size={18} />
-                </button>
+
+              <div className="detailFileRow">
+                <div className="detailPath" title={selected.path}>
+                  <File size={13} />
+                  <span>{selected.path}</span>
+                </div>
+                <div className="detailActions">
+                  <button
+                    className="bareIcon"
+                    onClick={() => revealItemInDir(selected.path)}
+                    title="Open in Finder"
+                    aria-label="Open in Finder"
+                  >
+                    <ExternalLink size={14} />
+                  </button>
+                  <CopyMenu
+                    items={[
+                      ...(isSessionItem(selected) && resumeCommandFor(selected.source, selected.id)
+                        ? [{
+                            label: "Copy resume command",
+                            value: resumeCommandFor(selected.source, selected.id)!
+                          }]
+                        : []),
+                      { label: "Copy path", value: selected.path },
+                      { label: "Copy filename", value: basename(selected.path) },
+                      ...(isSessionItem(selected)
+                        ? [{ label: "Copy ID", value: selected.id }]
+                        : [])
+                    ]}
+                  />
+                </div>
               </div>
             </header>
-
-            <div className="detailStats">
-              <InfoPill icon={<CalendarDays size={15} />} label={formatDate(selected.updated_at ?? selected.started_at)} />
-              {isSessionItem(selected) && (
-                <InfoPill icon={<Bot size={15} />} label={`${selected.message_count} messages`} />
-              )}
-              <InfoPill icon={<Tags size={15} />} label={selected.path} />
-            </div>
 
             <div className="messageList">
               {detailLoading && (
@@ -595,6 +663,333 @@ function App() {
         )}
       </section>
     </main>
+        )}
+      </div>
+      </div>
+      <FreshnessFooter
+        syncing={loading}
+        lastSyncedAt={lastRefreshedAt}
+        error={error}
+      />
+    </div>
+  );
+}
+
+function ActivityRail({
+  route,
+  onChange
+}: {
+  route: Route;
+  onChange: (next: Route) => void;
+}) {
+  const items: { id: Route; icon: React.ReactNode; label: string }[] = [
+    { id: "records", icon: <History size={20} />, label: "Records" },
+    { id: "search", icon: <Search size={20} />, label: "Search" },
+    { id: "stats", icon: <BarChart3 size={20} />, label: "Stats" },
+    { id: "config", icon: <Plug size={20} />, label: "CLI Config" },
+    { id: "settings", icon: <SettingsIcon size={20} />, label: "Settings" }
+  ];
+  return (
+    <nav className="activityRail" aria-label="Primary">
+      {items.map((item) => (
+        <button
+          key={item.id}
+          type="button"
+          className={route === item.id ? "railItem active" : "railItem"}
+          onClick={() => onChange(item.id)}
+          title={item.label}
+          aria-label={item.label}
+          aria-current={route === item.id ? "page" : undefined}
+        >
+          {item.icon}
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+function FreshnessFooter({
+  syncing,
+  lastSyncedAt,
+  error
+}: {
+  syncing: boolean;
+  lastSyncedAt: number | null;
+  error: string | null;
+}) {
+  // Bump every 30s so "Synced 2m ago" stays accurate without
+  // re-rendering the rest of the app. tick is intentionally unused —
+  // its only job is to invalidate the rendered label.
+  const [, setTick] = React.useState(0);
+  React.useEffect(() => {
+    const id = window.setInterval(() => setTick((t) => t + 1), 30_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // Brief "just synced" pulse after a successful sync — gives the user
+  // a passive cue that the background actually did something. After
+  // ~1.8s the footer falls back to the idle "Synced 2m ago" state.
+  // Triggers on any `lastSyncedAt` advance, so both launch-time scans
+  // and watcher-driven re-scans get the cue.
+  const justSyncedWindow = 1800;
+  const [justSynced, setJustSynced] = React.useState(false);
+  const prevSyncedAt = React.useRef(lastSyncedAt);
+  React.useEffect(() => {
+    if (
+      lastSyncedAt != null &&
+      prevSyncedAt.current !== lastSyncedAt &&
+      !error
+    ) {
+      setJustSynced(true);
+      const timer = window.setTimeout(() => setJustSynced(false), justSyncedWindow);
+      prevSyncedAt.current = lastSyncedAt;
+      return () => window.clearTimeout(timer);
+    }
+    prevSyncedAt.current = lastSyncedAt;
+  }, [lastSyncedAt, error]);
+
+  // State machine — chooses icon + label + className. error > syncing
+  // > justSynced > idle.
+  let state: "idle" | "syncing" | "done" | "error" = "idle";
+  let icon: React.ReactNode = null;
+  let label = "";
+  let tooltip: string | undefined;
+  if (error) {
+    state = "error";
+    icon = <AlertTriangle size={12} strokeWidth={2.25} />;
+    label = "Sync failed";
+    tooltip = error;
+  } else if (syncing) {
+    state = "syncing";
+    icon = <RefreshCw size={12} strokeWidth={2.25} className="spin" />;
+    label = "Syncing…";
+  } else if (justSynced) {
+    state = "done";
+    icon = <Check size={12} strokeWidth={2.25} />;
+    label = "Synced just now";
+  } else if (lastSyncedAt != null) {
+    state = "idle";
+    icon = <Check size={12} strokeWidth={2.25} />;
+    label = `Synced ${formatTimeAgo(lastSyncedAt)}`;
+    tooltip = new Date(lastSyncedAt).toLocaleString();
+  }
+
+  return (
+    <footer
+      className={`freshnessFooter freshnessFooter-${state}`}
+      aria-label={label || "Freshness status"}
+      title={tooltip}
+    >
+      <span className="freshnessGlyph">{icon}</span>
+      <span className="freshnessLabel">{label}</span>
+    </footer>
+  );
+}
+
+function CopyMenu({ items }: { items: { label: string; value: string }[] }) {
+  const [open, setOpen] = React.useState(false);
+  const [copied, setCopied] = React.useState<string | null>(null);
+  const wrapperRef = React.useRef<HTMLDivElement>(null);
+
+  // Close on outside click. Bound only while the menu is open so we
+  // don't pay listener overhead the rest of the time.
+  React.useEffect(() => {
+    if (!open) return;
+    const onDown = (event: MouseEvent) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  const handleCopy = async (label: string, value: string) => {
+    await copyToClipboard(value);
+    setCopied(label);
+    window.setTimeout(() => setCopied(null), 1200);
+    setOpen(false);
+  };
+
+  return (
+    <div className="copyMenu" ref={wrapperRef}>
+      <button
+        className="bareIcon copyMenuTrigger"
+        onClick={() => setOpen((value) => !value)}
+        title="Copy…"
+        aria-label="Copy…"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <Copy size={14} />
+      </button>
+      {open && (
+        <div className="copyMenuList" role="menu">
+          {items.map((item) => (
+            <button
+              key={item.label}
+              className="copyMenuItem"
+              role="menuitem"
+              onClick={() => void handleCopy(item.label, item.value)}
+            >
+              <span>{item.label}</span>
+              {copied === item.label && <Check size={12} className="copyMenuCheck" />}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/// Render a session's messages, weaving in a thin time separator
+/// whenever the timestamp jumps more than `TIME_GAP_MS` from the prior
+/// message (plus an anchor separator before the very first message).
+/// Per-message timestamps + role labels are intentionally not drawn —
+/// role is encoded via a left color stripe in CSS, and dense streams
+/// would be noisy with one timestamp per row.
+const TIME_GAP_MS = 5 * 60 * 1000;
+
+function renderMessages(messages: SessionMessage[]): React.ReactNode {
+  const nodes: React.ReactNode[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    const prev = i > 0 ? messages[i - 1] : null;
+    if (shouldInsertTimeSeparator(prev, message)) {
+      nodes.push(
+        <TimeSeparator
+          key={`sep-${i}`}
+          timestamp={message.timestamp ?? undefined}
+        />
+      );
+    }
+    nodes.push(
+      <article
+        key={`msg-${i}`}
+        className={`message ${roleClass(message.role)}`}
+      >
+        <MessageBody text={message.text} />
+      </article>
+    );
+  }
+  return nodes;
+}
+
+function shouldInsertTimeSeparator(
+  prev: SessionMessage | null,
+  current: SessionMessage
+): boolean {
+  if (!prev) {
+    // Anchor the start of the conversation when the first message has
+    // a timestamp; skip otherwise (rare, e.g. records with no time).
+    return !!current.timestamp;
+  }
+  if (prev.timestamp && current.timestamp) {
+    const gap =
+      new Date(current.timestamp).getTime() - new Date(prev.timestamp).getTime();
+    if (gap > TIME_GAP_MS) return true;
+  }
+  return false;
+}
+
+function TimeSeparator({ timestamp }: { timestamp?: string }) {
+  const label = React.useMemo(() => {
+    if (!timestamp) return "";
+    const date = new Date(timestamp);
+    if (isNaN(date.getTime())) return "";
+    // HH:MM in the user's locale — short, parses at a glance.
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }, [timestamp]);
+  return (
+    <div className="timeSeparator" aria-hidden={!label} title={timestamp}>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+/// Per-platform "resume this session" shell command. Returns `null`
+/// for sources whose CLI doesn't expose a direct resume-by-id flag.
+///
+/// Verified shapes:
+///   * Claude  → `claude --resume <id>`  (per user spec)
+///   * Codex   → `codex resume <id>`     (codex-rs/exec/src/cli.rs:174-181 ResumeArgsRaw,
+///                                        SESSION_ID positional)
+///
+/// Skipped:
+///   * Gemini   — `/resume` is an in-TUI slash command; there's no CLI
+///     flag to resume a specific sessionId from shell.
+///   * OpenCode — `--session` is a `run` subcommand option; the exact
+///     external invocation depends on flags we don't know here.
+function resumeCommandFor(source: string, id: string): string | null {
+  switch (source) {
+    case "Claude":
+      return `claude --resume ${id}`;
+    case "Codex":
+      return `codex resume ${id}`;
+    default:
+      return null;
+  }
+}
+
+function basename(path: string): string {
+  // Cross-platform basename: split on / or \, drop trailing empty
+  // segments, return the last piece. Falls back to the whole path if
+  // nothing splits.
+  const parts = path.split(/[\\/]+/).filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : path;
+}
+
+async function copyToClipboard(text: string): Promise<void> {
+  // navigator.clipboard is available in the Tauri webview; failure
+  // is silently swallowed since there's no useful recovery (clipboard
+  // permissions in webviews don't get prompted, they're granted).
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (err) {
+    console.warn("clipboard write failed", err);
+  }
+}
+
+function formatTimeAgo(timestamp: number): string {
+  const sec = Math.floor((Date.now() - timestamp) / 1000);
+  if (sec < 5) return "just now";
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  return `${day}d ago`;
+}
+
+function RoutePlaceholder({ route }: { route: Route }) {
+  const labels: Record<Route, { title: string; detail: string }> = {
+    records: { title: "Records", detail: "" },
+    search: {
+      title: "Search",
+      detail: "Global content search across Sessions / Memories / Skills. Lands in a later phase."
+    },
+    stats: {
+      title: "Stats",
+      detail: "Dashboards (sessions / day, tokens per tool, top projects) land here in a later phase."
+    },
+    config: {
+      title: "CLI Config",
+      detail: "Per-CLI provider profile editor — base URL / API key / model, with quick-switch. Lands in a later phase."
+    },
+    settings: {
+      title: "Settings",
+      detail: "App preferences (theme, scan paths, keyboard shortcuts). Lands in a later phase."
+    }
+  };
+  const { title, detail } = labels[route];
+  return (
+    <div className="placeholderPage">
+      <div className="placeholderCard">
+        <h2>{title}</h2>
+        <p>{detail}</p>
+      </div>
+    </div>
   );
 }
 
@@ -636,7 +1031,10 @@ function MemoryCard({
       </div>
       <h2>{item.title}</h2>
       <div className="sessionMeta">
-        <span title={item.path}>{item.project}</span>
+        <span className="sessionMetaProject" title={item.project}>
+          <Folder size={12} />
+          <span>{projectDisplayName(item.project)}</span>
+        </span>
       </div>
       {showSnippet && (
         <SnippetLine
@@ -809,6 +1207,12 @@ function formatFullNumber(value: number) {
 }
 
 function projectDisplayName(project: string) {
+  // Tool config "projects" (`~/.codex`, `~/.claude/skills`, `~/.gemini`,
+  // etc.) keep their full label — basenaming them yields useless
+  // strings like `.codex` or `skills` that don't tell the user which
+  // platform or scope they're looking at. Only real filesystem paths
+  // (cwd / git repo roots) get shortened to their leaf folder.
+  if (project.startsWith("~/") || project.startsWith("~\\")) return project;
   return project.split(/[\\/]+/).filter(Boolean).pop() ?? project;
 }
 

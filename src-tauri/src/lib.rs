@@ -1,4 +1,5 @@
 mod sessions;
+mod watcher;
 
 use sessions::{get_session, scan_sessions, search_sessions, AppSession, SearchHit, SessionDetail};
 
@@ -36,6 +37,18 @@ pub fn run() {
             load_session,
             search_all_sessions
         ])
+        .setup(|app| {
+            // Background filesystem watcher: pushes a fresh
+            // `Vec<AppSession>` to the frontend via
+            // `termory:sources-changed` whenever a watched source
+            // directory mutates. Failure is non-fatal — the app still
+            // works with only the launch-time scan.
+            let handle = app.handle().clone();
+            if let Err(err) = watcher::start(handle) {
+                eprintln!("termory watcher: init failed: {err}");
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

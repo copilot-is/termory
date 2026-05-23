@@ -35,17 +35,166 @@ input {
   font: inherit;
 }
 
+.appShell {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  width: 100%;
+  height: 100vh;
+  color: #1d2025;
+}
+
+.appBody {
+  display: grid;
+  /* Rail column = 36px item + 12px padding × 2 + 1px right border = 61px,
+     rounded up to 62 for a comfortable hair of slack. */
+  grid-template-columns: 62px 1fr;
+  min-height: 0;
+  min-width: 0;
+}
+
+.routeContent {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Freshness footer — passive status strip at the bottom of the window.
+   No buttons, no click affordance. Background matches the activity
+   rail so the chrome reads as one continuous frame; only the icon +
+   text color changes per state (background never changes). */
+.freshnessFooter {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  height: 22px;
+  padding: 0 14px;
+  font-size: 11.5px;
+  color: #97a0a6;
+  background: #e8eded;
+  border-top: 1px solid #d4dadc;
+  user-select: none;
+  transition: color 0.2s ease;
+}
+
+.freshnessFooter-syncing {
+  color: #5a676d;
+}
+
+.freshnessFooter-done {
+  color: #1f8a4d;
+}
+
+.freshnessFooter-error {
+  color: #b03a2e;
+  cursor: help;
+}
+
+.freshnessGlyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  color: inherit;
+}
+
+.freshnessLabel {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.activityRail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 12px;
+  background: #e8eded;
+  border-right: 1px solid #d4dadc;
+}
+
+.railItem {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  padding: 0;
+  /* Transparent border reserves the 1px so the box doesn't jump
+     when active/hover swaps to a visible color (mirrors the
+     sidebar's sourceButton). */
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: #5a676d;
+  background: transparent;
+  cursor: pointer;
+  transition: background-color 0.12s, color 0.12s, border-color 0.12s;
+}
+
+.railItem:hover {
+  background: #d8e0e2;
+  color: #2b343a;
+}
+
+.railItem.active {
+  background: #ffffff;
+  color: #1d2025;
+}
+
+.railItem:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.placeholderPage {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: #f5f7f8;
+}
+
+.placeholderCard {
+  max-width: 460px;
+  padding: 28px 32px;
+  border: 1px dashed #c8d2d6;
+  border-radius: 12px;
+  background: #ffffff;
+  text-align: center;
+}
+
+.placeholderCard h2 {
+  margin: 0 0 10px;
+  font-size: 18px;
+  color: #1d2025;
+}
+
+.placeholderCard p {
+  margin: 0;
+  color: #5a676d;
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+
 .app {
   display: grid;
   grid-template-columns: 260px minmax(280px, 360px) minmax(420px, 1fr);
-  min-height: 100vh;
+  flex: 1;
+  min-height: 0;
+  height: 100%;
   color: #1d2025;
 }
 
 .sidebar {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  min-height: 0;
+  height: 100%;
   padding: 0;
   border-right: 1px solid #dfe4e7;
   background: #eef3f2;
@@ -74,7 +223,7 @@ input {
   flex-direction: column;
   gap: 6px;
   flex: 1 0 auto;
-  padding: 22px 18px 12px;
+  padding: 12px;
 }
 
 .sourceGroup {
@@ -88,7 +237,7 @@ input {
   align-items: center;
   justify-content: space-between;
   width: 100%;
-  min-height: 38px;
+  min-height: 36px;
   padding: 0 10px;
   border: 1px solid transparent;
   border-radius: 7px;
@@ -285,16 +434,13 @@ input {
 }
 
 .sessionsPane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
   border-right: 1px solid #dfe4e7;
 }
 
-.toolbar {
-  display: flex;
-  gap: 10px;
-  padding: 18px;
-  border-bottom: 1px solid #e1e6e8;
-  background: #ffffff;
-}
 
 .searchBox {
   display: flex;
@@ -395,14 +541,19 @@ input {
 .sessionList {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  height: calc(100vh - 117px);
+  gap: 6px;
+  /* Auto-fills the sessionsPane's flex column. Items render at the
+     top; the pane's white background extends below to the bottom as
+     natural blank. Scroll happens inside the list (not the page) when
+     items overflow. No viewport-percentage math. */
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 12px;
 }
 
 .memoryList {
-  gap: 14px;
+  gap: 6px;
 }
 
 .sessionCard {
@@ -423,7 +574,6 @@ input {
 
 .sessionHeader,
 .sessionMeta,
-.detailKicker,
 .messageTop {
   display: flex;
   align-items: center;
@@ -453,6 +603,24 @@ input {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.sessionMetaProject {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.sessionMetaProject > svg {
+  flex-shrink: 0;
+  color: #8a939a;
+}
+
+.sessionMetaProject > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sessionHeader + .sessionMeta {
@@ -500,7 +668,6 @@ input {
 
 .sessionMeta,
 .date,
-.detailKicker,
 .messageTop {
   color: #758184;
   font-size: 12px;
@@ -559,87 +726,223 @@ input {
 .detailPane {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  min-height: 0;
+  height: 100%;
 }
 
 .detailHeader {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 22px 24px 16px;
+  flex-direction: column;
+  padding: 12px;
   border-bottom: 1px solid #e1e6e8;
   background: #ffffff;
 }
 
-.detailHeader > div {
-  min-width: 0;
+/* Title gets a larger breathing space before the meta line; meta and
+   path/file-row form one tight metadata block together. */
+.detailHeader > .detailMeta {
+  margin-top: 12px;
 }
 
-.detailHeader h2 {
-  margin-top: 10px;
-  font-size: 22px;
-  line-height: 1.25;
-  /* Clamp to 2 lines with ellipsis. */
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  word-break: break-word;
-}
-
-.detailHeader p {
-  margin: 8px 0 0;
-  color: #5b676b;
-  font-size: 13px;
-  overflow-wrap: anywhere;
-}
-
-.detailHeader p.detailGuid {
+.detailHeader > .detailFileRow {
   margin-top: 4px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Mono", "Roboto Mono", monospace;
-  font-size: 12px;
-  color: #7a868c;
-  letter-spacing: 0.01em;
 }
 
-.detailStats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 12px 24px;
-  border-bottom: 1px solid #e1e6e8;
-  background: #ffffff;
-}
-
-.infoPill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 100%;
-  min-height: 30px;
-  padding: 0 10px;
-  border: 1px solid #dce3e4;
-  border-radius: 8px;
-  color: #526165;
-  background: #f7f9f9;
-  font-size: 12px;
-}
-
-.infoPill span {
+.detailTitle {
+  margin: 0;
+  min-width: 0;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: #1d2025;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.detailMeta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: #6a747a;
+  font-size: 12px;
+}
+
+.detailMetaItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.detailMetaProject {
+  overflow: hidden;
+}
+
+.detailMetaProject > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detailMetaSep {
+  color: #c2cccf;
+  user-select: none;
+}
+
+.detailPaths {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.detailPath {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: #6a747a;
+  font-size: 11.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Mono", "Roboto Mono", monospace;
+}
+
+.detailPath > svg {
+  flex-shrink: 0;
+}
+
+.detailPath > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detailFileRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.detailFileRow .detailPath {
+  flex: 1;
+  min-width: 0;
+}
+
+.detailActions {
+  display: flex;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.bareIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  color: #6a747a;
+  cursor: pointer;
+}
+
+.bareIcon:hover {
+  color: #1d2025;
+}
+
+.detailAction {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid #e0e5e7;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #5b676b;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background-color 0.12s, color 0.12s, border-color 0.12s;
+}
+
+.detailAction:hover {
+  background: #f4f7f8;
+  border-color: #c7d3d2;
+  color: #1d2025;
+}
+
+.detailAction:active {
+  background: #eaf0f1;
+}
+
+.copyMenu {
+  position: relative;
+  display: inline-block;
+}
+
+.copyMenuTrigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.copyMenuTrigger > span {
+  line-height: 1;
+}
+
+.copyMenuList {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  min-width: 160px;
+  padding: 4px;
+  background: #ffffff;
+  border: 1px solid #d4dadc;
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(20, 28, 32, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.copyMenuItem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #354247;
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.1s;
+}
+
+.copyMenuItem:hover {
+  background: #f4f7f8;
+  color: #1d2025;
+}
+
+.copyMenuCheck {
+  color: #1f8a4d;
+  flex-shrink: 0;
+}
+
 .messageList {
   flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   overflow: auto;
-  padding: 18px 24px 28px;
+  padding: 12px;
 }
 
 .message {
-  margin-bottom: 14px;
   border: 1px solid #e0e5e7;
   border-radius: 8px;
   background: #ffffff;
@@ -867,13 +1170,6 @@ input {
 .messageBody img {
   max-width: 100%;
   border-radius: 6px;
-}
-
-.detailHeaderActions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: 0 0 auto;
 }
 
 .emptyState,
