@@ -3335,7 +3335,11 @@ fn opencode_v2_message_from_value(value: &Value, created: i64) -> Option<Session
             let command = value.get("command").and_then(value_to_string)?;
             let mut lines = vec![format!("$ {command}")];
             if let Some(output) = value.get("output").and_then(value_to_string) {
-                let output = output.trim();
+                // session-v2.tsx:203 ShellMessage applies `stripAnsi` to
+                // the output before rendering. Match here so terminal
+                // colour codes don't leak into the markdown viewer.
+                let stripped = strip_ansi(&output);
+                let output = stripped.trim();
                 if !output.is_empty() {
                     lines.push(output.to_string());
                 }
@@ -3503,7 +3507,17 @@ fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
         } else {
             format!("**Shell**({args})")
         };
-        let trimmed_output = output.trim();
+        // Per session-v2.tsx:710 Bash prefers `metadata.output` (the
+        // already-formatted shell capture) over `state.content` (the
+        // generic toolOutput projection). Resolve in that order and
+        // strip ANSI escapes — `stripAnsi` matches the TUI's behavior.
+        let bash_output_raw = metadata
+            .and_then(|m| m.get("output"))
+            .and_then(value_to_string)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| output.clone());
+        let bash_output = strip_ansi(&bash_output_raw);
+        let trimmed_output = bash_output.trim();
         if trimmed_output.is_empty() {
             return Some(header);
         }
@@ -3593,10 +3607,22 @@ fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
             .or_else(|| input.as_str().map(ToString::to_string))?;
         return Some(format!("**WebFetch**({})", wrap_inline_code(&url)));
     }
-    // session-v2.tsx:818 WebSearch
+    // session-v2.tsx:818 WebSearch — verb is provider-derived label per
+    // `webSearchProviderLabel` in `packages/opencode/src/tool/websearch.ts:39-43`:
+    //   * `"parallel"` → "Parallel Web Search"
+    //   * `"exa"`      → "Exa Web Search"
+    //   * (default)    → "Web Search"
     if name == "websearch" {
         let query = input_string(input_record, "query")
             .or_else(|| input.as_str().map(ToString::to_string))?;
+        let verb = match metadata
+            .and_then(|m| m.get("provider"))
+            .and_then(Value::as_str)
+        {
+            Some("parallel") => "Parallel Web Search",
+            Some("exa") => "Exa Web Search",
+            _ => "Web Search",
+        };
         let mut args = wrap_inline_code(&query);
         if let Some(results) = metadata
             .and_then(|m| m.get("numResults"))
@@ -3604,7 +3630,7 @@ fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
         {
             args.push_str(&format!(" — {results} results"));
         }
-        return Some(format!("**WebSearch**({args})"));
+        return Some(format!("**{verb}**({args})"));
     }
     // session-v2.tsx:828 Write
     if name == "write" {
@@ -3668,9 +3694,12 @@ fn opencode_v2_tool_part_text(part: &Value) -> Option<String> {
                         .get("patch")
                         .and_then(value_to_string)
                         .or_else(|| {
-                            file.get("deletions")
-                                .and_then(value_to_string)
-                                .map(|n| format!("-{n} lines"))
+                            // Per session-v2.tsx:923-924, fall back to the
+                            // deletion count. Pluralize TUI-style: `-1 line`,
+                            // `-N lines`.
+                            let n = file.get("deletions").and_then(Value::as_i64)?;
+                            let unit = if n == 1 { "line" } else { "lines" };
+                            Some(format!("-{n} {unit}"))
                         })
                         .unwrap_or_default();
                     Some(unified(verb, &wrap_inline_code(&path), &body, "diff"))
@@ -3818,6 +3847,65 @@ fn opencode_v2_patch_file_verb_path(file: &Value) -> Option<(&'static str, Strin
         }
         _ => ("Patched", relative_path),
     })
+}
+
+/// Strip ANSI escape sequences from terminal output. Mirrors the
+/// `stripAnsi` calls in OpenCode's session-v2.tsx (Bash output at l.710,
+/// shell-message output at l.203). We don't reach for a regex crate
+/// because the patterns we need to remove are a small, stable subset:
+///
+/// * CSI sequences — `ESC [ {params} {final}` where `final` ∈ `@..~`
+///   (most colour / cursor codes)
+/// * OSC sequences — `ESC ] ... BEL` or `ESC ] ... ESC \`
+/// * Single-character escapes — `ESC {letter}` (e.g. `ESC c` reset)
+///
+/// Anything else is left as-is so we don't accidentally strip user
+/// content that happens to contain a `0x1b` byte.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        let Some(next) = chars.next() else {
+            break;
+        };
+        match next {
+            '[' => {
+                // CSI — consume params (0x20-0x3F) then the final byte
+                // (0x40-0x7E) which terminates the sequence.
+                while let Some(&p) = chars.peek() {
+                    if matches!(p, '\u{20}'..='\u{3f}') {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(&p) = chars.peek() {
+                    if matches!(p, '\u{40}'..='\u{7e}') {
+                        chars.next();
+                    }
+                }
+            }
+            ']' => {
+                // OSC — consume until BEL (0x07) or ESC \\.
+                while let Some(p) = chars.next() {
+                    if p == '\u{07}' {
+                        break;
+                    }
+                    if p == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Single-character escape — drop the letter and continue.
+            _ => {}
+        }
+    }
+    out
 }
 
 fn todo_icon(status: &str) -> &'static str {
@@ -9377,6 +9465,126 @@ mod tests {
             edit,
             "**Edit**(`src/main.ts`)\n\n```diff\n- old\n+ new\n```"
         );
+    }
+
+    #[test]
+    fn opencode_bash_prefers_metadata_output_and_strips_ansi() {
+        // Per session-v2.tsx:710 Bash resolves output as
+        // `metadata.output ?? props.output` then strips ANSI. Termory
+        // mirrors: pick metadata.output when present (it's the
+        // already-formatted shell capture), fall back to state.content
+        // (props.output), and run the result through strip_ansi so
+        // colour codes don't leak into the markdown viewer.
+        let bash = opencode_v2_tool_part_text(&serde_json::json!({
+            "type":"tool",
+            "name":"bash",
+            "state":{
+                "status":"completed",
+                "input":{"command":"ls","description":"List"},
+                // Generic projection has bare text…
+                "content":[{"type":"text","text":"raw"}]
+            },
+            // …but metadata.output has the colourised capture. The TUI
+            // prefers metadata.output here.
+            "provider":{"metadata":{"output":"\u{1b}[31mred\u{1b}[0m line\nline2"}}
+        }))
+        .unwrap();
+        assert_eq!(
+            bash,
+            "**Shell**(`ls`)\n\n\\# List\n\n```bash\n$ ls\nred line\nline2\n```"
+        );
+    }
+
+    #[test]
+    fn opencode_websearch_uses_provider_aware_verb() {
+        // session-v2.tsx:818 + websearch.ts:39-43 — provider label varies
+        // by `metadata.provider`: "parallel" → "Parallel Web Search",
+        // "exa" → "Exa Web Search", anything else → "Web Search".
+        let parallel = opencode_v2_tool_part_text(&serde_json::json!({
+            "type":"tool","name":"websearch",
+            "state":{"input":{"query":"tauri v2 docs"}},
+            "metadata":{"provider":"parallel","numResults":5}
+        }))
+        .unwrap();
+        assert_eq!(
+            parallel,
+            "**Parallel Web Search**(`tauri v2 docs` — 5 results)"
+        );
+
+        let exa = opencode_v2_tool_part_text(&serde_json::json!({
+            "type":"tool","name":"websearch",
+            "state":{"input":{"query":"rust async"}},
+            "metadata":{"provider":"exa","numResults":3}
+        }))
+        .unwrap();
+        assert_eq!(exa, "**Exa Web Search**(`rust async` — 3 results)");
+
+        // No provider → default "Web Search" (with a space, matching the
+        // TUI default at websearch.ts:42).
+        let default = opencode_v2_tool_part_text(&serde_json::json!({
+            "type":"tool","name":"websearch",
+            "state":{"input":{"query":"q"}}
+        }))
+        .unwrap();
+        assert_eq!(default, "**Web Search**(`q`)");
+    }
+
+    #[test]
+    fn opencode_apply_patch_pluralizes_deletions_fallback() {
+        // Per session-v2.tsx:923 — when a file has no patch text, the
+        // TUI falls back to `-N line` / `-N lines` (singular for one
+        // deletion). Termory mirrors via the deletions count.
+        let one = opencode_v2_tool_part_text(&serde_json::json!({
+            "type":"tool","name":"apply_patch",
+            "state":{"input":{}},
+            "metadata":{"files":[{"type":"delete","relativePath":"a.txt","deletions":1}]}
+        }))
+        .unwrap();
+        assert!(one.starts_with("**Deleted**(`a.txt`)"));
+        assert!(one.contains("```diff\n-1 line\n```"), "got: {one}");
+
+        let many = opencode_v2_tool_part_text(&serde_json::json!({
+            "type":"tool","name":"apply_patch",
+            "state":{"input":{}},
+            "metadata":{"files":[{"type":"delete","relativePath":"b.txt","deletions":3}]}
+        }))
+        .unwrap();
+        assert!(many.contains("```diff\n-3 lines\n```"), "got: {many}");
+    }
+
+    #[test]
+    fn opencode_shell_message_strips_ansi_from_output() {
+        // session-v2.tsx:203 ShellMessage applies `stripAnsi` to the
+        // captured output before rendering. The shell-typed message in
+        // SQLite carries the raw capture; Termory strips ANSI to match.
+        let msg = opencode_v2_message_from_value(
+            &serde_json::json!({
+                "type":"shell",
+                "command":"ls",
+                "output":"\u{1b}[1mbold\u{1b}[0m plain",
+                "time":{"created":1714521600000_i64}
+            }),
+            1714521600000,
+        )
+        .unwrap();
+        assert_eq!(msg.text, "$ ls\nbold plain");
+    }
+
+    #[test]
+    fn strip_ansi_handles_csi_osc_and_single_letter_escapes() {
+        // CSI colour codes, OSC title-set, lone ESC-c reset — all
+        // should disappear, leaving only the printable payload.
+        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
+        assert_eq!(strip_ansi("\u{1b}[1;32mbold green\u{1b}[m"), "bold green");
+        assert_eq!(strip_ansi("\u{1b}]0;title\u{07}body"), "body");
+        assert_eq!(
+            strip_ansi("\u{1b}]0;title\u{1b}\\body"),
+            "body",
+            "OSC + ST terminator"
+        );
+        assert_eq!(strip_ansi("\u{1b}cclear"), "clear");
+        // Non-ESC content untouched.
+        assert_eq!(strip_ansi("no escapes"), "no escapes");
     }
 
     #[test]

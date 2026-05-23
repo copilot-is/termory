@@ -335,15 +335,15 @@ Feature-gated wrappers not handled: `<github-webhook-activity>` (KAIROS_GITHUB_W
 
 **OpenCode** (`opencode_v2_tool_part_text`) — each tool header uses the unified `**Verb**(args)` shape but the verb text + body content stay platform-native (matching `session-v2.tsx` lines cited below). Body decorations (`\# description` BlockTool title, bash fence with `$ cmd` prefix, ```diff diff fence, `↳ Loaded` instruction-file list, `{✓/~/✕/☐}` todo icons) are preserved verbatim — only the header line was reshaped:
 
-- `Bash` / `Shell` (l.707): header `**Shell**({wrap_inline_code(cmd)})`. With output → followed by `\# {description ?? "Shell"}\n\n```bash\n$ {cmd}\n{output}\n```` (original BlockTool body). Without output → header alone (original InlineTool was `$ {cmd}`).
+- `Bash` / `Shell` (l.707): header `**Shell**({wrap_inline_code(cmd)})`. With output → followed by `\# {description ?? "Shell"}\n\n```bash\n$ {cmd}\n{output}\n```` (original BlockTool body). Without output → header alone (original InlineTool was `$ {cmd}`). Output resolution mirrors TUI l.710: `metadata.output ?? state.content` (Bash-specific override — other tools just use `state.content`), then `strip_ansi` to drop terminal colour codes.
 - `Glob` (l.748): `**Glob**(pattern: {wrap_inline_code(pattern)}, path: {wrap_inline_code(path)} — {N} match[es])` (singular/plural matched).
 - `Read` (l.764): `**Read**({wrap_inline_code(filePath)} [other=...])` + per-entry `↳ Loaded {path}` lines using CommonMark hard breaks (`\` line terminator). `metadata.loaded` is the `instruction.resolve` array from `read.ts:264` — the auto-loaded instruction files (AGENTS.md / CLAUDE.md / etc.) the Read tool fetched alongside the requested file; surfaced because it's data, not decoration.
 - `Grep` (l.794): `**Grep**(pattern: {pattern}, path: {path} — {N} match[es])`.
 - `WebFetch` (l.810): `**WebFetch**({wrap_inline_code(url)})`.
-- `WebSearch` (l.818): `**WebSearch**({wrap_inline_code(query)} — {N} results)`.
+- `WebSearch` (l.818): `**{provider label}**({wrap_inline_code(query)} — {N} results)`. Verb is provider-derived per `webSearchProviderLabel` (`tool/websearch.ts:39-43`): `"parallel"` → `Parallel Web Search`, `"exa"` → `Exa Web Search`, otherwise → `Web Search` (default, with space — matches Claude's verb).
 - `Write` (l.828): `**Write**({wrap_inline_code(filePath)})` + ```{lang from ext}\n{content}\n``` body when completed.
 - `Edit` (l.857): `**Edit**({wrap_inline_code(filePath)})` + ```diff\n{diff}\n``` body when diff present.
-- `ApplyPatch` (l.891): per-file header → `**Deleted**({path})` / `**Created**({path})` / `**Moved**({old → new})` / `**Patched**({path})` + ```diff fence (matches FileChange tags in fileTitle()).
+- `ApplyPatch` (l.891): per-file header → `**Deleted**({path})` / `**Created**({path})` / `**Moved**({old → new})` / `**Patched**({path})` + ```diff fence (matches FileChange tags in fileTitle()). When a file has no `patch` text, body falls back to `-N line` / `-N lines` (pluralized per TUI l.923).
 - `TodoWrite` (l.964): `**Todos**\n\n{✓/~/✕/☐} {content}` per todo (verb is "Todos" — matches the original BlockTool title `\# Todos`; icons from todoIcon helper).
 - `Question` (l.991): `**Questions**\n\n{Q}\n{A}` per Q/A pair (verb "Questions" matches `\# Questions` title).
 - `Skill` (l.1022): `**Skill**({wrap_inline_code(name)})`.
@@ -379,6 +379,7 @@ Audit reference is OpenCode `1.15.5` (commit `9324ef0`). Compared against `v1.15
 - `merge_tool_outputs(messages)` (sessions.rs runs in `parse_claude_session` and `parse_codex_session`): folds matching `tool_result` / `tool_error` into the leading `tool_use` card. On a matched failure it prefixes the leading line with `✗ ` (instead of `⏺ `) and prepends the fence body with `Error:` (plus `Exit code N` when `SessionMessage.exit_code` is set). Orphan results (no matching tool_use) keep their text but also get a `⏺` / `✗` status prefix.
 - `codex_parse_exec_output(text)` returns `CodexExecOutput { raw, exit_code }` — strips Codex's `Chunk ID: ... Output:` wrapper line-by-line so the visible body is just `aggregated_output`, AND extracts the exit code for the `Error: Exit code N` line.
 - `codex_parse_patch_actions(patch_text)` scans `*** Add/Delete/Update File:` markers and returns `Vec<CodexPatchAction>` for the apply_patch header builder.
+- `strip_ansi(text)` — drop ANSI escapes (CSI colour / cursor codes, OSC title-set sequences, and lone `ESC + letter` escapes). Used for OpenCode Bash output (session-v2.tsx:710) and `type: "shell"` message captures (session-v2.tsx:203). No regex crate — small inline state machine, leaves non-ESC content untouched.
 
 ### Tool message metadata + UI
 
