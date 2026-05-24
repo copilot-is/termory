@@ -70,7 +70,7 @@ pub fn start(app_handle: AppHandle) -> notify::Result<()> {
             let mut events: Vec<notify::Event> = Vec::new();
             match rx.recv() {
                 Ok(Ok(event)) => events.push(event),
-                Ok(Err(_)) => {} // watcher-level error, ignore
+                Ok(Err(_)) => {}  // watcher-level error, ignore
                 Err(_) => return, // channel closed → shutdown
             }
             // Then drain everything that lands within the debounce

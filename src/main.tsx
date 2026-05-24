@@ -13,6 +13,8 @@ import {
   ChevronRight,
   Clock,
   Copy,
+  Eye,
+  EyeOff,
   File,
   Folder,
   ExternalLink,
@@ -28,7 +30,59 @@ import {
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { getConfig, setConfig } from "./config";
 import "./styles.css";
+
+/// React state that mirrors a key in the tauri-plugin-store backing
+/// file. Behavior:
+/// * mount → returns `initial` immediately; kicks off an async load
+/// * load resolves → if a value was persisted, swaps in (without
+///   re-persisting it)
+/// * any later setValue → writes through to the store
+///
+/// `validate` lets callers reject corrupt persisted data (e.g. an
+/// out-of-range enum) and fall back to `initial`. Returns the same
+/// `[value, setValue]` tuple as `React.useState` so callers can
+/// drop-in replace.
+function usePersistentState<T>(
+  key: string,
+  initial: T,
+  validate?: (raw: unknown) => raw is T
+): [T, React.Dispatch<React.SetStateAction<T>>] {
+  const [value, setValue] = React.useState<T>(initial);
+  const loaded = React.useRef(false);
+  const skipNextPersist = React.useRef(false);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    getConfig<unknown>(key)
+      .then((stored) => {
+        if (cancelled) return;
+        if (stored == null) return;
+        if (validate && !validate(stored)) return;
+        skipNextPersist.current = true;
+        setValue(stored as T);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) loaded.current = true;
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [key]);
+
+  React.useEffect(() => {
+    if (!loaded.current) return;
+    if (skipNextPersist.current) {
+      skipNextPersist.current = false;
+      return;
+    }
+    void setConfig(key, value);
+  }, [key, value]);
+
+  return [value, setValue];
+}
 
 const messageRemarkPlugins = [remarkGfm];
 
@@ -84,6 +138,23 @@ function sessionKey(session: { source: string; path: string; id: string }) {
 
 const sources = ["All", "Codex", "Claude", "Gemini", "OpenCode"];
 
+/// Pretty label for a tool/source identifier. Internal source values
+/// stay short ("Claude", "Gemini") so they line up with badge CSS
+/// classes (`.badge.claude`, `.badge.gemini`) and the filter logic;
+/// the display layer always goes through this helper so Records and
+/// Providers show the same official tool name ("Claude Code",
+/// "Gemini CLI").
+function sourceDisplayName(source: string): string {
+  switch (source) {
+    case "Claude":
+      return "Claude Code";
+    case "Gemini":
+      return "Gemini CLI";
+    default:
+      return source;
+  }
+}
+
 const MEMORY_SOURCE = "Memory";
 const SKILL_SOURCE = "Skill";
 
@@ -122,6 +193,70 @@ function memoryToolsOf(session: AppSession): MemoryTool[] {
 
 const MEMORY_TOOL_ORDER: MemoryTool[] = ["Claude", "Codex", "Gemini", "OpenCode", "Other"];
 
+type CliApp = "claude" | "codex" | "gemini" | "opencode";
+const CLI_APPS: CliApp[] = ["claude", "codex", "gemini", "opencode"];
+
+type ProviderKind = "official" | "custom";
+
+type Provider = {
+  id: string;
+  app: CliApp;
+  kind: ProviderKind;
+  name: string;
+  // All string fields below are optional in storage — config.ts strips
+  // ""/null/undefined when writing providers.json, so a freshly-loaded
+  // Provider may omit any of them. React inputs that bind to these
+  // must use `?? ""` to stay controlled.
+  baseUrl?: string;
+  apiKey?: string;
+  model?: string;
+  // Claude-only: per-size routing. When set, Claude Code's `/model`
+  // menu (Sonnet/Opus/Haiku) maps to these model ids instead of the
+  // Anthropic-native ones — matters when the provider doesn't speak
+  // Anthropic model id (e.g. routes Claude requests to gpt-5).
+  claudeHaikuModel?: string;
+  claudeSonnetModel?: string;
+  claudeOpusModel?: string;
+};
+
+type ActiveKind = "official" | "custom" | "unmanaged";
+
+type LiveSnapshot = {
+  baseUrl?: string | null;
+  apiKeyMasked?: string | null;
+  model?: string | null;
+};
+
+type ActiveState = {
+  app: CliApp;
+  kind: ActiveKind;
+  matchedProviderId?: string | null;
+  liveSnapshot?: LiveSnapshot | null;
+  livePath: string;
+};
+
+type TestResult = {
+  ok: boolean;
+  status?: number | null;
+  latencyMs: number;
+  message: string;
+};
+
+function isProviderList(raw: unknown): raw is Provider[] {
+  if (!Array.isArray(raw)) return false;
+  for (const item of raw) {
+    if (!item || typeof item !== "object") return false;
+    const p = item as Record<string, unknown>;
+    if (typeof p.id !== "string") return false;
+    if (typeof p.name !== "string") return false;
+    if (p.app !== "claude" && p.app !== "codex" && p.app !== "gemini" && p.app !== "opencode") {
+      return false;
+    }
+    if (p.kind !== "official" && p.kind !== "custom") return false;
+  }
+  return true;
+}
+
 type Route = "records" | "search" | "stats" | "config" | "settings";
 const ROUTES: Route[] = ["records", "search", "stats", "config", "settings"];
 
@@ -148,7 +283,45 @@ function App() {
   const [contentHits, setContentHits] = React.useState<Map<string, SearchHit>>(() => new Map());
   const [searchingContent, setSearchingContent] = React.useState(false);
   const [contentQuery, setContentQuery] = React.useState("");
-  const [pane, setPane] = React.useState<"sessions" | "memory" | "skills">("sessions");
+  const [pane, setPane] = usePersistentState<"sessions" | "memory" | "skills">(
+    "default_pane",
+    "sessions",
+    (raw): raw is "sessions" | "memory" | "skills" =>
+      raw === "sessions" || raw === "memory" || raw === "skills"
+  );
+  const [recentSearches, setRecentSearches] = usePersistentState<string[]>(
+    "recent_searches",
+    [],
+    (raw): raw is string[] =>
+      Array.isArray(raw) && raw.every((entry) => typeof entry === "string")
+  );
+  const [providers, setProviders] = usePersistentState<Provider[]>(
+    "providers",
+    [],
+    isProviderList
+  );
+  const [providersApp, setProvidersApp] = usePersistentState<CliApp>(
+    "providers_app",
+    "claude",
+    (raw): raw is CliApp =>
+      raw === "claude" || raw === "codex" || raw === "gemini" || raw === "opencode"
+  );
+
+  const addRecentSearch = React.useCallback(
+    (raw: string) => {
+      const trimmed = raw.trim();
+      if (trimmed.length < 2) return;
+      setRecentSearches((current) => {
+        const filtered = current.filter((entry) => entry !== trimmed);
+        return [trimmed, ...filtered].slice(0, 5);
+      });
+    },
+    [setRecentSearches]
+  );
+
+  const clearRecentSearches = React.useCallback(() => {
+    setRecentSearches([]);
+  }, [setRecentSearches]);
   const [route, setRoute] = React.useState<Route>(() => readRouteFromHash());
   const [lastRefreshedAt, setLastRefreshedAt] = React.useState<number | null>(null);
 
@@ -163,6 +336,20 @@ function App() {
     const onHashChange = () => setRoute(readRouteFromHash());
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  // Shared "jump to this record" action — used by both the Search page
+  // and the Cmd-K palette. Resets the Records sidebar filters so the
+  // target item is visible in its pane and switches the pane tab to
+  // match the item type before flipping the route.
+  const openItem = React.useCallback((item: AppSession) => {
+    setSource("All");
+    setProject(null);
+    if (isMemoryItem(item)) setPane("memory");
+    else if (isSkillItem(item)) setPane("skills");
+    else setPane("sessions");
+    setSelected(item);
+    setRoute("records");
   }, []);
 
   const applyScanResult = React.useCallback((result: AppSession[]) => {
@@ -353,6 +540,15 @@ function App() {
   }, [skillItems, query, source, project, contentHits, contentQuery]);
 
 
+  const hasActiveFilters =
+    source !== "All" || project !== null || query.trim().length > 0;
+
+  const clearFilters = React.useCallback(() => {
+    setSource("All");
+    setProject(null);
+    setQuery("");
+  }, []);
+
   const sourceGroups = React.useMemo(() => {
     return sources.map((item) => {
       const sourceSessions = item === "All" ? sessionItems : sessionItems.filter((session) => session.source === item);
@@ -374,7 +570,26 @@ function App() {
       <div className="appBody">
       <ActivityRail route={route} onChange={setRoute} />
       <div className="routeContent">
-        {route !== "records" && <RoutePlaceholder route={route} />}
+        {route === "search" && (
+          <SearchPage
+            sessions={sessions}
+            onOpenItem={openItem}
+            recentSearches={recentSearches}
+            onCommitSearch={addRecentSearch}
+            onClearRecent={clearRecentSearches}
+          />
+        )}
+        {route === "config" && (
+          <ProvidersPage
+            providers={providers}
+            setProviders={setProviders}
+            app={providersApp}
+            setApp={setProvidersApp}
+          />
+        )}
+        {route !== "records" && route !== "search" && route !== "config" && (
+          <RoutePlaceholder route={route} />
+        )}
         {route === "records" && (
     <main className="app">
       <aside className="sidebar">
@@ -416,7 +631,7 @@ function App() {
                       <ChevronRight className="toggleIcon" size={15} />
                     )}
                   </span>
-                  <span>{group.source}</span>
+                  <span>{sourceDisplayName(group.source)}</span>
                 </span>
                 <b>{group.count}</b>
               </button>
@@ -487,8 +702,26 @@ function App() {
         {pane === "sessions" && (
           <div className="sessionList">
             {loading && sessionItems.length === 0 && <EmptyState icon={<Loader2 className="spin" />} title="Scanning local history" />}
-            {!loading && filtered.length === 0 && (
-              <EmptyState icon={<FileJson />} title="No sessions found" />
+            {!loading && filtered.length === 0 && sessionItems.length === 0 && (
+              <EmptyState
+                icon={<FileJson size={32} />}
+                title="No sessions yet"
+                description="Termory scans Codex, Claude Code, Gemini CLI, and OpenCode for chat history. None of those tools have recorded sessions here yet."
+              />
+            )}
+            {!loading && filtered.length === 0 && sessionItems.length > 0 && (
+              <EmptyState
+                icon={<FileJson size={32} />}
+                title="No sessions match"
+                description={
+                  hasActiveFilters
+                    ? "Try a different source, project, or query."
+                    : "Nothing matches your current view."
+                }
+                action={
+                  hasActiveFilters ? { label: "Clear filters", onClick: clearFilters } : undefined
+                }
+              />
             )}
             {(!loading || sessionItems.length > 0) &&
               filtered.map((session) => {
@@ -502,7 +735,7 @@ function App() {
                     onClick={() => setSelected(session)}
                   >
                     <div className="sessionHeader">
-                      <span className={`badge ${session.source.toLowerCase()}`}>{session.source}</span>
+                      <span className={`badge ${session.source.toLowerCase()}`}>{sourceDisplayName(session.source)}</span>
                       <span className="date">{formatDate(session.updated_at ?? session.started_at)}</span>
                     </div>
                     <h2>{session.title}</h2>
@@ -532,8 +765,26 @@ function App() {
             {loading && memoryItems.length === 0 && (
               <EmptyState icon={<Loader2 className="spin" />} title="Scanning memory" />
             )}
-            {!loading && filteredMemories.length === 0 && (
-              <EmptyState icon={<BookOpen />} title="No memory found" />
+            {!loading && filteredMemories.length === 0 && memoryItems.length === 0 && (
+              <EmptyState
+                icon={<BookOpen size={32} />}
+                title="No memory files yet"
+                description="Termory looks for AGENTS.md, CLAUDE.md, GEMINI.md, and per-project memory folders in the current working directory and your home folder."
+              />
+            )}
+            {!loading && filteredMemories.length === 0 && memoryItems.length > 0 && (
+              <EmptyState
+                icon={<BookOpen size={32} />}
+                title="No memory matches"
+                description={
+                  hasActiveFilters
+                    ? "Try a different source or query."
+                    : "Nothing matches your current view."
+                }
+                action={
+                  hasActiveFilters ? { label: "Clear filters", onClick: clearFilters } : undefined
+                }
+              />
             )}
             {filteredMemories.map((item) => (
               <MemoryCard
@@ -554,8 +805,26 @@ function App() {
             {loading && skillItems.length === 0 && (
               <EmptyState icon={<Loader2 className="spin" />} title="Scanning skills" />
             )}
-            {!loading && filteredSkills.length === 0 && (
-              <EmptyState icon={<Sparkles />} title="No skills found" />
+            {!loading && filteredSkills.length === 0 && skillItems.length === 0 && (
+              <EmptyState
+                icon={<Sparkles size={32} />}
+                title="No skills yet"
+                description="Termory scans ~/.claude/skills, ~/.codex/skills, ~/.gemini/skills, and ~/.agents/skills, plus project-local .agents/skills folders."
+              />
+            )}
+            {!loading && filteredSkills.length === 0 && skillItems.length > 0 && (
+              <EmptyState
+                icon={<Sparkles size={32} />}
+                title="No skill matches"
+                description={
+                  hasActiveFilters
+                    ? "Try a different source or query."
+                    : "Nothing matches your current view."
+                }
+                action={
+                  hasActiveFilters ? { label: "Clear filters", onClick: clearFilters } : undefined
+                }
+              />
             )}
             {filteredSkills.map((item) => (
               <MemoryCard
@@ -573,7 +842,19 @@ function App() {
       </section>
 
       <section className="detailPane">
-        {!selected && <EmptyState icon={<Sparkles />} title="Select a session" />}
+        {!selected && sessions.length === 0 && !loading && (
+          <EmptyState
+            icon={<Sparkles size={32} />}
+            title="Nothing to view yet"
+            description="Once Termory finds local history, sessions, memories, and skills will show up here."
+          />
+        )}
+        {!selected && sessions.length > 0 && (
+          <EmptyState icon={<Sparkles />} title="Select a record" />
+        )}
+        {!selected && sessions.length === 0 && loading && (
+          <EmptyState icon={<Loader2 className="spin" />} title="Scanning…" />
+        )}
         {selected && (
           <>
             <header className="detailHeader">
@@ -671,6 +952,13 @@ function App() {
         lastSyncedAt={lastRefreshedAt}
         error={error}
       />
+      <CommandPalette
+        sessions={sessions}
+        onOpenItem={openItem}
+        recentSearches={recentSearches}
+        onCommitSearch={addRecentSearch}
+        onClearRecent={clearRecentSearches}
+      />
     </div>
   );
 }
@@ -686,7 +974,7 @@ function ActivityRail({
     { id: "records", icon: <History size={20} />, label: "Records" },
     { id: "search", icon: <Search size={20} />, label: "Search" },
     { id: "stats", icon: <BarChart3 size={20} />, label: "Stats" },
-    { id: "config", icon: <Plug size={20} />, label: "CLI Config" },
+    { id: "config", icon: <Plug size={20} />, label: "Providers" },
     { id: "settings", icon: <SettingsIcon size={20} />, label: "Settings" }
   ];
   return (
@@ -962,19 +1250,1270 @@ function formatTimeAgo(timestamp: number): string {
   return `${day}d ago`;
 }
 
+const CLI_APP_LABEL: Record<CliApp, string> = {
+  claude: "Claude Code",
+  codex: "Codex",
+  gemini: "Gemini CLI",
+  opencode: "OpenCode"
+};
+
+const CLI_APP_SOURCE_BADGE: Record<CliApp, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  gemini: "Gemini",
+  opencode: "OpenCode"
+};
+
+function newProviderId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function blankProvider(app: CliApp): Provider {
+  const base: Provider = {
+    id: newProviderId(),
+    app,
+    kind: "custom",
+    name: "",
+    baseUrl: "",
+    apiKey: "",
+    model: ""
+  };
+  if (app === "claude") {
+    base.baseUrl = "https://api.anthropic.com";
+  } else if (app === "codex") {
+    base.baseUrl = "https://api.openai.com/v1";
+  } else if (app === "gemini") {
+    base.baseUrl = "https://generativelanguage.googleapis.com";
+  } else if (app === "opencode") {
+    base.baseUrl = "https://api.anthropic.com";
+  }
+  return base;
+}
+
+function maskKey(key: string): string {
+  if (!key) return "";
+  if (key.length <= 8) return "•".repeat(key.length);
+  return `${key.slice(0, 4)}${"•".repeat(key.length - 8)}${key.slice(-4)}`;
+}
+
+const ACTIVE_STATE_REFRESH_EVENT = "termory:providers-refresh";
+
+function ProvidersPage({
+  providers,
+  setProviders,
+  app,
+  setApp
+}: {
+  providers: Provider[];
+  setProviders: React.Dispatch<React.SetStateAction<Provider[]>>;
+  app: CliApp;
+  setApp: (next: CliApp) => void;
+}) {
+  const [editing, setEditing] = React.useState<Provider | null>(null);
+  const [editingIsNew, setEditingIsNew] = React.useState(false);
+  const [activeStates, setActiveStates] = React.useState<Record<CliApp, ActiveState | null>>({
+    claude: null,
+    codex: null,
+    gemini: null,
+    opencode: null
+  });
+  const [activating, setActivating] = React.useState<string | null>(null);
+  const [testing, setTesting] = React.useState<string | null>(null);
+  const [testResults, setTestResults] = React.useState<Record<string, TestResult>>({});
+  const [feedback, setFeedback] = React.useState<{
+    kind: "ok" | "error";
+    message: string;
+  } | null>(null);
+
+  const refreshActive = React.useCallback(async () => {
+    try {
+      const states = await invoke<ActiveState[]>("provider_active_states", { providers });
+      const next: Record<CliApp, ActiveState | null> = {
+        claude: null,
+        codex: null,
+        gemini: null,
+        opencode: null
+      };
+      for (const s of states) next[s.app] = s;
+      setActiveStates(next);
+    } catch (err) {
+      setFeedback({ kind: "error", message: `read live state failed: ${String(err)}` });
+    }
+  }, [providers]);
+
+  React.useEffect(() => {
+    void refreshActive();
+  }, [refreshActive]);
+
+  // Auto refresh when the Rust watcher detects any change in the
+  // CLI dirs (live config files live inside those dirs). Reuse the
+  // existing `termory:sources-changed` event — payload is ignored.
+  React.useEffect(() => {
+    const unlistenPromise = listen("termory:sources-changed", () => {
+      void refreshActive();
+    });
+    const peerHandler = () => void refreshActive();
+    window.addEventListener(ACTIVE_STATE_REFRESH_EVENT, peerHandler);
+    return () => {
+      void unlistenPromise.then((fn) => fn()).catch(() => {});
+      window.removeEventListener(ACTIVE_STATE_REFRESH_EVENT, peerHandler);
+    };
+  }, [refreshActive]);
+
+  // Re-fetch when the user switches tabs (cheap; backend reads 4 files).
+  React.useEffect(() => {
+    setFeedback(null);
+  }, [app]);
+
+  const providersForApp = React.useMemo(
+    () => providers.filter((p) => p.app === app),
+    [providers, app]
+  );
+  const customProviders = React.useMemo(
+    () => providersForApp.filter((p) => p.kind === "custom"),
+    [providersForApp]
+  );
+  const activeState = activeStates[app];
+
+  const startNew = () => {
+    setEditing(blankProvider(app));
+    setEditingIsNew(true);
+  };
+  const startEdit = (p: Provider) => {
+    setEditing({ ...p });
+    setEditingIsNew(false);
+  };
+  const closeEditor = () => {
+    setEditing(null);
+    setEditingIsNew(false);
+  };
+
+  const saveProvider = (next: Provider) => {
+    setProviders((cur) => {
+      const idx = cur.findIndex((p) => p.id === next.id);
+      if (idx === -1) return [...cur, next];
+      const copy = cur.slice();
+      copy[idx] = next;
+      return copy;
+    });
+    closeEditor();
+  };
+
+  const deleteProvider = (id: string) => {
+    if (!window.confirm("Delete this provider?")) return;
+    setProviders((cur) => cur.filter((p) => p.id !== id));
+  };
+
+  const activateOne = async (target: Provider) => {
+    setActivating(target.id);
+    setFeedback(null);
+    try {
+      await invoke("activate_provider", {
+        provider: target,
+        providersForApp
+      });
+      setFeedback({
+        kind: "ok",
+        message: `Activated ${target.name || "(unnamed)"}.`
+      });
+      await refreshActive();
+    } catch (err) {
+      setFeedback({ kind: "error", message: String(err) });
+    } finally {
+      setActivating(null);
+    }
+  };
+
+  const activateOfficial = async () => {
+    setActivating("__official__");
+    setFeedback(null);
+    try {
+      await invoke("deactivate_provider", {
+        app,
+        providersForApp
+      });
+      setFeedback({ kind: "ok", message: `Restored ${CLI_APP_LABEL[app]} to native login.` });
+      await refreshActive();
+    } catch (err) {
+      setFeedback({ kind: "error", message: String(err) });
+    } finally {
+      setActivating(null);
+    }
+  };
+
+  const testOne = async (target: Provider) => {
+    setTesting(target.id);
+    try {
+      const result = await invoke<TestResult>("test_provider_api", { provider: target });
+      setTestResults((cur) => ({ ...cur, [target.id]: result }));
+    } catch (err) {
+      setTestResults((cur) => ({
+        ...cur,
+        [target.id]: {
+          ok: false,
+          status: null,
+          latencyMs: 0,
+          message: String(err)
+        }
+      }));
+    } finally {
+      setTesting(null);
+    }
+  };
+
+  return (
+    <div className="providersPage">
+      <div className="providersTabs" role="tablist">
+        {CLI_APPS.map((id) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={app === id}
+            className={app === id ? "providersTab active" : "providersTab"}
+            onClick={() => setApp(id)}
+          >
+            <BrandIcon source={CLI_APP_SOURCE_BADGE[id]} />
+            <span>{CLI_APP_LABEL[id]}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="providersBody">
+        {feedback && (
+          <div className={`providersFeedback ${feedback.kind}`}>
+            {feedback.kind === "ok" ? <Check size={14} /> : <AlertTriangle size={14} />}
+            <span>{feedback.message}</span>
+          </div>
+        )}
+
+        {app !== "opencode" && (
+          <section className="providersSection">
+            <header className="providersSectionHeader">
+              <h3>Official</h3>
+              <span className="providersSectionHint">
+                Use {CLI_APP_LABEL[app]}'s native login. Activating clears Termory-injected fields.
+              </span>
+            </header>
+            <ProviderOfficialCard
+              app={app}
+              isActive={activeState?.kind === "official"}
+              activating={activating === "__official__"}
+              onActivate={() => void activateOfficial()}
+            />
+          </section>
+        )}
+
+        <section className="providersSection">
+          <header className="providersSectionHeader">
+            <h3>API platforms</h3>
+            <span className="providersSectionHint">
+              {customProviderHint(app)}
+            </span>
+            <button type="button" className="providersPrimary" onClick={startNew}>
+              + Add provider
+            </button>
+          </header>
+
+          {customProviders.length === 0 && (
+            <EmptyState
+              icon={<Plug size={32} />}
+              title="No custom providers yet"
+              description={`Add a third-party API platform for ${CLI_APP_LABEL[app]} and switch to it with one click.`}
+              action={{ label: "+ Add provider", onClick: startNew }}
+            />
+          )}
+
+          <div className="providersList">
+            {customProviders.map((p) => (
+              <ProviderCard
+                key={p.id}
+                provider={p}
+                isActive={activeState?.matchedProviderId === p.id}
+                activating={activating === p.id}
+                testing={testing === p.id}
+                testResult={testResults[p.id]}
+                onActivate={() => void activateOne(p)}
+                onEdit={() => startEdit(p)}
+                onDelete={() => deleteProvider(p.id)}
+                onTest={() => void testOne(p)}
+              />
+            ))}
+          </div>
+        </section>
+      </div>
+
+      {editing && (
+        <ProviderEditor
+          provider={editing}
+          isNew={editingIsNew}
+          onSave={saveProvider}
+          onClose={closeEditor}
+        />
+      )}
+    </div>
+  );
+}
+
+function ProviderOfficialCard({
+  app,
+  isActive,
+  activating,
+  onActivate
+}: {
+  app: CliApp;
+  isActive: boolean;
+  activating: boolean;
+  onActivate: () => void;
+}) {
+  const subtitle = {
+    claude: "Anthropic OAuth via `claude login`",
+    codex: "ChatGPT login via `codex login`",
+    gemini: "Google OAuth via `gemini auth`",
+    opencode: "Run `/connect` to add an AI provider and start coding"
+  }[app];
+  const authBadge = {
+    claude: "OAuth",
+    codex: "OAuth",
+    gemini: "OAuth",
+    opencode: "API key"
+  }[app];
+  return (
+    <div className={isActive ? "providerCard active" : "providerCard"}>
+      <div className="providerCardHeader">
+        <div className="providerCardTitle">
+          <h3>
+            {CLI_APP_LABEL[app]} <span className="providerCardAuthBadge">({authBadge})</span>
+          </h3>
+          {isActive && <span className="providerActiveBadge">Active</span>}
+        </div>
+        <button
+          type="button"
+          className="providersSecondary"
+          onClick={onActivate}
+          disabled={activating || isActive}
+        >
+          {activating ? "Activating…" : isActive ? "Active" : "Activate"}
+        </button>
+      </div>
+      <p className="providerCardSubtitle">{subtitle}</p>
+    </div>
+  );
+}
+
+function ProviderCard({
+  provider,
+  isActive,
+  activating,
+  testing,
+  testResult,
+  onActivate,
+  onEdit,
+  onDelete,
+  onTest
+}: {
+  provider: Provider;
+  isActive: boolean;
+  activating: boolean;
+  testing: boolean;
+  testResult: TestResult | undefined;
+  onActivate: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+  onTest: () => void;
+}) {
+  return (
+    <div className={isActive ? "providerCard active" : "providerCard"}>
+      <div className="providerCardHeader">
+        <div className="providerCardTitle">
+          <h3>{provider.name || "(unnamed)"}</h3>
+          {isActive && <span className="providerActiveBadge">Active</span>}
+        </div>
+        <div className="providerCardActions">
+          <button
+            type="button"
+            className="providersSecondary"
+            onClick={onActivate}
+            disabled={activating}
+          >
+            {activating ? "Activating…" : isActive ? "Re-apply" : "Activate"}
+          </button>
+          <button type="button" className="providersGhost" onClick={onTest} disabled={testing}>
+            {testing ? "Testing…" : "Test"}
+          </button>
+          <button type="button" className="providersGhost" onClick={onEdit}>
+            Edit
+          </button>
+          <button type="button" className="providersGhost danger" onClick={onDelete}>
+            Delete
+          </button>
+        </div>
+      </div>
+      <dl className="providerCardFields">
+        {provider.baseUrl && (
+          <div>
+            <dt>Base URL</dt>
+            <dd className="mono">{provider.baseUrl}</dd>
+          </div>
+        )}
+        {provider.apiKey && (
+          <div>
+            <dt>API key</dt>
+            <dd className="mono">{maskKey(provider.apiKey)}</dd>
+          </div>
+        )}
+        {provider.model && (
+          <div>
+            <dt>Model</dt>
+            <dd className="mono">{provider.model}</dd>
+          </div>
+        )}
+      </dl>
+      {testResult && (
+        <div className={`providerTestResult ${testResult.ok ? "ok" : "fail"}`}>
+          {testResult.ok ? <Check size={13} /> : <AlertTriangle size={13} />}
+          <span>
+            {testResult.status ? `HTTP ${testResult.status}` : "no response"} ·{" "}
+            {testResult.latencyMs}ms · {testResult.message}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProviderEditor({
+  provider,
+  isNew,
+  onSave,
+  onClose
+}: {
+  provider: Provider;
+  isNew: boolean;
+  onSave: (p: Provider) => void;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = React.useState<Provider>(provider);
+  const [revealKey, setRevealKey] = React.useState(false);
+  const firstFieldRef = React.useRef<HTMLInputElement>(null);
+  const [modelOptions, setModelOptions] = React.useState<string[]>([]);
+  const [fetchingModels, setFetchingModels] = React.useState(false);
+  const [modelError, setModelError] = React.useState<string | null>(null);
+  const modelDatalistId = React.useId();
+
+  React.useEffect(() => {
+    firstFieldRef.current?.focus();
+  }, []);
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const update = <K extends keyof Provider>(key: K, value: Provider[K]) => {
+    setDraft((cur) => ({ ...cur, [key]: value }));
+  };
+
+  // OpenCode requires a model (its defaultModel() throws "no models
+  // found" when our provider block has an empty `models: {}` map).
+  // Claude / Codex / Gemini accept an empty model and fall back to
+  // their own default — the placeholder "默认" makes that explicit.
+  const modelRequired = draft.app === "opencode";
+  const canSave =
+    draft.name.trim().length > 0 &&
+    (draft.baseUrl ?? "").trim().length > 0 &&
+    (!modelRequired || (draft.model ?? "").trim().length > 0);
+
+  const canFetchModels = (draft.baseUrl ?? "").trim().length > 0 && !fetchingModels;
+
+  const fetchModels = async () => {
+    if (!canFetchModels) return;
+    setFetchingModels(true);
+    setModelError(null);
+    try {
+      const result = await invoke<{
+        ok: boolean;
+        models: string[];
+        status: number | null;
+        message: string;
+      }>("fetch_provider_models", { provider: draft });
+      setModelOptions(result.models);
+      if (!result.ok) {
+        setModelError(
+          result.status ? `${result.status} ${result.message}` : result.message
+        );
+      }
+    } catch (err) {
+      setModelError(String(err));
+    } finally {
+      setFetchingModels(false);
+    }
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!canSave) return;
+    // Trim every string field; `undefined` falls through so the
+    // stripEmpty pass in config.ts later prunes them from disk.
+    onSave({
+      ...draft,
+      name: draft.name.trim(),
+      baseUrl: draft.baseUrl?.trim() || undefined,
+      apiKey: draft.apiKey?.trim() || undefined,
+      model: draft.model?.trim() || undefined,
+      claudeSonnetModel: draft.claudeSonnetModel?.trim() || undefined,
+      claudeOpusModel: draft.claudeOpusModel?.trim() || undefined,
+      claudeHaikuModel: draft.claudeHaikuModel?.trim() || undefined
+    });
+  };
+
+  return (
+    <div
+      className="providerEditorBackdrop"
+      role="dialog"
+      aria-modal="true"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <form
+        className="providerEditorCard"
+        onSubmit={handleSubmit}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <header className="providerEditorHeader">
+          <h2>{isNew ? "Add provider" : "Edit provider"}</h2>
+          <span className="providerEditorPlatform">{CLI_APP_LABEL[draft.app]}</span>
+        </header>
+
+        <div className="providerEditorFields">
+          <label className="providerField">
+            <span className="providerFieldLabel">Name *</span>
+            <input
+              ref={firstFieldRef}
+              type="text"
+              className="providerInput"
+              placeholder="Display name for this provider"
+              value={draft.name}
+              onChange={(e) => update("name", e.target.value)}
+              required
+            />
+          </label>
+
+          <label className="providerField">
+            <span className="providerFieldLabel">Base URL *</span>
+            <input
+              type="text"
+              className="providerInput mono"
+              placeholder={baseUrlPlaceholder(draft.app)}
+              value={draft.baseUrl ?? ""}
+              onChange={(e) => update("baseUrl", e.target.value)}
+              required
+            />
+            <span className="providerFieldHelp">{baseUrlHelp(draft.app)}</span>
+          </label>
+
+          <label className="providerField">
+            <span className="providerFieldLabel">API key</span>
+            <div className="providerKeyInput">
+              <input
+                type={revealKey ? "text" : "password"}
+                className="providerInput mono providerKeyInputField"
+                placeholder="sk-..."
+                value={draft.apiKey ?? ""}
+                onChange={(e) => update("apiKey", e.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                className="providerKeyToggle"
+                onClick={() => setRevealKey((c) => !c)}
+                aria-label={revealKey ? "Hide API key" : "Show API key"}
+                title={revealKey ? "Hide API key" : "Show API key"}
+              >
+                {revealKey ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
+            <span className="providerFieldHelp">{apiKeyHelp(draft.app)}</span>
+          </label>
+
+          <label className="providerField">
+            <span className="providerFieldLabel">
+              Model{modelRequired ? " *" : " (optional)"}
+            </span>
+            <div className="providerKeyInput">
+              <input
+                type="text"
+                className="providerInput mono providerKeyInputField"
+                placeholder={
+                  modelRequired
+                    ? "Enter a model id"
+                    : "Leave blank to use the default"
+                }
+                value={draft.model ?? ""}
+                onChange={(e) => update("model", e.target.value)}
+                list={modelOptions.length > 0 ? modelDatalistId : undefined}
+                autoComplete="off"
+              />
+              <button
+                type="button"
+                className="providerKeyToggle"
+                onClick={() => void fetchModels()}
+                disabled={!canFetchModels}
+                aria-label="Fetch available models from API"
+                title="Fetch models from API"
+              >
+                {fetchingModels ? (
+                  <Loader2 size={16} className="spin" />
+                ) : (
+                  <RefreshCw size={16} />
+                )}
+              </button>
+            </div>
+            {modelOptions.length > 0 && (
+              <datalist id={modelDatalistId}>
+                {modelOptions.map((m) => (
+                  <option key={m} value={m} />
+                ))}
+              </datalist>
+            )}
+            {modelError && (
+              <span className="providerFieldHelp providerFieldError">
+                {modelError}
+              </span>
+            )}
+            {!modelError && modelOptions.length > 0 && (
+              <span className="providerFieldHelp">
+                {modelOptions.length} models available — start typing to pick
+              </span>
+            )}
+          </label>
+
+          {draft.app === "claude" && (
+            <details className="providerAdvanced">
+              <summary className="providerAdvancedSummary">
+                Advanced — per-size routing (Sonnet / Opus / Haiku)
+              </summary>
+              <p className="providerFieldHelp providerAdvancedHelp">
+                When Claude Code's <code>/model</code> menu picks a size,
+                it sends the model id below to your provider. Leave blank
+                to fall back to the main model.
+              </p>
+              {(
+                [
+                  ["claudeSonnetModel", "Sonnet route", "e.g. gpt-5"],
+                  ["claudeOpusModel", "Opus route", "e.g. claude-opus-4-7"],
+                  ["claudeHaikuModel", "Haiku route", "e.g. deepseek-chat"]
+                ] as const
+              ).map(([key, label, ph]) => (
+                <label key={key} className="providerField providerAdvancedField">
+                  <span className="providerFieldLabel">{label}</span>
+                  <input
+                    type="text"
+                    className="providerInput mono"
+                    placeholder={ph}
+                    value={(draft[key] as string | undefined) ?? ""}
+                    onChange={(e) => update(key, e.target.value)}
+                  />
+                </label>
+              ))}
+            </details>
+          )}
+
+        </div>
+
+        <footer className="providerEditorFooter">
+          <button type="button" className="providersGhost" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" className="providersPrimary" disabled={!canSave}>
+            {isNew ? "Create" : "Save"}
+          </button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+function customProviderHint(app: CliApp): string {
+  switch (app) {
+    case "claude":
+      return "Writes ~/.claude/settings.json env block (ANTHROPIC_BASE_URL + auth token + model).";
+    case "codex":
+      return "Writes ~/.codex/auth.json (OPENAI_API_KEY) + ~/.codex/config.toml ([model_providers.termory] block).";
+    case "gemini":
+      return "Writes ~/.gemini/.env (GOOGLE_GEMINI_BASE_URL + GEMINI_API_KEY), file mode 0600.";
+    case "opencode":
+      return "Writes ~/.config/opencode/opencode.json (provider.termory.options + qualified model).";
+  }
+}
+
+function baseUrlPlaceholder(app: CliApp): string {
+  switch (app) {
+    case "claude":
+      return "https://api.anthropic.com";
+    case "codex":
+      return "https://api.openai.com/v1";
+    case "gemini":
+      return "https://generativelanguage.googleapis.com";
+    case "opencode":
+      return "https://api.anthropic.com";
+  }
+}
+
+function baseUrlHelp(app: CliApp): string {
+  switch (app) {
+    case "claude":
+      return "Hits ANTHROPIC_BASE_URL. Don't include /v1 — Claude appends it.";
+    case "codex":
+      return "Include /v1 (Codex uses it as model_providers.<id>.base_url verbatim).";
+    case "gemini":
+      return "Triggers Gemini's GATEWAY mode via GOOGLE_GEMINI_BASE_URL env var.";
+    case "opencode":
+      return "Goes to provider.termory.options.baseURL. Use the OpenAI/Anthropic-compatible root URL.";
+  }
+}
+
+function apiKeyHelp(app: CliApp): string {
+  switch (app) {
+    case "claude":
+      return "Stored in ~/.claude/settings.json env block.";
+    case "codex":
+      return "Stored in ~/.codex/auth.json under OPENAI_API_KEY.";
+    case "gemini":
+      return "Stored in ~/.gemini/.env (chmod 600).";
+    case "opencode":
+      return "Stored in opencode.json under provider.termory.options.apiKey.";
+  }
+}
+
+
+
+function useSearchHits(query: string) {
+  const [hits, setHits] = React.useState<SearchHit[]>([]);
+  const [loading, setLoading] = React.useState(false);
+  const [committedQuery, setCommittedQuery] = React.useState("");
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    const trimmed = query.trim();
+    if (trimmed.length < 2) {
+      setHits([]);
+      setCommittedQuery("");
+      setLoading(false);
+      setError(null);
+      return;
+    }
+    let cancelled = false;
+    const handle = window.setTimeout(() => {
+      setLoading(true);
+      invoke<SearchHit[]>("search_all_sessions", { query: trimmed })
+        .then((result) => {
+          if (cancelled) return;
+          setHits(result);
+          setCommittedQuery(trimmed);
+          setError(null);
+        })
+        .catch((err) => {
+          if (!cancelled) setError(String(err));
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+    }, 300);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+  }, [query]);
+
+  return { hits, loading, committedQuery, error };
+}
+
+function SearchPage({
+  sessions,
+  onOpenItem,
+  recentSearches,
+  onCommitSearch,
+  onClearRecent
+}: {
+  sessions: AppSession[];
+  onOpenItem: (item: AppSession) => void;
+  recentSearches: string[];
+  onCommitSearch: (query: string) => void;
+  onClearRecent: () => void;
+}) {
+  const [query, setQuery] = React.useState("");
+  const { hits, loading, committedQuery, error } = useSearchHits(query);
+  const inputRef = React.useRef<HTMLInputElement>(null);
+
+  React.useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  const handleOpen = React.useCallback(
+    (item: AppSession) => {
+      onCommitSearch(committedQuery || query);
+      onOpenItem(item);
+    },
+    [committedQuery, onCommitSearch, onOpenItem, query]
+  );
+
+  const groups = React.useMemo(() => {
+    const sessionHits: SearchHit[] = [];
+    const memoryHits: SearchHit[] = [];
+    const skillHits: SearchHit[] = [];
+    for (const hit of hits) {
+      if (isMemoryItem(hit.session)) memoryHits.push(hit);
+      else if (isSkillItem(hit.session)) skillHits.push(hit);
+      else sessionHits.push(hit);
+    }
+    return { sessions: sessionHits, memories: memoryHits, skills: skillHits };
+  }, [hits]);
+
+  const trimmed = query.trim();
+  const settled = committedQuery === trimmed && trimmed.length >= 2;
+  const noResults = settled && !loading && hits.length === 0;
+
+  return (
+    <div className="searchPage">
+      <div className="searchHeader">
+        <div className="searchInputBox">
+          <Search size={16} />
+          <input
+            ref={inputRef}
+            type="search"
+            className="searchInput"
+            placeholder="Search across sessions, memories, skills…"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            autoFocus
+          />
+          {loading && <Loader2 className="spin searchSpinner" size={14} />}
+        </div>
+        {settled && hits.length > 0 && (
+          <div className="searchSummary">
+            {formatFullNumber(hits.length)} {hits.length === 1 ? "match" : "matches"}
+            <span className="searchSummarySep">·</span>
+            <span>Sessions {groups.sessions.length}</span>
+            <span className="searchSummarySep">·</span>
+            <span>Memories {groups.memories.length}</span>
+            <span className="searchSummarySep">·</span>
+            <span>Skills {groups.skills.length}</span>
+          </div>
+        )}
+      </div>
+      <div className="searchResults">
+        {error && <div className="error">{error}</div>}
+        {trimmed.length < 2 && !loading && (
+          <div className="searchHint">
+            <Search size={28} />
+            <p>Search inside every session, memory, and skill Termory scans.</p>
+            <p className="searchKbdHint">
+              <span>Press</span>
+              <kbd>⌘</kbd>
+              <kbd>K</kbd>
+              <span>to summon search from anywhere.</span>
+            </p>
+            <p className="searchCorpusHint">
+              {formatFullNumber(sessions.length)} records indexed.
+            </p>
+            {recentSearches.length > 0 && (
+              <div className="searchRecent">
+                <div className="searchRecentHeader">
+                  <span>Recent</span>
+                  <button
+                    type="button"
+                    className="searchRecentClear"
+                    onClick={onClearRecent}
+                  >
+                    Clear
+                  </button>
+                </div>
+                <div className="searchRecentChips">
+                  {recentSearches.map((entry) => (
+                    <button
+                      key={entry}
+                      type="button"
+                      className="searchRecentChip"
+                      onClick={() => setQuery(entry)}
+                    >
+                      {entry}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {noResults && (
+          <EmptyState icon={<Search />} title={`No matches for "${trimmed}"`} />
+        )}
+        {groups.sessions.length > 0 && (
+          <SearchGroup
+            title="Sessions"
+            icon={<MessageSquare size={14} />}
+            hits={groups.sessions}
+            query={committedQuery}
+            onOpen={handleOpen}
+          />
+        )}
+        {groups.memories.length > 0 && (
+          <SearchGroup
+            title="Memories"
+            icon={<BookOpen size={14} />}
+            hits={groups.memories}
+            query={committedQuery}
+            onOpen={handleOpen}
+          />
+        )}
+        {groups.skills.length > 0 && (
+          <SearchGroup
+            title="Skills"
+            icon={<Sparkles size={14} />}
+            hits={groups.skills}
+            query={committedQuery}
+            onOpen={handleOpen}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SearchGroup({
+  title,
+  icon,
+  hits,
+  query,
+  onOpen
+}: {
+  title: string;
+  icon: React.ReactNode;
+  hits: SearchHit[];
+  query: string;
+  onOpen: (item: AppSession) => void;
+}) {
+  const limit = 50;
+  const visible = hits.slice(0, limit);
+  const truncated = hits.length - visible.length;
+  return (
+    <section className="searchGroup">
+      <header className="searchGroupHeader">
+        <span className="searchGroupIcon">{icon}</span>
+        <h3>{title}</h3>
+        <b>{hits.length}</b>
+      </header>
+      <div className="searchGroupList">
+        {visible.map((hit) => (
+          <SearchResultCard
+            key={sessionKey(hit.session)}
+            hit={hit}
+            query={query}
+            onOpen={() => onOpen(hit.session)}
+          />
+        ))}
+      </div>
+      {truncated > 0 && (
+        <div className="searchGroupTruncated">+ {formatFullNumber(truncated)} more</div>
+      )}
+    </section>
+  );
+}
+
+function SearchResultCard({
+  hit,
+  query,
+  onOpen
+}: {
+  hit: SearchHit;
+  query: string;
+  onOpen: () => void;
+}) {
+  const session = hit.session;
+  const sessionTypeLabel = !isSessionItem(session);
+  const tools = memoryToolsOf(session);
+  return (
+    <button className="sessionCard searchResultCard" onClick={onOpen}>
+      <div className="sessionHeader">
+        {sessionTypeLabel ? (
+          <span className="memoryBadges">
+            {tools.map((tool) => (
+              <span
+                key={tool}
+                className={`badge ${tool === "Other" ? "memory" : tool.toLowerCase()}`}
+              >
+                {tool === "Other" ? "Memory" : sourceDisplayName(tool)}
+              </span>
+            ))}
+          </span>
+        ) : (
+          <span className={`badge ${session.source.toLowerCase()}`}>{sourceDisplayName(session.source)}</span>
+        )}
+        <span className="date">{formatDate(session.updated_at ?? session.started_at)}</span>
+      </div>
+      <h2>{session.title || "(untitled)"}</h2>
+      <div className="sessionMeta">
+        <span className="sessionMetaProject" title={session.project}>
+          <Folder size={12} />
+          <span>{projectDisplayName(session.project)}</span>
+        </span>
+        {isSessionItem(session) && <span>{session.message_count} messages</span>}
+      </div>
+      <SnippetLine
+        snippet={hit.snippet}
+        query={query}
+        role={hit.role}
+        matchCount={hit.match_count}
+      />
+    </button>
+  );
+}
+
+function CommandPalette({
+  sessions,
+  onOpenItem,
+  recentSearches,
+  onCommitSearch,
+  onClearRecent
+}: {
+  sessions: AppSession[];
+  onOpenItem: (item: AppSession) => void;
+  recentSearches: string[];
+  onCommitSearch: (query: string) => void;
+  onClearRecent: () => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [query, setQuery] = React.useState("");
+  const { hits, loading, committedQuery } = useSearchHits(query);
+  const inputRef = React.useRef<HTMLInputElement>(null);
+  const [activeIndex, setActiveIndex] = React.useState(0);
+
+  const handleOpen = React.useCallback(
+    (item: AppSession) => {
+      onCommitSearch(committedQuery || query);
+      onOpenItem(item);
+      setOpen(false);
+    },
+    [committedQuery, onCommitSearch, onOpenItem, query]
+  );
+
+  // Global ⌘K / Ctrl+K toggle. Esc closes (handled here so it works
+  // even before the input gets focus).
+  React.useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const isToggle = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k";
+      if (isToggle) {
+        event.preventDefault();
+        setOpen((current) => !current);
+      } else if (event.key === "Escape") {
+        setOpen((current) => (current ? false : current));
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  // On open: focus the input and reset state. On close: clear query so
+  // the next open is a fresh slate.
+  React.useEffect(() => {
+    if (open) {
+      inputRef.current?.focus();
+      setActiveIndex(0);
+    } else {
+      setQuery("");
+    }
+  }, [open]);
+
+  React.useEffect(() => {
+    setActiveIndex(0);
+  }, [committedQuery, query]);
+
+  // Cheap metadata-only fallback so the palette feels live before the
+  // backend debounce settles (or when there are 1-char queries the
+  // backend rejects). Capped — palette is a quick-jump surface.
+  const fallbackHits = React.useMemo<SearchHit[]>(() => {
+    const trimmed = query.trim();
+    if (committedQuery === trimmed) return [];
+    if (trimmed.length === 0) return [];
+    const needle = trimmed.toLowerCase();
+    const matches: SearchHit[] = [];
+    for (const session of sessions) {
+      const haystack = `${session.title}\n${session.project}\n${session.source}`.toLowerCase();
+      if (haystack.includes(needle)) {
+        matches.push({ session, snippet: "", role: "", match_count: 0 });
+        if (matches.length >= 16) break;
+      }
+    }
+    return matches;
+  }, [query, committedQuery, sessions]);
+
+  const rows = hits.length > 0 ? hits.slice(0, 8) : fallbackHits.slice(0, 8);
+  const trimmed = query.trim();
+  const settled = committedQuery === trimmed && trimmed.length >= 2;
+
+  const handleKeyDown = (event: React.KeyboardEvent) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setActiveIndex((idx) => Math.min(idx + 1, Math.max(rows.length - 1, 0)));
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveIndex((idx) => Math.max(idx - 1, 0));
+    } else if (event.key === "Enter") {
+      const row = rows[activeIndex];
+      if (row) {
+        event.preventDefault();
+        handleOpen(row.session);
+      }
+    }
+  };
+
+  if (!open) return null;
+
+  return (
+    <div
+      className="paletteBackdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Quick search"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) setOpen(false);
+      }}
+    >
+      <div className="paletteCard" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="paletteInputBox">
+          <Search size={16} />
+          <input
+            ref={inputRef}
+            className="paletteInput"
+            type="search"
+            placeholder="Find sessions, memories, skills…"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={handleKeyDown}
+            autoFocus
+          />
+          {loading && <Loader2 className="spin paletteSpinner" size={14} />}
+          <kbd className="paletteKbd">ESC</kbd>
+        </div>
+        <div className="paletteResults">
+          {trimmed.length === 0 && recentSearches.length === 0 && (
+            <div className="paletteEmpty">Type to search across all records.</div>
+          )}
+          {trimmed.length === 0 && recentSearches.length > 0 && (
+            <div className="paletteRecent">
+              <div className="paletteRecentHeader">
+                <span>Recent searches</span>
+                <button
+                  type="button"
+                  className="paletteRecentClear"
+                  onClick={onClearRecent}
+                >
+                  Clear
+                </button>
+              </div>
+              {recentSearches.map((entry) => (
+                <button
+                  key={entry}
+                  type="button"
+                  className="paletteRecentRow"
+                  onClick={() => setQuery(entry)}
+                >
+                  <Search size={13} />
+                  <span>{entry}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {trimmed.length > 0 && rows.length === 0 && settled && !loading && (
+            <div className="paletteEmpty">No matches.</div>
+          )}
+          {rows.map((row, idx) => (
+            <PaletteRow
+              key={sessionKey(row.session)}
+              hit={row}
+              query={committedQuery}
+              active={idx === activeIndex}
+              onMouseEnter={() => setActiveIndex(idx)}
+              onClick={() => handleOpen(row.session)}
+            />
+          ))}
+        </div>
+        <div className="paletteFooter">
+          <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+          <span><kbd>↵</kbd> open</span>
+          <span><kbd>esc</kbd> close</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PaletteRow({
+  hit,
+  query,
+  active,
+  onMouseEnter,
+  onClick
+}: {
+  hit: SearchHit;
+  query: string;
+  active: boolean;
+  onMouseEnter: () => void;
+  onClick: () => void;
+}) {
+  const session = hit.session;
+  const rowRef = React.useRef<HTMLButtonElement>(null);
+  React.useEffect(() => {
+    if (active) {
+      rowRef.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [active]);
+  const typeLabel = typeLabelOf(session);
+  const showSnippet = hit.snippet.length > 0;
+  return (
+    <button
+      ref={rowRef}
+      className={active ? "paletteRow active" : "paletteRow"}
+      onMouseEnter={onMouseEnter}
+      onClick={onClick}
+    >
+      <span className={`badge ${typeLabel.toLowerCase()} paletteRowType`}>{typeLabel}</span>
+      <span className="paletteRowBody">
+        <span className="paletteRowTitle">{session.title || "(untitled)"}</span>
+        <span className="paletteRowMeta">
+          <span className="paletteRowSource">{sourceDisplayName(session.source)}</span>
+          <span className="paletteRowSep">·</span>
+          <span className="paletteRowProject" title={session.project}>
+            {projectDisplayName(session.project)}
+          </span>
+        </span>
+        {showSnippet && (
+          <span className="paletteRowSnippet">
+            {splitSnippet(hit.snippet, query).map((seg, index) =>
+              seg.match ? <mark key={index}>{seg.text}</mark> : <span key={index}>{seg.text}</span>
+            )}
+          </span>
+        )}
+      </span>
+    </button>
+  );
+}
+
 function RoutePlaceholder({ route }: { route: Route }) {
   const labels: Record<Route, { title: string; detail: string }> = {
     records: { title: "Records", detail: "" },
-    search: {
-      title: "Search",
-      detail: "Global content search across Sessions / Memories / Skills. Lands in a later phase."
-    },
+    search: { title: "Search", detail: "" },
     stats: {
       title: "Stats",
       detail: "Dashboards (sessions / day, tokens per tool, top projects) land here in a later phase."
     },
     config: {
-      title: "CLI Config",
+      title: "Providers",
       detail: "Per-CLI provider profile editor — base URL / API key / model, with quick-switch. Lands in a later phase."
     },
     settings: {
@@ -1023,7 +2562,7 @@ function MemoryCard({
               key={tool}
               className={`badge ${tool === "Other" ? "memory" : tool.toLowerCase()}`}
             >
-              {tool === "Other" ? "Memory" : tool}
+              {tool === "Other" ? "Memory" : sourceDisplayName(tool)}
             </span>
           ))}
         </span>
@@ -1096,11 +2635,28 @@ function splitSnippet(snippet: string, query: string): { text: string; match: bo
   return out;
 }
 
-function EmptyState({ icon, title }: { icon: React.ReactNode; title: string }) {
+function EmptyState({
+  icon,
+  title,
+  description,
+  action
+}: {
+  icon: React.ReactNode;
+  title: string;
+  description?: React.ReactNode;
+  action?: { label: string; onClick: () => void };
+}) {
+  const detailed = description != null || action != null;
   return (
-    <div className="emptyState">
-      {icon}
-      <span>{title}</span>
+    <div className={detailed ? "emptyState emptyStateDetailed" : "emptyState"}>
+      <span className="emptyStateIcon">{icon}</span>
+      <span className="emptyStateTitle">{title}</span>
+      {description && <span className="emptyStateDescription">{description}</span>}
+      {action && (
+        <button type="button" className="emptyStateAction" onClick={action.onClick}>
+          {action.label}
+        </button>
+      )}
     </div>
   );
 }

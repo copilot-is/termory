@@ -38,16 +38,26 @@ Current alignment target: data acquisition and message preview formatting should
 
 - Frontend: `src/main.tsx`
 - Styles: `src/styles.css`
+- Frontend local-store wrapper: `src/config.ts` (routes `getConfig`/`setConfig` to the two backing files via IPC)
 - Tauri IPC commands: `src-tauri/src/lib.rs`
 - Session/Memory/Skill scanning, parsing, and formatting: `src-tauri/src/sessions.rs`
+- Provider switching (activate / deactivate / reverse-derive / test / fetch-models): `src-tauri/src/providers.rs`
+- Local KV store (config.json + providers.json under `~/.termory/`, chmod 0600): `src-tauri/src/config.rs`
 - Tauri config: `src-tauri/tauri.conf.json`
 - Rust parser/formatter tests: inline tests at the bottom of `src-tauri/src/sessions.rs`
+- Rust provider/store tests: inline tests at the bottom of `src-tauri/src/providers.rs` and `src-tauri/src/config.rs`
 
 Current Tauri IPC commands, called from the frontend with `invoke(...)`:
 
 - `scan_all_sessions` — returns Sessions + Memory + Skill entries as `AppSession[]`
 - `load_session` — loads one entry by `{ source, path, id }`
 - `search_all_sessions` — substring search across all loaded session/memory/skill bodies
+- `provider_active_state(app, providers)` / `provider_active_states(providers)` — reverse-derive which Provider is currently active by reading the CLI's live config files; nothing about "active" is stored backend-side
+- `activate_provider(provider, providersForApp)` / `deactivate_provider(app, providersForApp)` — materialize a Provider into the CLI's live config (or clear Termory-injected fields)
+- `test_provider_api(provider)` — connectivity probe to the provider's base URL (returns `{ ok, status, latencyMs, message }`)
+- `fetch_provider_models(provider)` — hits `/v1/models` (or `/v1beta/models?key=` for Gemini) and returns the available model ids for the editor's autocomplete
+- `read_app_config` / `write_app_config` — `~/.termory/config.json` (UI prefs)
+- `read_app_providers` / `write_app_providers` — `~/.termory/providers.json` (provider library, contains API keys, chmod 0600)
 
 ## Project Commands
 
@@ -63,7 +73,7 @@ The Tauri binary is renamed via `[[bin]] name = "Termory"` in `src-tauri/Cargo.t
 
 macOS bundle identifier: `is.chats.termory` (reverse DNS of the `chats.is` domain the project ships under). Do NOT change this after a public release — macOS treats a different identifier as a different app, so existing user data and the Tauri updater would break.
 
-The repo also contains `.audit-sources/` (gitignored) with shallow clones of `openai/codex`, `google-gemini/gemini-cli`, `sst/opencode`, and `videcoding/cli` (legacy Claude Code reference). This is the source-of-truth for path/behavior verification when official docs disagree with implementation — grep here instead of WebFetching docs.
+The repo also contains `.audit-sources/` (gitignored) with shallow clones of `openai/codex`, `google-gemini/gemini-cli`, `sst/opencode`, `videcoding/cli` (legacy Claude Code reference), and `farion1231/cc-switch` (reference for provider-switcher behavior). This is the source-of-truth for path/behavior verification when official docs disagree with implementation — grep here instead of WebFetching docs.
 
 ## Upstream References
 
@@ -452,22 +462,62 @@ npm run build
 
 Parser/formatter tests should cover the relevant official storage shape, title extraction, visible messages, hidden metadata, and command/tool preview formatting. Skill/memory tests should cover the actual scan paths and the per-tool tag string (e.g. `claude,opencode` for `.claude/skills/`).
 
+## Providers (switch CLI to a third-party API platform)
+
+User flow: a Provider is a named snapshot of `{baseUrl, apiKey, model, ...}`. Each CLI has its own list. Activate = materialize into the CLI's live config so the next launch picks it up. Switching back to Official = clear the Termory-injected fields; the CLI's native OAuth/credentials file is **never touched**, so logins survive a round-trip.
+
+**Local storage** — `~/.termory/` (same path on macOS / Linux / Windows), permissions `0700` dir / `0600` files on Unix. Atomic write (tmp + rename):
+
+- `~/.termory/config.json` — UI prefs (`default_pane`, `providers_app`, `recent_searches`). No secrets.
+- `~/.termory/providers.json` — provider library (`Provider[]`). Contains API keys, `0600`.
+
+Termory does **not** store an "active provider" pointer anywhere. `provider_active_state` reverse-derives the active state on every read by parsing the CLI's live config files and matching against the in-memory provider list — this keeps Termory consistent when other tools (`cc-switch`, manual `vim`, the CLI's own OAuth flow) change the same files.
+
+`Provider` schema (in `providers.json`, fields default to omitted when empty):
+
+```
+{ id, app: "claude"|"codex"|"gemini"|"opencode", kind: "custom"|"official",
+  name, baseUrl?, apiKey?, model?,
+  claudeHaikuModel?, claudeSonnetModel?, claudeOpusModel? }
+```
+
+`config.ts` strips `""`/`null`/`undefined` fields before write, so the JSON only contains user-set values. Field naming is unified — `local_store.rs` → renamed to `config.rs` to match frontend `config.ts`.
+
+### Per-CLI materialization (source-of-truth: cite official source AND cc-switch when both verified)
+
+All four were cross-verified against the upstream CLI source (`.audit-sources/{codex,claude-code,gemini-cli,opencode}/`) AND cc-switch's implementation (`.audit-sources/cc-switch/src-tauri/`). Cite `file:line` next to each branch — don't infer from docs.
+
+| CLI | Files written | Key fields | OAuth credential file (untouched) |
+|---|---|---|---|
+| **Claude Code** | `~/.claude/settings.json` (merge) | `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_AUTH_TOKEN`, `env.ANTHROPIC_MODEL`, plus optional sub-routing `env.ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL` for Claude Code's `/model` size picker (see `model.ts:69, 105-138`) | `~/.claude/.credentials.json` (or macOS Keychain — `auth.ts:1323`). Independent file, isolated by design. |
+| **Codex** | `~/.codex/auth.json` (merge) + `~/.codex/config.toml` (merge) | auth.json: `auth_mode = "apikey"`, `OPENAI_API_KEY` (matches `login_with_api_key` shape `manager.rs:529-542`; we **merge** instead of nulling `tokens` so ChatGPT OAuth survives a swap). config.toml: top-level `model_provider`, `model`; `[model_providers.termory]` block with `name`, `base_url`, `wire_api = "responses"`, `requires_openai_auth = true` (gates `AuthManager`'s auth.json load — `tui/src/lib.rs:1817`). **Never set `env_key`** — it forces Codex onto a hard env-var path with no fallback (`model-provider/src/auth.rs:92-103`). | The `tokens` / `last_refresh` / `agent_identity` fields **inside** auth.json. Termory never overwrites them; deactivate only removes `auth_mode` + `OPENAI_API_KEY`. |
+| **Gemini CLI** | `~/.gemini/.env` (dotenv merge, `chmod 0600`) | `GOOGLE_GEMINI_BASE_URL` (triggers GATEWAY mode `contentGenerator.ts:85-87`), `GEMINI_API_KEY`, `GEMINI_MODEL` (`config.ts:836-837`). Other env vars in the file are preserved. | `~/.gemini/oauth_creds.json` + `~/.gemini/google_accounts.json` (`storage.ts:22, 87`). Independent files, isolated. |
+| **OpenCode** | `~/.config/opencode/opencode.json` (merge, additive) | `provider.termory.{npm: "@ai-sdk/openai-compatible", name, options.{baseURL, apiKey}, models[<m>]}` + top-level `model = "termory/<m>"`. **All four sub-fields are required**: `getModel()` throws `ModelNotFoundError` if `models[<m>]` missing (`provider.ts:1668-1675`), and `defaultModel()` falls through to "first provider's first model" — empty `models` map crashes startup (`provider.ts:1801-1806`). Other `provider.X` blocks (e.g. `github-copilot` from `opencode auth login`) are preserved on activate AND deactivate. | `~/.local/share/opencode/auth.json` (`auth/index.ts:9, 78`). Different directory entirely — Termory writes to `~/.config/opencode/...` and never touches `~/.local/share/opencode/...`. |
+
+**Codex "stable provider id" rationale:** Codex stores session history keyed by `model_provider`. If we used a different id per provider, switching would visually "drop" history. We pin all Termory-written Codex provider blocks to id `"termory"` (`TERMORY_PROVIDER_ID` constant) and refuse to overwrite Codex's built-in reserved ids (`openai`/`amazon-bedrock`/`ollama`/`lmstudio` — `CODEX_RESERVED_IDS`).
+
+**Claude sub-model routing (Advanced section):** Claude Code's `/model` menu in 3P mode reads `process.env.ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL` via `getDefaultXxxModel()` (`model.ts:105-138`). Users who route different sizes to different upstream models (e.g. Sonnet → `gpt-5`, Opus → `claude-opus-4-7`) fill the Advanced fields; empty fields strip the corresponding env var.
+
+**Test coverage:** Each CLI has an activate/reverse roundtrip test, an unrelated-fields-preserved test, and an OAuth-credentials-isolated three-stage test (Stage 1 simulates a prior CLI login, Stage 2 activates a Custom provider via Termory, Stage 3 deactivates — credentials file must be byte-identical at the end). See `providers::tests::*` in `src-tauri/src/providers.rs`.
+
 ## Pending feature work
 
-The current UI shell is settled: activity rail (Records / Search / Stats / CLI Config / Settings), routed via URL hash, with a passive bottom freshness footer fed by the Rust filesystem watcher. Records is fully implemented; the other four rail destinations render placeholder cards.
+The current UI shell is settled: activity rail (Records / Search / Stats / Providers / Settings), routed via URL hash, with a passive bottom freshness footer fed by the Rust filesystem watcher. Records and Providers are fully implemented; the other three rail destinations render placeholder cards.
 
 Roadmap below is grouped by priority. Pick top-down within a tier.
 
-### P0 — core capabilities for v1
+### P0 — core capabilities for v1 ✅
 
-- **Search page + Cmd-K palette** — global content search across Sessions / Memories / Skills. Backend `search_all_sessions` IPC exists; frontend needs the page (results grouped by source with snippet highlight) and a Cmd-K overlay reusing the same store. Recent search history persists once P1 store lands.
-- **Message content rendering polish** — `renderMessages` / `shouldInsertTimeSeparator` / `TimeSeparator` helpers are staged in `main.tsx` from an earlier abandoned attempt. The first cut (drop role label, left color stripe, demote tool messages) was rejected as too aggressive — revisit only with a concrete pain point.
-- **Empty states per route** — first-launch / no-data / search-no-results all currently render blank.
+All P0 items have shipped:
+
+- ~~Search page + Cmd-K palette~~ — done. Backend `search_all_sessions` IPC + frontend `SearchPage` (grouped by source with snippet highlight) + global Cmd-K palette reusing the same store + recent-search history persisted via `config.ts`.
+- ~~Empty states per route~~ — done. Distinguishes first-launch (no data) from filtered-empty (with "Clear filters" action) across Sessions / Memories / Skills panes.
+- Message content rendering polish — deferred. `renderMessages` / `TimeSeparator` helpers stay staged. Revisit only with a concrete pain point.
 
 ### P1 — new pages & persistence
 
-- **`tauri-plugin-store`** — single JSON file for all user prefs (theme, default pane, search history, starred sessions). Prereq for the remaining P1 / P3 items that need persistence.
-- **CLI Config page** — CC Switch-style profile editor per platform (base URL, API key, model, env vars). Writes the official CLI config files atomically with a `.bak` sidecar. Per-platform schemas differ — Codex uses TOML at `~/.codex/config.toml`, OpenCode uses YAML, Claude / Gemini have their own shapes.
+- ~~`tauri-plugin-store`~~ — replaced with custom `config.rs` module (`~/.termory/{config,providers}.json` with `chmod 0600`). The plugin couldn't control file location or Unix permissions; rolling our own KV gives both.
+- ~~Providers page~~ — done. See the "Providers" section above. Cross-verified against `.audit-sources/cc-switch/` for the per-CLI write shapes; 4 CLIs supported with per-CLI tests.
 - **Stats page** — dashboards (sessions/day, tokens/tool, top projects, model distribution). Requires extending the four parsers in `sessions.rs` to extract token counts (currently dropped); each platform exposes the field differently.
 - **App Settings page** — theme, scan-path overrides, keyboard shortcuts, watcher toggle.
 
