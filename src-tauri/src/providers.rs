@@ -64,15 +64,6 @@ pub enum CliApp {
 }
 
 impl CliApp {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CliApp::Claude => "claude",
-            CliApp::Codex => "codex",
-            CliApp::Gemini => "gemini",
-            CliApp::Opencode => "opencode",
-        }
-    }
-
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "claude" => Some(CliApp::Claude),
@@ -110,20 +101,84 @@ pub struct Provider {
     pub api_key: String,
     #[serde(default)]
     pub model: String,
-    /// Claude-only: model id used when the user picks "Haiku" from
-    /// Claude Code's `/model` menu (`modelOptions.ts:167` reads
-    /// ANTHROPIC_DEFAULT_HAIKU_MODEL). Empty = inherit `model`.
-    #[serde(default)]
-    pub claude_haiku_model: String,
-    /// Claude-only: model id used when the user picks "Sonnet".
-    /// Backed by ANTHROPIC_DEFAULT_SONNET_MODEL.
-    #[serde(default)]
-    pub claude_sonnet_model: String,
-    /// Claude-only: model id used when the user picks "Opus".
-    /// Backed by ANTHROPIC_DEFAULT_OPUS_MODEL.
-    #[serde(default)]
-    pub claude_opus_model: String,
+    /// Claude-only options nested under `claude` in the JSON so the
+    /// editor can group them visually and Termory doesn't pollute the
+    /// top-level shape for every app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude: Option<ClaudeOptions>,
+    /// OpenCode-only options nested under `opencode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode: Option<OpencodeOptions>,
 }
+
+/// Claude Code's `/model` menu reads three env vars
+/// (ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL — `modelOptions.ts:167`)
+/// to route per-size picks at the upstream provider. Empty fields fall
+/// back to the provider's top-level `model`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeOptions {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub haiku_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sonnet_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub opus_model: String,
+}
+
+/// OpenCode catalog binding. `provider_id` selects which AI SDK npm
+/// package OpenCode loads — the dropdown shows catalog ids
+/// (`anthropic` / `openai` / `openai-compatible` / …) which map to
+/// `@ai-sdk/<id>` npm packages in `opencode_npm_for_catalog`.
+/// Empty/missing → defaults to `openai-compatible`. `models` are
+/// extra model ids surfaced in OpenCode's picker alongside the
+/// provider's primary `model` (top-level Provider field).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OpencodeOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Extra model ids to expose in OpenCode's model picker alongside
+    /// the top-level `model` field (which acts as the primary/default).
+    /// OpenCode supports multiple models per provider — they all get
+    /// written as `models: { <id>: { name: "<id>" } }` entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+}
+
+impl Provider {
+    fn claude_haiku_model(&self) -> &str {
+        self.claude
+            .as_ref()
+            .map(|c| c.haiku_model.as_str())
+            .unwrap_or("")
+    }
+    fn claude_sonnet_model(&self) -> &str {
+        self.claude
+            .as_ref()
+            .map(|c| c.sonnet_model.as_str())
+            .unwrap_or("")
+    }
+    fn claude_opus_model(&self) -> &str {
+        self.claude
+            .as_ref()
+            .map(|c| c.opus_model.as_str())
+            .unwrap_or("")
+    }
+    fn opencode_catalog_id_raw(&self) -> Option<&str> {
+        self.opencode
+            .as_ref()
+            .and_then(|o| o.provider_id.as_deref())
+    }
+    fn opencode_extra_models(&self) -> &[String] {
+        self.opencode
+            .as_ref()
+            .map(|o| o.models.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
+const OPENCODE_DEFAULT_PROVIDER_ID: &str = "openai-compatible";
 
 /// Reverse-derived active state for a single CLI.
 #[derive(Debug, Clone, Serialize)]
@@ -133,7 +188,8 @@ pub struct ActiveState {
     pub kind: ActiveKind,
     /// When kind=Custom, the id of the matched Provider from the
     /// user's list (or None when no Provider matches and the state
-    /// is "Unmanaged").
+    /// is "Unmanaged"). For OpenCode this means "the one set as
+    /// default" (top-level `model` points at it).
     pub matched_provider_id: Option<String>,
     /// Reverse-derived snapshot of what's actually in live config.
     /// Always populated when kind != Official (used for the
@@ -141,6 +197,13 @@ pub struct ActiveState {
     pub live_snapshot: Option<LiveSnapshot>,
     /// Path of the file(s) consulted, for "open in finder" UX.
     pub live_path: String,
+    /// OpenCode-only: ids of Termory providers whose slots are
+    /// currently in opencode.json (i.e. "activated"). Activated and
+    /// default are distinct concepts for OpenCode — multiple slots
+    /// can coexist, only one can be the default. Empty for other CLIs
+    /// (which are single-slot).
+    #[serde(default)]
+    pub configured_provider_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -181,9 +244,13 @@ pub struct ModelListResult {
 // Activation entry point
 // ===================================================================
 
+/// Dispatch activate to the per-CLI write functions. Only Custom
+/// providers reach here — the frontend's Official card has its own
+/// path through `deactivate` directly, so we don't accept Official
+/// kind here.
 pub fn activate(provider: &Provider, providers_for_app: &[Provider]) -> Result<(), Box<dyn Error>> {
     if provider.kind == ProviderKind::Official {
-        return deactivate(provider.app, providers_for_app);
+        return Err("activate() does not accept Official kind — call deactivate() instead.".into());
     }
     match provider.app {
         CliApp::Claude => activate_claude(provider),
@@ -201,6 +268,23 @@ pub fn deactivate(app: CliApp, providers_for_app: &[Provider]) -> Result<(), Box
         CliApp::Codex => deactivate_codex(),
         CliApp::Gemini => deactivate_gemini(),
         CliApp::Opencode => deactivate_opencode(providers_for_app),
+    }
+}
+
+/// Surgical per-provider cleanup, used when deleting a single
+/// provider so we don't accidentally wipe siblings. For
+/// Claude / Codex / Gemini this is a no-op (single-slot CLIs —
+/// the delete flow runs `deactivate` when the provider is in use).
+/// For OpenCode it strips this provider's `termory-<id>` slot from
+/// opencode.json and clears the top-level `model` if it pointed
+/// here; sibling Termory slots stay configured.
+pub fn delete_provider_traces(provider: &Provider) -> Result<(), Box<dyn Error>> {
+    if provider.kind == ProviderKind::Official {
+        return Ok(());
+    }
+    match provider.app {
+        CliApp::Claude | CliApp::Codex | CliApp::Gemini => Ok(()),
+        CliApp::Opencode => delete_opencode_provider_entry(provider),
     }
 }
 
@@ -281,20 +365,16 @@ fn activate_claude(p: &Provider) -> Result<(), Box<dyn Error>> {
     // this size"; we strip the corresponding env var so Claude falls
     // back to its default Anthropic-side resolution.
     for (env_key, val) in [
-        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", &p.claude_haiku_model),
-        ("ANTHROPIC_DEFAULT_SONNET_MODEL", &p.claude_sonnet_model),
-        ("ANTHROPIC_DEFAULT_OPUS_MODEL", &p.claude_opus_model),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", p.claude_haiku_model()),
+        ("ANTHROPIC_DEFAULT_SONNET_MODEL", p.claude_sonnet_model()),
+        ("ANTHROPIC_DEFAULT_OPUS_MODEL", p.claude_opus_model()),
     ] {
         if val.is_empty() {
             env.remove(env_key);
         } else {
-            env.insert(env_key.into(), JsonValue::String(val.clone()));
+            env.insert(env_key.into(), JsonValue::String(val.to_string()));
         }
     }
-    // Strip any leftover top-level `model` field — earlier Termory
-    // versions wrote here, so on upgrade we tidy up so the env-side
-    // value is the single source of truth.
-    root.remove("model");
     write_json_object(&path, &root)
 }
 
@@ -316,9 +396,6 @@ fn deactivate_claude() -> Result<(), Box<dyn Error>> {
             root.remove("env");
         }
     }
-    // Clear top-level `model` too — covers settings.json files written
-    // by earlier Termory versions, before we switched to env.ANTHROPIC_MODEL.
-    root.remove("model");
     write_json_object(&path, &root)
 }
 
@@ -332,6 +409,7 @@ fn read_active_claude(providers: &[Provider]) -> Result<ActiveState, Box<dyn Err
             matched_provider_id: None,
             live_snapshot: None,
             live_path,
+            configured_provider_ids: Vec::new(),
         });
     }
     let root = load_json_object(&path)?;
@@ -371,6 +449,7 @@ fn read_active_claude(providers: &[Provider]) -> Result<ActiveState, Box<dyn Err
             matched_provider_id: None,
             live_snapshot: None,
             live_path,
+            configured_provider_ids: Vec::new(),
         });
     }
 
@@ -398,6 +477,7 @@ fn read_active_claude(providers: &[Provider]) -> Result<ActiveState, Box<dyn Err
         matched_provider_id: matched.map(|p| p.id.clone()),
         live_snapshot: Some(snapshot),
         live_path,
+        configured_provider_ids: Vec::new(),
     })
 }
 
@@ -569,6 +649,10 @@ fn deactivate_codex() -> Result<(), Box<dyn Error>> {
     // Only remove provider blocks Termory could have written
     // (non-reserved id); never touch the user's openai/bedrock/ollama
     // blocks even if they happen to be the current selection.
+    // Scorched-earth: also unconditionally drop the stable
+    // `[model_providers.termory]` block so leftovers from a failed
+    // delete (or a previous Termory version) get swept, not just the
+    // currently-selected one.
     let config_path = codex_config_path()?;
     if !config_path.exists() {
         return Ok(());
@@ -596,6 +680,19 @@ fn deactivate_codex() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    // Always purge the stable Termory provider block, even if
+    // `model_provider` was already pointing elsewhere — that leftover
+    // is exactly the "failed delete" footprint the Restore-default
+    // button is meant to clean.
+    if let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(|i| i.as_table_mut())
+    {
+        providers.remove(TERMORY_PROVIDER_ID);
+        if providers.is_empty() {
+            doc.as_table_mut().remove("model_providers");
+        }
+    }
     write_text_file(&config_path, &doc.to_string())
 }
 
@@ -609,6 +706,7 @@ fn read_active_codex(providers: &[Provider]) -> Result<ActiveState, Box<dyn Erro
             matched_provider_id: None,
             live_snapshot: None,
             live_path,
+            configured_provider_ids: Vec::new(),
         });
     }
     let text = fs::read_to_string(&config_path)?;
@@ -630,6 +728,7 @@ fn read_active_codex(providers: &[Provider]) -> Result<ActiveState, Box<dyn Erro
             matched_provider_id: None,
             live_snapshot: None,
             live_path,
+            configured_provider_ids: Vec::new(),
         });
     };
     if CODEX_RESERVED_IDS
@@ -642,6 +741,7 @@ fn read_active_codex(providers: &[Provider]) -> Result<ActiveState, Box<dyn Erro
             matched_provider_id: None,
             live_snapshot: None,
             live_path,
+            configured_provider_ids: Vec::new(),
         });
     }
 
@@ -677,6 +777,7 @@ fn read_active_codex(providers: &[Provider]) -> Result<ActiveState, Box<dyn Erro
         matched_provider_id: matched.map(|p| p.id.clone()),
         live_snapshot: Some(snapshot),
         live_path,
+        configured_provider_ids: Vec::new(),
     })
 }
 
@@ -756,6 +857,7 @@ fn read_active_gemini(providers: &[Provider]) -> Result<ActiveState, Box<dyn Err
             matched_provider_id: None,
             live_snapshot: None,
             live_path,
+            configured_provider_ids: Vec::new(),
         });
     }
     let map = parse_dotenv(&path)?;
@@ -769,6 +871,7 @@ fn read_active_gemini(providers: &[Provider]) -> Result<ActiveState, Box<dyn Err
             matched_provider_id: None,
             live_snapshot: None,
             live_path,
+            configured_provider_ids: Vec::new(),
         });
     }
     let snapshot = LiveSnapshot {
@@ -792,6 +895,7 @@ fn read_active_gemini(providers: &[Provider]) -> Result<ActiveState, Box<dyn Err
         matched_provider_id: matched.map(|p| p.id.clone()),
         live_snapshot: Some(snapshot),
         live_path,
+        configured_provider_ids: Vec::new(),
     })
 }
 
@@ -799,14 +903,27 @@ fn read_active_gemini(providers: &[Provider]) -> Result<ActiveState, Box<dyn Err
 // OpenCode
 // ===================================================================
 //
-// File: ~/.config/opencode/opencode.json (additive — multiple
-//       provider.X blocks coexist)
-// Custom: writes provider.<provider_id>.options.{baseURL,apiKey} +
-//         top-level model = "<provider_id>/<model>"
-// Official: removes provider.<termory> (or any other Custom we
-//           added) and removes top-level model
-// Reverse: parse top-level model. If it starts with a Custom-id we
-//          recognize, read its options and match.
+// cc-switch mode: Termory writes EVERYTHING into one file —
+// `~/.config/opencode/opencode.json`. `auth.json` is never touched
+// (that file stays reserved for `/connect`).
+//
+// Per Termory provider P with id <pid> (stored in `providers.json`):
+//   * Slot in opencode.json:
+//       provider.termory-<pid>.{
+//         name, npm,
+//         options.{baseURL, apiKey},
+//         models: { <id>: {name: "<id>"}, ... }   // primary + extras
+//       }
+//   * "In use" pointer (top-level): model = "termory-<pid>/<primary>"
+//
+// Two independent states reverse-derived from opencode.json alone:
+//   * Enabled — `provider.termory-<pid>` exists.
+//   * In use — top-level `model` starts with `termory-<pid>/` AND
+//              the slot's apiKey matches the stored provider's key.
+//
+// Activate writes the slot only. Set-as-default writes the top-level
+// model (requires slot to exist). Delete removes the slot and clears
+// top-level model if it pointed at this slot.
 
 fn opencode_config_path() -> Result<PathBuf, Box<dyn Error>> {
     // xdg-basedir uses ~/.config on every platform (verified at
@@ -819,193 +936,327 @@ fn opencode_config_path() -> Result<PathBuf, Box<dyn Error>> {
         .join("opencode.json"))
 }
 
-fn opencode_provider_id_or_default(_p: &Provider) -> String {
-    // Internal stable id under `provider.<id>` in opencode.json.
-    // Not user-configurable — keeps the JSON shape consistent so
-    // deactivate can find and remove it.
-    TERMORY_PROVIDER_ID.to_string()
+fn opencode_catalog_id(p: &Provider) -> String {
+    p.opencode_catalog_id_raw()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(OPENCODE_DEFAULT_PROVIDER_ID)
+        .to_string()
+}
+
+/// Stable, per-Termory-provider id used in OpenCode's auth.json and
+/// opencode.json. Termory writes its providers under this id so they
+/// don't share the catalog id namespace with the user's `/connect`
+/// entries.
+fn opencode_termory_id(p: &Provider) -> String {
+    format!("termory-{}", p.id)
+}
+
+/// Map the user-facing catalog id (anthropic / openai-compatible /
+/// google / …) to the npm package name OpenCode loads for that
+/// provider. This is what goes into opencode.json `provider.<id>.npm`
+/// so OpenCode knows which AI SDK to instantiate.
+fn opencode_npm_for_catalog(catalog_id: &str) -> &'static str {
+    match catalog_id {
+        "anthropic" => "@ai-sdk/anthropic",
+        "openai" => "@ai-sdk/openai",
+        "openai-compatible" => "@ai-sdk/openai-compatible",
+        "google" => "@ai-sdk/google",
+        "azure" => "@ai-sdk/azure",
+        "amazon-bedrock" => "@ai-sdk/amazon-bedrock",
+        "google-vertex" => "@ai-sdk/google-vertex",
+        _ => "@ai-sdk/openai-compatible",
+    }
 }
 
 fn activate_opencode(p: &Provider, _all: &[Provider]) -> Result<(), Box<dyn Error>> {
-    // Model is required for OpenCode: `defaultModel()` falls through
-    // to "first provider's first model" (`provider.ts:1801-1806`) and
-    // throws "no models found" when our provider block has empty
-    // `models: {}`. A half-written block would crash OpenCode at
-    // startup, so refuse the activation up front.
+    // Primary model is required — without an entry in `models` map
+    // OpenCode's picker can't surface this provider. API key is
+    // optional (OpenCode supports env-var references and some
+    // gateways don't require auth) — we just omit options.apiKey
+    // when the user left it blank.
     if p.model.trim().is_empty() {
-        return Err(
-            "OpenCode provider requires a Model. Fill the Model field (e.g. \
-             gpt-5, claude-opus-4-7) before activating."
-                .into(),
-        );
+        return Err("OpenCode provider requires a primary model id.".into());
     }
 
+    let termory_id = opencode_termory_id(p);
+    let catalog = opencode_catalog_id(p);
+    let npm = opencode_npm_for_catalog(&catalog);
+
+    // Everything lives in opencode.json under provider.<termory-id>:
+    //   npm, name, options.{baseURL, apiKey}, models.{<id>: {name}}
+    // Matches cc-switch's pattern (opencode_config.rs:89-104,
+    // provider.rs:695-742). auth.json is untouched — that file is
+    // reserved for `/connect` flows.
     let path = opencode_config_path()?;
     let mut root = load_json_object(&path)?;
-    let provider_id = opencode_provider_id_or_default(p);
-
     let provider_map = ensure_json_object(&mut root, "provider")?;
-    let block = ensure_object_at(provider_map, &provider_id);
-
-    // `npm` selects the AI SDK adapter OpenCode loads at runtime
-    // (`provider.ts:92-100`). Default to `@ai-sdk/openai-compatible`
-    // — works for ~all third-party gateways that speak the OpenAI
-    // wire format (PackyCode / DMXAPI / etc.). Users on a real
-    // Anthropic-native endpoint can post-edit opencode.json.
-    block.insert(
-        "npm".into(),
-        JsonValue::String("@ai-sdk/openai-compatible".into()),
-    );
-    // Display name shown in OpenCode's provider picker.
+    let block = ensure_object_at(provider_map, &termory_id);
+    block.clear();
     if !p.name.is_empty() {
         block.insert("name".into(), JsonValue::String(p.name.clone()));
     }
+    block.insert("npm".into(), JsonValue::String(npm.to_string()));
 
-    let options = ensure_object_at(block, "options");
-    if !p.base_url.is_empty() {
-        options.insert("baseURL".into(), JsonValue::String(p.base_url.clone()));
-    } else {
-        options.remove("baseURL");
+    let mut opts = serde_json::Map::new();
+    if !p.base_url.trim().is_empty() {
+        opts.insert("baseURL".into(), JsonValue::String(p.base_url.clone()));
     }
-    if !p.api_key.is_empty() {
-        options.insert("apiKey".into(), JsonValue::String(p.api_key.clone()));
-    } else {
-        options.remove("apiKey");
+    if !p.api_key.trim().is_empty() {
+        opts.insert("apiKey".into(), JsonValue::String(p.api_key.clone()));
+    }
+    if !opts.is_empty() {
+        block.insert("options".into(), JsonValue::Object(opts));
     }
 
-    // `provider.X.models[Y]` MUST exist or OpenCode's `getModel()`
-    // throws ModelNotFoundError at startup (`provider.ts:1668-1675`).
-    let models = ensure_object_at(block, "models");
-    let mut entry = serde_json::Map::new();
-    entry.insert("name".into(), JsonValue::String(p.model.clone()));
-    models.insert(p.model.clone(), JsonValue::Object(entry));
+    // models map: primary first, then any extras the user added in the
+    // editor. Dedup so the primary isn't repeated. cc-switch writes
+    // each model with `{name: "<id>"}` so OpenCode's picker has a label.
+    let mut models = serde_json::Map::new();
+    let mut seen = std::collections::HashSet::new();
+    for m in std::iter::once(p.model.trim()).chain(
+        p.opencode_extra_models()
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty()),
+    ) {
+        if !seen.insert(m.to_string()) {
+            continue;
+        }
+        let mut entry = serde_json::Map::new();
+        entry.insert("name".into(), JsonValue::String(m.to_string()));
+        models.insert(m.to_string(), JsonValue::Object(entry));
+    }
+    block.insert("models".into(), JsonValue::Object(models));
 
-    // Top-level `model = "<provider>/<model>"` makes this Termory
-    // provider the default — without it, OpenCode falls back to the
-    // recent-models state file (which is empty on first launch).
-    root.insert(
-        "model".into(),
-        JsonValue::String(format!("{}/{}", provider_id, p.model)),
-    );
-
+    // NOTE: Termory does NOT write the top-level `model` field on
+    // activate. Activate only registers this provider's slot.
+    // Setting it as OpenCode's startup default is a separate explicit
+    // action via `set_opencode_default`. Multi-provider coexistence
+    // is intentional — OpenCode picks at runtime via `/model`.
     write_json_object(&path, &root)
 }
 
-fn deactivate_opencode(providers: &[Provider]) -> Result<(), Box<dyn Error>> {
+/// Promote a Termory provider to OpenCode's startup default by writing
+/// `model = "<termory-id>/<primary>"` at the top of opencode.json.
+/// Per `provider.ts:1775-1807` this short-circuits OpenCode's default
+/// model resolution at startup. Requires the provider to be activated
+/// already (slot must exist) — callers should activate first.
+pub fn set_opencode_default(p: &Provider) -> Result<(), Box<dyn Error>> {
+    if p.app != CliApp::Opencode || p.kind != ProviderKind::Custom {
+        return Err("set_opencode_default only applies to OpenCode Custom providers.".into());
+    }
+    if p.model.trim().is_empty() {
+        return Err("Provider needs a primary model id to be set as default.".into());
+    }
+    let termory_id = opencode_termory_id(p);
     let path = opencode_config_path()?;
-    if !path.exists() {
+    let mut root = load_json_object(&path)?;
+    let slot_exists = root
+        .get("provider")
+        .and_then(|v| v.as_object())
+        .map(|m| m.contains_key(&termory_id))
+        .unwrap_or(false);
+    if !slot_exists {
+        return Err("Provider isn't activated yet — activate it first.".into());
+    }
+    root.insert(
+        "model".into(),
+        JsonValue::String(format!("{termory_id}/{}", p.model.trim())),
+    );
+    write_json_object(&path, &root)
+}
+
+/// Remove a single Termory OpenCode provider's slot from opencode.json.
+/// auth.json is not touched (Termory doesn't write there in cc-switch
+/// mode). If the top-level `model` pointed at this provider, clear it
+/// too — that ref is dead now.
+fn delete_opencode_provider_entry(p: &Provider) -> Result<(), Box<dyn Error>> {
+    if p.app != CliApp::Opencode || p.kind != ProviderKind::Custom {
         return Ok(());
     }
-    let mut root = load_json_object(&path)?;
-    // Remove every provider block that any of our Custom OpenCode
-    // providers might have written to. Conservative: collect ids,
-    // remove all of them, plus TERMORY_PROVIDER_ID.
-    let mut ids_to_strip = vec![TERMORY_PROVIDER_ID.to_string()];
-    for p in providers {
-        if p.app == CliApp::Opencode && p.kind == ProviderKind::Custom {
-            ids_to_strip.push(opencode_provider_id_or_default(p));
-        }
+    let termory_id = opencode_termory_id(p);
+
+    let config_path = opencode_config_path()?;
+    if !config_path.exists() {
+        return Ok(());
     }
-    if let Some(JsonValue::Object(map)) = root.get_mut("provider") {
-        for id in &ids_to_strip {
-            map.remove(id);
+    let mut root = load_json_object(&config_path)?;
+    let mut changed = false;
+    if let Some(JsonValue::Object(provider_map)) = root.get_mut("provider") {
+        if provider_map.remove(&termory_id).is_some() {
+            changed = true;
         }
-        if map.is_empty() {
+        if provider_map.is_empty() {
             root.remove("provider");
         }
     }
-    root.remove("model");
-    write_json_object(&path, &root)
+    // Drop top-level `model` only when it refers to this provider —
+    // user's choice of another provider as default stays untouched.
+    let model_ref_prefix = format!("{termory_id}/");
+    let drop_top_model = root
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.starts_with(&model_ref_prefix))
+        .unwrap_or(false);
+    if drop_top_model {
+        root.remove("model");
+        changed = true;
+    }
+    if changed {
+        if root.is_empty() {
+            let _ = fs::remove_file(&config_path);
+        } else {
+            write_json_object(&config_path, &root)?;
+        }
+    }
+    Ok(())
+}
+
+fn deactivate_opencode(providers: &[Provider]) -> Result<(), Box<dyn Error>> {
+    // For OpenCode, "Set Official as default" means *no Termory
+    // provider is the startup default* — but the user's Enabled
+    // Termory slots stay in opencode.json so they remain selectable
+    // via OpenCode's `/model` command. We only clear the top-level
+    // `model` field, and only when it points at one of the user's
+    // Termory providers (don't touch a hand-written choice).
+    let config_path = opencode_config_path()?;
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let mut root = load_json_object(&config_path)?;
+
+    let user_termory_ids: std::collections::HashSet<String> = providers
+        .iter()
+        .filter(|p| p.app == CliApp::Opencode && p.kind == ProviderKind::Custom)
+        .map(opencode_termory_id)
+        .collect();
+    let active_termory_id = root
+        .get("model")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.split_once('/').map(|(pid, _)| pid.to_string()));
+
+    if let Some(id) = active_termory_id {
+        if user_termory_ids.contains(&id) {
+            root.remove("model");
+            if root.is_empty() {
+                let _ = fs::remove_file(&config_path);
+            } else {
+                write_json_object(&config_path, &root)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_active_opencode(providers: &[Provider]) -> Result<ActiveState, Box<dyn Error>> {
-    let path = opencode_config_path()?;
-    let live_path = path.display().to_string();
-    if !path.exists() {
+    let config_path = opencode_config_path()?;
+    let live_path = config_path.display().to_string();
+
+    if !config_path.exists() {
         return Ok(ActiveState {
             app: CliApp::Opencode,
             kind: ActiveKind::Official,
             matched_provider_id: None,
             live_snapshot: None,
             live_path,
+            configured_provider_ids: Vec::new(),
         });
     }
-    let root = load_json_object(&path)?;
-    let model = root
+    let config_root = load_json_object(&config_path)?;
+
+    // Build the list of Termory provider ids whose slots exist in
+    // opencode.json. "Activated" = slot exists; "default" = top-level
+    // `model` points at it. They're independent for OpenCode.
+    let provider_map = config_root
+        .get("provider")
+        .and_then(|v| v.as_object());
+    let configured_provider_ids: Vec<String> = providers
+        .iter()
+        .filter(|p| p.app == CliApp::Opencode && p.kind == ProviderKind::Custom)
+        .filter(|p| {
+            provider_map
+                .map(|m| m.contains_key(&opencode_termory_id(p)))
+                .unwrap_or(false)
+        })
+        .map(|p| p.id.clone())
+        .collect();
+
+    // The top-level `model` field decides which provider is the
+    // OpenCode-startup default. Parse it as `<providerId>/<modelId>`
+    // and match the providerId against our Termory providers.
+    let top_model_ref = config_root
         .get("model")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let Some(model_str) = model.clone() else {
-        return Ok(ActiveState {
-            app: CliApp::Opencode,
-            kind: ActiveKind::Official,
-            matched_provider_id: None,
-            live_snapshot: None,
-            live_path,
-        });
-    };
-    let (active_id, bare_model) = match model_str.split_once('/') {
-        Some((id, rest)) => (id.to_string(), rest.to_string()),
-        None => {
-            // No prefix → OpenCode picks default → Official.
+    let active_termory_id = top_model_ref
+        .as_deref()
+        .and_then(|s| s.split_once('/').map(|(pid, _)| pid.to_string()));
+
+    if let Some(active_id) = active_termory_id {
+        for p in providers {
+            if p.app != CliApp::Opencode || p.kind != ProviderKind::Custom {
+                continue;
+            }
+            if opencode_termory_id(p) != active_id {
+                continue;
+            }
+            // Sanity check the api key in the live block matches what
+            // Termory stored — guards against a stale top-level model
+            // pointing at a slot the user edited. Treat missing
+            // options.apiKey and an empty stored key as equivalent
+            // (both mean "no key configured here").
+            let block = config_root
+                .get("provider")
+                .and_then(|v| v.as_object())
+                .and_then(|m| m.get(&active_id))
+                .and_then(|v| v.as_object());
+            let live_key = block
+                .and_then(|b| b.get("options"))
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("apiKey"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if live_key != p.api_key.trim() {
+                continue;
+            }
+            let live_base = block
+                .and_then(|b| b.get("options"))
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("baseURL"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             return Ok(ActiveState {
                 app: CliApp::Opencode,
-                kind: ActiveKind::Official,
-                matched_provider_id: None,
-                live_snapshot: None,
+                kind: ActiveKind::Custom,
+                matched_provider_id: Some(p.id.clone()),
+                live_snapshot: Some(LiveSnapshot {
+                    base_url: live_base,
+                    api_key_masked: if live_key.is_empty() {
+                        None
+                    } else {
+                        Some(mask_secret(live_key))
+                    },
+                    model: top_model_ref,
+                }),
                 live_path,
+                configured_provider_ids,
             });
         }
-    };
-    let block = root
-        .get("provider")
-        .and_then(|v| v.as_object())
-        .and_then(|m| m.get(active_id.as_str()))
-        .and_then(|v| v.as_object());
-    let options = block
-        .and_then(|b| b.get("options"))
-        .and_then(|v| v.as_object());
-    let base_url = options
-        .and_then(|o| o.get("baseURL"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let api_key = options
-        .and_then(|o| o.get("apiKey"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    if base_url.is_none() && api_key.is_none() {
-        // The model has a prefix but the provider block has no
-        // Termory-injected baseURL/apiKey → it's a built-in models.dev
-        // provider, treat as Official.
-        return Ok(ActiveState {
-            app: CliApp::Opencode,
-            kind: ActiveKind::Official,
-            matched_provider_id: None,
-            live_snapshot: None,
-            live_path,
-        });
     }
-    let snapshot = LiveSnapshot {
-        base_url: base_url.clone(),
-        api_key_masked: api_key.as_deref().map(mask_secret),
-        model: Some(bare_model.clone()),
-    };
-    let matched = providers.iter().find(|p| {
-        p.app == CliApp::Opencode
-            && p.kind == ProviderKind::Custom
-            && string_match(&p.base_url, base_url.as_deref())
-            && string_match(&p.api_key, api_key.as_deref())
-    });
+
+    // Top-level `model` either missing or pointing somewhere we don't
+    // own → Official, even if some Termory providers are still
+    // activated (their slots stay in opencode.json, exposed via
+    // `configured_provider_ids` for the UI).
     Ok(ActiveState {
         app: CliApp::Opencode,
-        kind: if matched.is_some() {
-            ActiveKind::Custom
-        } else {
-            ActiveKind::Unmanaged
-        },
-        matched_provider_id: matched.map(|p| p.id.clone()),
-        live_snapshot: Some(snapshot),
+        kind: ActiveKind::Official,
+        matched_provider_id: None,
+        live_snapshot: None,
         live_path,
+        configured_provider_ids,
     })
 }
 
@@ -1438,9 +1689,8 @@ mod tests {
             base_url: base.into(),
             api_key: key.into(),
             model: "test-model".into(),
-            claude_haiku_model: String::new(),
-            claude_sonnet_model: String::new(),
-            claude_opus_model: String::new(),
+            claude: None,
+            opencode: None,
         }
     }
 
@@ -1641,9 +1891,11 @@ mod tests {
             "sk-multi",
         );
         p.model = "gpt-5".into();
-        p.claude_sonnet_model = "gpt-5".into();
-        p.claude_opus_model = "claude-opus-4-7".into();
-        p.claude_haiku_model = "deepseek-chat".into();
+        p.claude = Some(ClaudeOptions {
+            sonnet_model: "gpt-5".into(),
+            opus_model: "claude-opus-4-7".into(),
+            haiku_model: "deepseek-chat".into(),
+        });
         activate(&p, &[p.clone()]).unwrap();
 
         let after: JsonValue =
@@ -2133,125 +2385,213 @@ base_url = "https://x.io/v1"
     }
 
     #[test]
-    fn opencode_activate_writes_full_provider_block_for_runtime_resolution() {
-        // OpenCode's `getModel()` (`provider.ts:1668-1675`) throws
-        // ModelNotFoundError if `provider.X.models[Y]` isn't registered,
-        // and the SDK adapter selector falls through to
-        // `@ai-sdk/openai-compatible` only when neither model.provider.npm
-        // nor provider.npm is set (`provider.ts:1273-1278`). We write
-        // both to keep OpenCode from crashing or silently falling back.
+    fn opencode_activate_writes_full_provider_block_in_opencode_json() {
+        // cc-switch mode: everything Termory writes lives in
+        // ~/.config/opencode/opencode.json. auth.json is never touched.
         let _g = HOME_LOCK.lock().unwrap();
-        let tmp = tempdir("opencode-rt");
+        let tmp = tempdir("opencode-cc-mode");
         let _home = HomeOverride::new(&tmp);
-        let p = make_provider(
+
+        let mut p = make_provider(
             CliApp::Opencode,
-            "oc-custom",
-            "https://oc.example/v1",
-            "oc-sk",
+            "packycode",
+            "https://api.packy.example",
+            "sk-packy",
         );
+        p.model = "claude-opus-4-7".into();
+        p.opencode = Some(OpencodeOptions {
+            provider_id: Some("anthropic".into()),
+            models: vec!["claude-sonnet-4-5".into(), "claude-haiku-4-5".into()],
+        });
         activate(&p, &[p.clone()]).unwrap();
-        let after: JsonValue = serde_json::from_str(
+
+        // auth.json must NOT be created — that file is reserved for /connect.
+        assert!(
+            !tmp.join(".local/share/opencode/auth.json").exists(),
+            "auth.json must not be created in cc-switch mode"
+        );
+
+        let termory_id = format!("termory-{}", p.id);
+        let config_path = tmp.join(".config/opencode/opencode.json");
+        let config: JsonValue =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let block_ptr = format!("/provider/{termory_id}");
+        assert_eq!(
+            config
+                .pointer(&format!("{block_ptr}/name"))
+                .and_then(|v| v.as_str()),
+            Some("packycode")
+        );
+        assert_eq!(
+            config
+                .pointer(&format!("{block_ptr}/npm"))
+                .and_then(|v| v.as_str()),
+            Some("@ai-sdk/anthropic")
+        );
+        assert_eq!(
+            config
+                .pointer(&format!("{block_ptr}/options/baseURL"))
+                .and_then(|v| v.as_str()),
+            Some("https://api.packy.example")
+        );
+        assert_eq!(
+            config
+                .pointer(&format!("{block_ptr}/options/apiKey"))
+                .and_then(|v| v.as_str()),
+            Some("sk-packy")
+        );
+        // models contains primary + extras, each as {name: "<id>"}.
+        for m in ["claude-opus-4-7", "claude-sonnet-4-5", "claude-haiku-4-5"] {
+            assert_eq!(
+                config
+                    .pointer(&format!("{block_ptr}/models/{m}/name"))
+                    .and_then(|v| v.as_str()),
+                Some(m)
+            );
+        }
+        // Activate alone does NOT set as default — top-level `model`
+        // is untouched.
+        assert!(config.get("model").is_none());
+
+        // Activated provider shows up in configured_provider_ids but
+        // kind stays Official until set_opencode_default is called.
+        let state = read_active_state(CliApp::Opencode, &[p.clone()]).unwrap();
+        assert_eq!(state.kind, ActiveKind::Official);
+        assert_eq!(state.configured_provider_ids, vec![p.id.clone()]);
+
+        // After explicit set_default, kind flips to Custom.
+        set_opencode_default(&p).unwrap();
+        let state2 = read_active_state(CliApp::Opencode, &[p.clone()]).unwrap();
+        assert_eq!(state2.kind, ActiveKind::Custom);
+        assert_eq!(state2.matched_provider_id.as_deref(), Some(p.id.as_str()));
+        let config2: JsonValue = serde_json::from_str(
             &fs::read_to_string(tmp.join(".config/opencode/opencode.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(
-            after.get("model").and_then(|v| v.as_str()),
-            Some("termory/test-model")
+            config2.get("model").and_then(|v| v.as_str()),
+            Some(format!("{termory_id}/claude-opus-4-7").as_str())
         );
-        assert_eq!(
-            after
-                .pointer("/provider/termory/options/baseURL")
-                .and_then(|v| v.as_str()),
-            Some("https://oc.example/v1")
-        );
-        assert_eq!(
-            after
-                .pointer("/provider/termory/options/apiKey")
-                .and_then(|v| v.as_str()),
-            Some("oc-sk")
-        );
-        // SDK adapter — must be set so OpenCode knows how to call it.
-        assert_eq!(
-            after
-                .pointer("/provider/termory/npm")
-                .and_then(|v| v.as_str()),
-            Some("@ai-sdk/openai-compatible")
-        );
-        // Display name carried from Provider.name.
-        assert_eq!(
-            after
-                .pointer("/provider/termory/name")
-                .and_then(|v| v.as_str()),
-            Some("oc-custom")
-        );
-        // Model registry entry — required to clear getModel's existence check.
-        assert!(
-            after
-                .pointer("/provider/termory/models/test-model")
-                .is_some(),
-            "models[test-model] must be registered or OpenCode throws ModelNotFoundError"
-        );
-
-        let state = read_active_state(CliApp::Opencode, &[p.clone()]).unwrap();
-        assert_eq!(state.kind, ActiveKind::Custom);
-        assert_eq!(state.matched_provider_id.as_deref(), Some("test-oc-custom"));
-
-        deactivate(CliApp::Opencode, &[p.clone()]).unwrap();
-        let state2 = read_active_state(CliApp::Opencode, &[p.clone()]).unwrap();
-        assert_eq!(state2.kind, ActiveKind::Official);
     }
 
     #[test]
-    fn opencode_activate_does_not_touch_auth_json() {
-        // Users log in to OpenCode providers via `opencode auth login`,
-        // which stores credentials in `~/.local/share/opencode/auth.json`
-        // (`auth/index.ts:9, 78`). Termory writes to a different file
-        // (`~/.config/opencode/opencode.json`), so existing auth.json
-        // logins must survive activate/deactivate untouched.
+    fn opencode_activate_dedupes_primary_in_extra_models() {
         let _g = HOME_LOCK.lock().unwrap();
-        let tmp = tempdir("opencode-auth-isolated");
+        let tmp = tempdir("opencode-dedup");
         let _home = HomeOverride::new(&tmp);
-        // Simulate a prior `opencode auth login anthropic`.
-        fs::create_dir_all(tmp.join(".local/share/opencode")).unwrap();
-        let auth_contents = r#"{
-          "anthropic": {
-            "type": "oauth",
-            "refresh": "rt-anthropic",
-            "access": "at-anthropic",
-            "expires": 9999999999000
-          }
-        }"#;
-        fs::write(tmp.join(".local/share/opencode/auth.json"), auth_contents).unwrap();
 
-        let p = make_provider(
-            CliApp::Opencode,
-            "third-party",
-            "https://oc.example/v1",
-            "oc-sk",
-        );
+        let mut p = make_provider(CliApp::Opencode, "dedup", "", "sk-dedup");
+        p.model = "gpt-5".into();
+        p.opencode = Some(OpencodeOptions {
+            provider_id: None,
+            // Primary repeated + an actual extra
+            models: vec!["gpt-5".into(), "gpt-5-mini".into()],
+        });
         activate(&p, &[p.clone()]).unwrap();
-        assert_eq!(
-            fs::read_to_string(tmp.join(".local/share/opencode/auth.json")).unwrap(),
-            auth_contents,
-            "auth.json must survive activate byte-for-byte"
-        );
 
-        deactivate(CliApp::Opencode, &[p.clone()]).unwrap();
+        let termory_id = format!("termory-{}", p.id);
+        let config: JsonValue = serde_json::from_str(
+            &fs::read_to_string(tmp.join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
+        let models = config
+            .pointer(&format!("/provider/{termory_id}/models"))
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models.contains_key("gpt-5"));
+        assert!(models.contains_key("gpt-5-mini"));
+    }
+
+    #[test]
+    fn opencode_set_default_picks_one_among_multi_activated() {
+        // A and B both activated → both slots in opencode.json,
+        // but only the one passed to set_opencode_default ends up as
+        // the top-level model. Switching default just overwrites the
+        // top-level field, slots stay put.
+        let _g = HOME_LOCK.lock().unwrap();
+        let tmp = tempdir("opencode-set-default");
+        let _home = HomeOverride::new(&tmp);
+
+        let mut a = make_provider(CliApp::Opencode, "a", "", "sk-a");
+        a.id = "aaa".into();
+        a.model = "model-a".into();
+        let mut b = make_provider(CliApp::Opencode, "b", "", "sk-b");
+        b.id = "bbb".into();
+        b.model = "model-b".into();
+
+        activate(&a, &[a.clone(), b.clone()]).unwrap();
+        activate(&b, &[a.clone(), b.clone()]).unwrap();
+
+        // No top-level model yet — neither was set as default.
+        let config0: JsonValue = serde_json::from_str(
+            &fs::read_to_string(tmp.join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(config0.pointer("/provider/termory-aaa").is_some());
+        assert!(config0.pointer("/provider/termory-bbb").is_some());
+        assert!(config0.get("model").is_none());
+
+        let state0 = read_active_state(CliApp::Opencode, &[a.clone(), b.clone()]).unwrap();
+        assert_eq!(state0.kind, ActiveKind::Official);
+        let mut configured = state0.configured_provider_ids.clone();
+        configured.sort();
+        assert_eq!(configured, vec!["aaa".to_string(), "bbb".to_string()]);
+
+        // Set A as default.
+        set_opencode_default(&a).unwrap();
+        let state1 = read_active_state(CliApp::Opencode, &[a.clone(), b.clone()]).unwrap();
+        assert_eq!(state1.kind, ActiveKind::Custom);
+        assert_eq!(state1.matched_provider_id.as_deref(), Some("aaa"));
+
+        // Switch default to B — A's slot stays.
+        set_opencode_default(&b).unwrap();
+        let config2: JsonValue = serde_json::from_str(
+            &fs::read_to_string(tmp.join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(config2.pointer("/provider/termory-aaa").is_some());
         assert_eq!(
-            fs::read_to_string(tmp.join(".local/share/opencode/auth.json")).unwrap(),
-            auth_contents,
-            "auth.json must survive deactivate byte-for-byte"
+            config2.get("model").and_then(|v| v.as_str()),
+            Some("termory-bbb/model-b")
+        );
+        let state2 = read_active_state(CliApp::Opencode, &[a.clone(), b.clone()]).unwrap();
+        assert_eq!(state2.matched_provider_id.as_deref(), Some("bbb"));
+    }
+
+    #[test]
+    fn opencode_set_default_rejects_inactive_provider() {
+        let _g = HOME_LOCK.lock().unwrap();
+        let tmp = tempdir("opencode-default-rejects");
+        let _home = HomeOverride::new(&tmp);
+        let p = make_provider(CliApp::Opencode, "p", "", "sk-p");
+        // Never activated.
+        let result = set_opencode_default(&p);
+        assert!(result.is_err());
+        assert!(!tmp.join(".config/opencode/opencode.json").exists());
+    }
+
+    #[test]
+    fn opencode_activate_rejects_empty_model() {
+        let _g = HOME_LOCK.lock().unwrap();
+        let tmp = tempdir("opencode-no-model");
+        let _home = HomeOverride::new(&tmp);
+        let mut p = make_provider(CliApp::Opencode, "no-model", "https://x.io", "sk-x");
+        p.model = String::new();
+        let result = activate(&p, &[p.clone()]);
+        assert!(result.is_err());
+        assert!(
+            !tmp.join(".config/opencode/opencode.json").exists(),
+            "no partial opencode.json on model-missing failure"
         );
     }
 
     #[test]
-    fn opencode_activate_preserves_user_provider_blocks_for_other_ids() {
-        // OpenCode is additive: users may have multiple `provider.X`
-        // blocks (e.g. one for github-copilot via `auth login`).
-        // Termory only writes/clears `provider.termory` — unrelated
-        // blocks must survive the whole cycle.
+    fn opencode_activate_preserves_unrelated_provider_blocks() {
+        // Pre-existing user `provider.<...>` blocks (manually edited or
+        // from /connect baseURL overlays) must survive Termory's activate.
         let _g = HOME_LOCK.lock().unwrap();
-        let tmp = tempdir("opencode-additive");
+        let tmp = tempdir("opencode-preserve");
         let _home = HomeOverride::new(&tmp);
         fs::create_dir_all(tmp.join(".config/opencode")).unwrap();
         fs::write(
@@ -2259,84 +2599,219 @@ base_url = "https://x.io/v1"
             r#"{
               "$schema": "https://opencode.ai/config.json",
               "provider": {
-                "github-copilot": {
-                  "options": { "enterpriseUrl": "https://ghe.example/" }
-                }
+                "anthropic": { "options": { "baseURL": "https://user.example.com" } }
               }
             }"#,
         )
         .unwrap();
+        fs::create_dir_all(tmp.join(".local/share/opencode")).unwrap();
+        let prior_auth = r#"{"github-copilot":{"type":"oauth","refresh":"rt"}}"#;
+        fs::write(tmp.join(".local/share/opencode/auth.json"), prior_auth).unwrap();
 
-        let p = make_provider(
-            CliApp::Opencode,
-            "oc-custom",
-            "https://oc.example/v1",
-            "oc-sk",
-        );
+        let mut p = make_provider(CliApp::Opencode, "termory-one", "", "sk-termory");
+        p.model = "claude-opus-4-7".into();
+        p.opencode = Some(OpencodeOptions {
+            provider_id: Some("anthropic".into()),
+            models: vec![],
+        });
         activate(&p, &[p.clone()]).unwrap();
-        let after: JsonValue = serde_json::from_str(
-            &fs::read_to_string(tmp.join(".config/opencode/opencode.json")).unwrap(),
-        )
-        .unwrap();
-        // Our new block is there.
-        assert!(after.pointer("/provider/termory/npm").is_some());
-        // User's github-copilot block survived.
-        assert_eq!(
-            after
-                .pointer("/provider/github-copilot/options/enterpriseUrl")
-                .and_then(|v| v.as_str()),
-            Some("https://ghe.example/")
-        );
-        // $schema preserved.
-        assert!(after.get("$schema").is_some());
 
-        deactivate(CliApp::Opencode, &[p.clone()]).unwrap();
-        let after2: JsonValue = serde_json::from_str(
+        let config: JsonValue = serde_json::from_str(
             &fs::read_to_string(tmp.join(".config/opencode/opencode.json")).unwrap(),
         )
         .unwrap();
-        // termory gone, github-copilot survived.
-        assert!(after2.pointer("/provider/termory").is_none());
+        let termory_id = format!("termory-{}", p.id);
+        assert!(config.pointer(&format!("/provider/{termory_id}")).is_some());
+        // User's manual anthropic block untouched.
         assert_eq!(
-            after2
-                .pointer("/provider/github-copilot/options/enterpriseUrl")
+            config
+                .pointer("/provider/anthropic/options/baseURL")
                 .and_then(|v| v.as_str()),
-            Some("https://ghe.example/")
+            Some("https://user.example.com")
         );
-        assert!(after2.get("$schema").is_some());
+        assert_eq!(
+            config.get("$schema").and_then(|v| v.as_str()),
+            Some("https://opencode.ai/config.json")
+        );
+        // auth.json must be byte-identical — Termory never touches it.
+        assert_eq!(
+            fs::read_to_string(tmp.join(".local/share/opencode/auth.json")).unwrap(),
+            prior_auth
+        );
     }
 
     #[test]
-    fn opencode_activate_rejects_empty_model() {
-        // Saving an OpenCode provider with no model would write
-        // `provider.X.models = {}` plus no top-level `model` field —
-        // OpenCode's defaultModel() then throws "no models found" at
-        // startup. Refuse the activation explicitly so the user
-        // doesn't end up with a config that crashes OpenCode.
+    fn opencode_deactivate_clears_only_top_model_keeps_slots() {
+        // For OpenCode, "Set Official as default" clears the top-level
+        // `model` (so no Termory provider is the startup default) but
+        // keeps the Enabled slots so they remain selectable via
+        // OpenCode's `/model` command.
         let _g = HOME_LOCK.lock().unwrap();
-        let tmp = tempdir("opencode-no-model");
+        let tmp = tempdir("opencode-deactivate");
         let _home = HomeOverride::new(&tmp);
 
         let mut p = make_provider(
             CliApp::Opencode,
-            "no-model",
-            "https://oc.example/v1",
-            "oc-sk",
+            "termory-one",
+            "https://gateway.example.com",
+            "sk-termory",
         );
-        p.model = String::new();
-        let result = activate(&p, &[p.clone()]);
-        assert!(result.is_err(), "empty model must be rejected");
-        let msg = result.unwrap_err().to_string();
+        p.model = "model-a".into();
+        p.opencode = Some(OpencodeOptions {
+            provider_id: Some("anthropic".into()),
+            models: vec![],
+        });
+        activate(&p, &[p.clone()]).unwrap();
+        set_opencode_default(&p).unwrap();
+
+        // Inject unrelated $schema.
+        let config_path = tmp.join(".config/opencode/opencode.json");
+        let mut config_root: serde_json::Map<String, JsonValue> =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        config_root.insert(
+            "$schema".into(),
+            JsonValue::String("https://opencode.ai/config.json".into()),
+        );
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&JsonValue::Object(config_root)).unwrap(),
+        )
+        .unwrap();
+
+        deactivate(CliApp::Opencode, &[p.clone()]).unwrap();
+
+        let termory_id = format!("termory-{}", p.id);
+        let config_after: JsonValue =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert!(
-            msg.to_lowercase().contains("model"),
-            "error message must mention model: {msg}"
+            config_after
+                .pointer(&format!("/provider/{termory_id}"))
+                .is_some(),
+            "termory provider slot must SURVIVE deactivate (still Enabled)"
         );
-        // opencode.json must NOT have been touched (we error out before
-        // writing).
         assert!(
-            !tmp.join(".config/opencode/opencode.json").exists(),
-            "no partial config should be written on rejection"
+            config_after.get("model").is_none(),
+            "top-level model pointing at us is cleared"
         );
+        assert_eq!(
+            config_after.get("$schema").and_then(|v| v.as_str()),
+            Some("https://opencode.ai/config.json"),
+            "unrelated $schema field survived"
+        );
+
+        // kind=Official because top-level model is gone, but the
+        // provider remains in `configured_provider_ids`.
+        let state = read_active_state(CliApp::Opencode, &[p.clone()]).unwrap();
+        assert_eq!(state.kind, ActiveKind::Official);
+        assert_eq!(state.configured_provider_ids, vec![p.id.clone()]);
+    }
+
+    #[test]
+    fn opencode_deactivate_preserves_user_set_top_model() {
+        // If the user manually pointed top-level `model` at a
+        // non-Termory provider, our deactivate must NOT clear it.
+        let _g = HOME_LOCK.lock().unwrap();
+        let tmp = tempdir("opencode-deactivate-user-model");
+        let _home = HomeOverride::new(&tmp);
+
+        let mut p = make_provider(CliApp::Opencode, "t", "", "sk-t");
+        p.model = "m".into();
+        p.opencode = Some(OpencodeOptions {
+            provider_id: None,
+            models: vec![],
+        });
+        activate(&p, &[p.clone()]).unwrap();
+
+        // User points top-level model at a non-Termory provider.
+        let config_path = tmp.join(".config/opencode/opencode.json");
+        let mut config_root: serde_json::Map<String, JsonValue> =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        config_root.insert(
+            "model".into(),
+            JsonValue::String("anthropic/claude-opus-4-7".into()),
+        );
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&JsonValue::Object(config_root)).unwrap(),
+        )
+        .unwrap();
+
+        deactivate(CliApp::Opencode, &[p.clone()]).unwrap();
+        let config_after: JsonValue =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            config_after.get("model").and_then(|v| v.as_str()),
+            Some("anthropic/claude-opus-4-7"),
+            "non-termory user choice for default must survive"
+        );
+    }
+
+    #[test]
+    fn opencode_delete_only_clears_top_model_when_it_points_at_self() {
+        // Deleting an inactive provider must NOT touch top-level model
+        // (which points at a different Termory provider).
+        let _g = HOME_LOCK.lock().unwrap();
+        let tmp = tempdir("opencode-delete-inactive");
+        let _home = HomeOverride::new(&tmp);
+
+        let mut a = make_provider(CliApp::Opencode, "a", "", "sk-a");
+        a.id = "aaa".into();
+        a.model = "model-a".into();
+        let mut b = make_provider(CliApp::Opencode, "b", "", "sk-b");
+        b.id = "bbb".into();
+        b.model = "model-b".into();
+        activate(&a, &[a.clone(), b.clone()]).unwrap();
+        activate(&b, &[a.clone(), b.clone()]).unwrap();
+        // Promote B as the default.
+        set_opencode_default(&b).unwrap();
+
+        // Delete A (not the default) — top-level model must still point at B.
+        delete_provider_traces(&a).unwrap();
+        let config: JsonValue = serde_json::from_str(
+            &fs::read_to_string(tmp.join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(config.pointer("/provider/termory-aaa").is_none());
+        assert!(config.pointer("/provider/termory-bbb").is_some());
+        assert_eq!(
+            config.get("model").and_then(|v| v.as_str()),
+            Some("termory-bbb/model-b")
+        );
+    }
+
+    #[test]
+    fn opencode_activate_allows_empty_api_key() {
+        // OpenCode's options.apiKey is optional in the schema. Termory
+        // should write the slot without options.apiKey when the user
+        // left it blank (some gateways don't need auth; or user
+        // intends to fill via env var / `/connect` later).
+        let _g = HOME_LOCK.lock().unwrap();
+        let tmp = tempdir("opencode-empty-key");
+        let _home = HomeOverride::new(&tmp);
+        let mut p = make_provider(CliApp::Opencode, "no-key", "https://example.com", "");
+        p.model = "gpt-5".into();
+        p.opencode = Some(OpencodeOptions {
+            provider_id: Some("openai-compatible".into()),
+            models: vec![],
+        });
+        activate(&p, &[p.clone()]).unwrap();
+
+        let termory_id = format!("termory-{}", p.id);
+        let config: JsonValue = serde_json::from_str(
+            &fs::read_to_string(tmp.join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
+        let block_ptr = format!("/provider/{termory_id}");
+        // options.apiKey omitted, options.baseURL still written.
+        assert_eq!(
+            config
+                .pointer(&format!("{block_ptr}/options/baseURL"))
+                .and_then(|v| v.as_str()),
+            Some("https://example.com")
+        );
+        assert!(config
+            .pointer(&format!("{block_ptr}/options/apiKey"))
+            .is_none());
     }
 
     #[test]

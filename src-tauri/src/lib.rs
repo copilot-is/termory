@@ -14,8 +14,9 @@ pub(crate) mod testutils {
 }
 
 use providers::{
-    activate, deactivate, fetch_models, read_active_state, test_provider, ActiveState, CliApp,
-    ModelListResult, Provider, TestResult,
+    activate, deactivate, delete_provider_traces, fetch_models, read_active_state,
+    set_opencode_default, test_provider, ActiveState, CliApp, ModelListResult, Provider,
+    TestResult,
 };
 use sessions::{get_session, scan_sessions, search_sessions, AppSession, SearchHit, SessionDetail};
 
@@ -79,11 +80,12 @@ async fn provider_active_states(providers: Vec<Provider>) -> Result<Vec<ActiveSt
     .map_err(|err| err.to_string())?
 }
 
-/// Activate a provider — materializes it into the matching CLI's
-/// live config files. For Official kind, clears Termory-injected
-/// fields. `providers_for_app` is the user's full provider list for
-/// this app, used by Opencode deactivate to know which custom blocks
-/// to strip.
+/// Activate a Custom provider — materializes it into the matching
+/// CLI's live config. Single-slot CLIs (Claude/Codex/Gemini) write
+/// directly into the CLI's primary slot (overwriting any previous
+/// Termory write). For OpenCode this only adds the provider's slot to
+/// opencode.json; promoting it to startup default is a separate call
+/// (`set_opencode_default_provider`).
 #[tauri::command]
 async fn activate_provider(
     provider: Provider,
@@ -91,6 +93,33 @@ async fn activate_provider(
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         activate(&provider, &providers_for_app).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+/// Promote a Termory OpenCode provider to OpenCode's startup default
+/// by writing `model = "<termory-id>/<primary>"` at the top of
+/// opencode.json. The provider must already be activated.
+#[tauri::command]
+async fn set_opencode_default_provider(provider: Provider) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        set_opencode_default(&provider).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+/// Surgical per-provider cleanup before delete. For Claude/Codex/Gemini
+/// this is a no-op (single-slot — the delete flow runs deactivate
+/// when the provider is in use). For OpenCode it removes only this
+/// provider's `termory-<id>` slot from opencode.json (plus clears the
+/// top-level `model` if it pointed here); sibling Termory slots and
+/// any /connect entries in `auth.json` stay untouched.
+#[tauri::command]
+async fn delete_provider_entry(provider: Provider) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_provider_traces(&provider).map_err(|e| e.to_string())
     })
     .await
     .map_err(|err| err.to_string())?
@@ -170,6 +199,8 @@ pub fn run() {
             provider_active_states,
             activate_provider,
             deactivate_provider,
+            delete_provider_entry,
+            set_opencode_default_provider,
             test_provider_api,
             fetch_provider_models,
             read_app_config,

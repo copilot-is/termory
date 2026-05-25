@@ -210,14 +210,63 @@ type Provider = {
   baseUrl?: string;
   apiKey?: string;
   model?: string;
-  // Claude-only: per-size routing. When set, Claude Code's `/model`
-  // menu (Sonnet/Opus/Haiku) maps to these model ids instead of the
-  // Anthropic-native ones — matters when the provider doesn't speak
-  // Anthropic model id (e.g. routes Claude requests to gpt-5).
-  claudeHaikuModel?: string;
-  claudeSonnetModel?: string;
-  claudeOpusModel?: string;
+  // Claude-only options nested so the JSON is grouped: when set,
+  // Claude Code's `/model` menu (Sonnet/Opus/Haiku) maps to these model
+  // ids instead of the Anthropic-native ones — matters when the
+  // provider doesn't speak Anthropic model id (e.g. routes Claude
+  // requests to gpt-5).
+  claude?: {
+    haikuModel?: string;
+    sonnetModel?: string;
+    opusModel?: string;
+  };
+  // OpenCode-only nested options. `providerId` is the catalog id
+  // whose npm package OpenCode should load (anthropic /
+  // openai-compatible / …). `models` are extra model ids surfaced in
+  // OpenCode's picker alongside the primary `model` (top-level).
+  opencode?: {
+    providerId?: string;
+    models?: string[];
+  };
 };
+
+const OPENCODE_PROVIDER_ID_OPTIONS: { value: string; label: string; hint: string }[] = [
+  {
+    value: "openai-compatible",
+    label: "openai-compatible (default)",
+    hint: "Generic OpenAI-shaped REST. Use for PackyCode, DMXAPI, Open Router, etc."
+  },
+  {
+    value: "anthropic",
+    label: "anthropic",
+    hint: "Anthropic Claude API. Use for endpoints that mimic api.anthropic.com."
+  },
+  {
+    value: "openai",
+    label: "openai",
+    hint: "Real OpenAI api.openai.com."
+  },
+  {
+    value: "google",
+    label: "google",
+    hint: "Google Gemini API."
+  },
+  {
+    value: "azure",
+    label: "azure",
+    hint: "Azure-hosted OpenAI."
+  },
+  {
+    value: "amazon-bedrock",
+    label: "amazon-bedrock",
+    hint: "AWS Bedrock."
+  },
+  {
+    value: "google-vertex",
+    label: "google-vertex",
+    hint: "Google Vertex AI."
+  }
+];
 
 type ActiveKind = "official" | "custom" | "unmanaged";
 
@@ -233,6 +282,10 @@ type ActiveState = {
   matchedProviderId?: string | null;
   liveSnapshot?: LiveSnapshot | null;
   livePath: string;
+  // OpenCode-only: ids of Termory providers whose slots exist in
+  // opencode.json (i.e. activated). Activated vs default are distinct
+  // for OpenCode — multiple slots coexist, only one can be default.
+  configuredProviderIds?: string[];
 };
 
 type TestResult = {
@@ -1318,7 +1371,7 @@ function ProvidersPage({
     gemini: null,
     opencode: null
   });
-  const [activating, setActivating] = React.useState<string | null>(null);
+  const [toggling, setToggling] = React.useState<string | null>(null);
   const [testing, setTesting] = React.useState<string | null>(null);
   const [testResults, setTestResults] = React.useState<Record<string, TestResult>>({});
   const [feedback, setFeedback] = React.useState<{
@@ -1400,45 +1453,119 @@ function ProvidersPage({
     closeEditor();
   };
 
-  const deleteProvider = (id: string) => {
+  const deleteProvider = async (id: string) => {
     if (!window.confirm("Delete this provider?")) return;
+    const target = providers.find((p) => p.id === id);
+    if (!target) return;
+    const isInUse = activeStates[target.app]?.matchedProviderId === id;
+    try {
+      if (target.app === "opencode") {
+        // OpenCode is multi-slot — delete only this provider's slot
+        // from opencode.json (and the top-level model if it pointed
+        // at this provider). Other Termory slots stay intact.
+        await invoke("delete_provider_entry", { provider: target });
+      } else if (isInUse) {
+        // Single-slot CLIs — when the deleted one is the live record,
+        // full deactivate clears Termory's writes so the CLI falls
+        // back to its native auth.
+        await invoke("deactivate_provider", {
+          app: target.app,
+          providersForApp: providers.filter((p) => p.app === target.app),
+        });
+      }
+    } catch (err) {
+      setFeedback({
+        kind: "error",
+        message: `Could not clear ${CLI_APP_LABEL[target.app]} live config: ${String(err)}`,
+      });
+      return;
+    }
     setProviders((cur) => cur.filter((p) => p.id !== id));
+    await refreshActive();
   };
 
-  const activateOne = async (target: Provider) => {
-    setActivating(target.id);
+  // OpenCode-only: toggle the provider's slot in opencode.json.
+  // Enabled means the slot exists (multi-slot coexist). Other CLIs
+  // don't have this concept — they only have "Set as default".
+  const toggleEnabled = async (target: Provider) => {
+    if (target.app !== "opencode") return;
+    const state = activeStates[target.app];
+    const enabled = (state?.configuredProviderIds ?? []).includes(target.id);
+    setToggling(target.id);
     setFeedback(null);
     try {
-      await invoke("activate_provider", {
-        provider: target,
-        providersForApp
-      });
+      if (enabled) {
+        await invoke("delete_provider_entry", { provider: target });
+        setFeedback({
+          kind: "ok",
+          message: `Disabled ${target.name || "(unnamed)"}.`,
+        });
+      } else {
+        await invoke("activate_provider", {
+          provider: target,
+          providersForApp,
+        });
+        setFeedback({
+          kind: "ok",
+          message: `Enabled ${target.name || "(unnamed)"}.`,
+        });
+      }
+      await refreshActive();
+    } catch (err) {
+      setFeedback({ kind: "error", message: String(err) });
+    } finally {
+      setToggling(null);
+    }
+  };
+
+  // Universal "Set as default" — promotes a provider to "In use".
+  // Single-slot CLIs: writes Termory's config (auto-replaces previous).
+  // OpenCode: writes top-level model (requires the slot to exist first
+  // via Enable, so the backend rejects if not enabled).
+  const [settingDefault, setSettingDefault] = React.useState<string | null>(null);
+  const setAsDefault = async (target: Provider) => {
+    setSettingDefault(target.id);
+    setFeedback(null);
+    try {
+      if (target.app === "opencode") {
+        await invoke("set_opencode_default_provider", { provider: target });
+      } else {
+        await invoke("activate_provider", {
+          provider: target,
+          providersForApp,
+        });
+      }
       setFeedback({
         kind: "ok",
-        message: `Activated ${target.name || "(unnamed)"}.`
+        message: `${target.name || "(unnamed)"} is now in use.`,
       });
       await refreshActive();
     } catch (err) {
       setFeedback({ kind: "error", message: String(err) });
     } finally {
-      setActivating(null);
+      setSettingDefault(null);
     }
   };
 
-  const activateOfficial = async () => {
-    setActivating("__official__");
+  // Official "Set as default" — clears Termory writes from the CLI's
+  // live config so it falls back to its native auth flow.
+  const setOfficialAsDefault = async () => {
+    setSettingDefault("__official__");
     setFeedback(null);
     try {
       await invoke("deactivate_provider", {
         app,
-        providersForApp
+        providersForApp,
       });
-      setFeedback({ kind: "ok", message: `Restored ${CLI_APP_LABEL[app]} to native login.` });
+      setFeedback({
+        kind: "ok",
+        message: `Official is now in use for ${CLI_APP_LABEL[app]}.`,
+      });
       await refreshActive();
     } catch (err) {
       setFeedback({ kind: "error", message: String(err) });
     } finally {
-      setActivating(null);
+      setSettingDefault(null);
     }
   };
 
@@ -1488,22 +1615,22 @@ function ProvidersPage({
           </div>
         )}
 
-        {app !== "opencode" && (
-          <section className="providersSection">
-            <header className="providersSectionHeader">
-              <h3>Official</h3>
-              <span className="providersSectionHint">
-                Use {CLI_APP_LABEL[app]}'s native login. Activating clears Termory-injected fields.
-              </span>
-            </header>
-            <ProviderOfficialCard
-              app={app}
-              isActive={activeState?.kind === "official"}
-              activating={activating === "__official__"}
-              onActivate={() => void activateOfficial()}
-            />
-          </section>
-        )}
+        <section className="providersSection">
+          <header className="providersSectionHeader">
+            <h3>Official</h3>
+            <span className="providersSectionHint">
+              {app === "opencode"
+                ? `Clear the OpenCode startup default. Enabled Termory providers stay configured and remain selectable via \`/model\`.`
+                : `Use ${CLI_APP_LABEL[app]}'s native login. Activating clears Termory-injected fields.`}
+            </span>
+          </header>
+          <ProviderOfficialCard
+            app={app}
+            isInUse={activeState?.kind === "official"}
+            settingDefault={settingDefault === "__official__"}
+            onSetDefault={() => void setOfficialAsDefault()}
+          />
+        </section>
 
         <section className="providersSection">
           <header className="providersSectionHeader">
@@ -1526,20 +1653,32 @@ function ProvidersPage({
           )}
 
           <div className="providersList">
-            {customProviders.map((p) => (
-              <ProviderCard
-                key={p.id}
-                provider={p}
-                isActive={activeState?.matchedProviderId === p.id}
-                activating={activating === p.id}
-                testing={testing === p.id}
-                testResult={testResults[p.id]}
-                onActivate={() => void activateOne(p)}
-                onEdit={() => startEdit(p)}
-                onDelete={() => deleteProvider(p.id)}
-                onTest={() => void testOne(p)}
-              />
-            ))}
+            {customProviders.map((p) => {
+              const configuredIds = activeState?.configuredProviderIds ?? [];
+              const matchedId = activeState?.matchedProviderId ?? null;
+              const isOpencode = p.app === "opencode";
+              const isConfigured = isOpencode
+                ? configuredIds.includes(p.id)
+                : matchedId === p.id;
+              const isInUse = matchedId === p.id;
+              return (
+                <ProviderCard
+                  key={p.id}
+                  provider={p}
+                  isConfigured={isConfigured}
+                  isInUse={isInUse}
+                  toggling={toggling === p.id}
+                  settingDefault={settingDefault === p.id}
+                  testing={testing === p.id}
+                  testResult={testResults[p.id]}
+                  onToggleEnabled={isOpencode ? () => void toggleEnabled(p) : undefined}
+                  onSetDefault={() => void setAsDefault(p)}
+                  onEdit={() => startEdit(p)}
+                  onDelete={() => deleteProvider(p.id)}
+                  onTest={() => void testOne(p)}
+                />
+              );
+            })}
           </div>
         </section>
       </div>
@@ -1558,44 +1697,46 @@ function ProvidersPage({
 
 function ProviderOfficialCard({
   app,
-  isActive,
-  activating,
-  onActivate
+  isInUse,
+  settingDefault,
+  onSetDefault,
 }: {
   app: CliApp;
-  isActive: boolean;
-  activating: boolean;
-  onActivate: () => void;
+  isInUse: boolean;
+  settingDefault: boolean;
+  onSetDefault: () => void;
 }) {
   const subtitle = {
     claude: "Anthropic OAuth via `claude login`",
     codex: "ChatGPT login via `codex login`",
     gemini: "Google OAuth via `gemini auth`",
-    opencode: "Run `/connect` to add an AI provider and start coding"
+    opencode: "No Termory provider is the startup default — OpenCode picks via `/model`.",
   }[app];
   const authBadge = {
     claude: "OAuth",
     codex: "OAuth",
     gemini: "OAuth",
-    opencode: "API key"
+    opencode: "Native",
   }[app];
   return (
-    <div className={isActive ? "providerCard active" : "providerCard"}>
+    <div className={isInUse ? "providerCard active" : "providerCard"}>
       <div className="providerCardHeader">
         <div className="providerCardTitle">
           <h3>
             {CLI_APP_LABEL[app]} <span className="providerCardAuthBadge">({authBadge})</span>
           </h3>
-          {isActive && <span className="providerActiveBadge">Active</span>}
+          {isInUse && <span className="providerActiveBadge">In use</span>}
         </div>
-        <button
-          type="button"
-          className="providersSecondary"
-          onClick={onActivate}
-          disabled={activating || isActive}
-        >
-          {activating ? "Activating…" : isActive ? "Active" : "Activate"}
-        </button>
+        {!isInUse && (
+          <button
+            type="button"
+            className="providersSecondary"
+            onClick={onSetDefault}
+            disabled={settingDefault}
+          >
+            {settingDefault ? "Setting…" : "Set as default"}
+          </button>
+        )}
       </div>
       <p className="providerCardSubtitle">{subtitle}</p>
     </div>
@@ -1604,41 +1745,87 @@ function ProviderOfficialCard({
 
 function ProviderCard({
   provider,
-  isActive,
-  activating,
+  isConfigured,
+  isInUse,
+  toggling,
+  settingDefault,
   testing,
   testResult,
-  onActivate,
+  onToggleEnabled,
+  onSetDefault,
   onEdit,
   onDelete,
-  onTest
+  onTest,
 }: {
   provider: Provider;
-  isActive: boolean;
-  activating: boolean;
+  // OpenCode: slot exists in opencode.json. Other CLIs: same as isInUse
+  // (single-slot — Enabled ≡ In use, so the Enable concept doesn't
+  // surface separately).
+  isConfigured: boolean;
+  // Universal: CLI is currently using this provider.
+  isInUse: boolean;
+  // OpenCode-only pending state for the Enable/Disable toggle.
+  toggling: boolean;
+  settingDefault: boolean;
   testing: boolean;
   testResult: TestResult | undefined;
-  onActivate: () => void;
+  // OpenCode-only: toggle the slot in opencode.json. Undefined for
+  // other CLIs (their Enabled state isn't separately controllable).
+  onToggleEnabled?: () => void;
+  onSetDefault: () => void;
   onEdit: () => void;
   onDelete: () => void;
   onTest: () => void;
 }) {
+  const isOpencode = provider.app === "opencode";
   return (
-    <div className={isActive ? "providerCard active" : "providerCard"}>
+    <div className={isInUse ? "providerCard active" : "providerCard"}>
       <div className="providerCardHeader">
         <div className="providerCardTitle">
           <h3>{provider.name || "(unnamed)"}</h3>
-          {isActive && <span className="providerActiveBadge">Active</span>}
+          {/* Only the In use badge is rendered. The Enabled/Disabled
+              state surfaces through the Enable/Disable button label
+              itself (showing "Disable" means already enabled). */}
+          {isInUse && <span className="providerActiveBadge">In use</span>}
         </div>
         <div className="providerCardActions">
-          <button
-            type="button"
-            className="providersSecondary"
-            onClick={onActivate}
-            disabled={activating}
-          >
-            {activating ? "Activating…" : isActive ? "Re-apply" : "Activate"}
-          </button>
+          {/* Universal "Set as default" — the action that puts a
+              provider into "In use". Hidden when already In use
+              (the badge already conveys that state). For OpenCode
+              it requires the slot to exist first. */}
+          {!isInUse && (
+            <button
+              type="button"
+              className="providersSecondary"
+              onClick={onSetDefault}
+              disabled={settingDefault || (isOpencode && !isConfigured)}
+              title={
+                isOpencode && !isConfigured
+                  ? "Enable this provider first."
+                  : undefined
+              }
+            >
+              {settingDefault ? "Setting…" : "Set as default"}
+            </button>
+          )}
+          {/* OpenCode-only Enable/Disable — toggles slot membership in
+              opencode.json. Single-slot CLIs don't show this button. */}
+          {onToggleEnabled && (
+            <button
+              type="button"
+              className="providersGhost"
+              onClick={onToggleEnabled}
+              disabled={toggling}
+            >
+              {toggling
+                ? isConfigured
+                  ? "Disabling…"
+                  : "Enabling…"
+                : isConfigured
+                  ? "Disable"
+                  : "Enable"}
+            </button>
+          )}
           <button type="button" className="providersGhost" onClick={onTest} disabled={testing}>
             {testing ? "Testing…" : "Test"}
           </button>
@@ -1717,11 +1904,13 @@ function ProviderEditor({
     setDraft((cur) => ({ ...cur, [key]: value }));
   };
 
-  // OpenCode requires a model (its defaultModel() throws "no models
-  // found" when our provider block has an empty `models: {}` map).
-  // Claude / Codex / Gemini accept an empty model and fall back to
-  // their own default — the placeholder "默认" makes that explicit.
-  const modelRequired = draft.app === "opencode";
+  // Universal required fields: name + baseUrl. apiKey is always
+  // optional (OpenCode supports env-var references; empty is allowed
+  // and Termory just leaves the field unset). OpenCode additionally
+  // needs a primary model — without it OpenCode's picker can't surface
+  // the provider.
+  const isOpencode = draft.app === "opencode";
+  const modelRequired = isOpencode;
   const canSave =
     draft.name.trim().length > 0 &&
     (draft.baseUrl ?? "").trim().length > 0 &&
@@ -1756,17 +1945,31 @@ function ProviderEditor({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!canSave) return;
-    // Trim every string field; `undefined` falls through so the
-    // stripEmpty pass in config.ts later prunes them from disk.
+    // Trim every string field; collapse nested option objects to
+    // undefined when nothing inside survived the trim, so providers.json
+    // doesn't carry empty {claude: {}} / {opencode: {}} blocks.
+    const claude = {
+      sonnetModel: draft.claude?.sonnetModel?.trim() || undefined,
+      opusModel: draft.claude?.opusModel?.trim() || undefined,
+      haikuModel: draft.claude?.haikuModel?.trim() || undefined,
+    };
+    const claudeHasAny = !!(claude.sonnetModel || claude.opusModel || claude.haikuModel);
+    const extraModels = (draft.opencode?.models ?? [])
+      .map((m) => m.trim())
+      .filter((m) => m.length > 0);
+    const opencode = {
+      providerId: draft.opencode?.providerId?.trim() || undefined,
+      models: extraModels.length > 0 ? extraModels : undefined,
+    };
+    const opencodeHasAny = !!(opencode.providerId || opencode.models);
     onSave({
       ...draft,
       name: draft.name.trim(),
       baseUrl: draft.baseUrl?.trim() || undefined,
       apiKey: draft.apiKey?.trim() || undefined,
       model: draft.model?.trim() || undefined,
-      claudeSonnetModel: draft.claudeSonnetModel?.trim() || undefined,
-      claudeOpusModel: draft.claudeOpusModel?.trim() || undefined,
-      claudeHaikuModel: draft.claudeHaikuModel?.trim() || undefined
+      claude: claudeHasAny ? claude : undefined,
+      opencode: opencodeHasAny ? opencode : undefined,
     });
   };
 
@@ -1799,6 +2002,10 @@ function ProviderEditor({
               placeholder="Display name for this provider"
               value={draft.name}
               onChange={(e) => update("name", e.target.value)}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
               required
             />
           </label>
@@ -1822,7 +2029,7 @@ function ProviderEditor({
               <input
                 type={revealKey ? "text" : "password"}
                 className="providerInput mono providerKeyInputField"
-                placeholder="sk-..."
+                placeholder="sk-… (leave blank to fill in CLI later)"
                 value={draft.apiKey ?? ""}
                 onChange={(e) => update("apiKey", e.target.value)}
                 autoComplete="off"
@@ -1841,9 +2048,36 @@ function ProviderEditor({
             <span className="providerFieldHelp">{apiKeyHelp(draft.app)}</span>
           </label>
 
+          {isOpencode && (
+            <label className="providerField">
+              <span className="providerFieldLabel">AI SDK *</span>
+              <select
+                className="providerInput providerSelect"
+                value={draft.opencode?.providerId ?? "openai-compatible"}
+                onChange={(e) =>
+                  update("opencode", {
+                    ...(draft.opencode ?? {}),
+                    providerId: e.target.value,
+                  })
+                }
+              >
+                {OPENCODE_PROVIDER_ID_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+              <span className="providerFieldHelp">
+                {OPENCODE_PROVIDER_ID_OPTIONS.find(
+                  (o) => o.value === (draft.opencode?.providerId ?? "openai-compatible")
+                )?.hint}
+              </span>
+            </label>
+          )}
+
           <label className="providerField">
             <span className="providerFieldLabel">
-              Model{modelRequired ? " *" : " (optional)"}
+              {`Model${modelRequired ? " *" : ""}`}
             </span>
             <div className="providerKeyInput">
               <input
@@ -1851,13 +2085,14 @@ function ProviderEditor({
                 className="providerInput mono providerKeyInputField"
                 placeholder={
                   modelRequired
-                    ? "Enter a model id"
+                    ? "Enter the model id (e.g. claude-opus-4-7)"
                     : "Leave blank to use the default"
                 }
                 value={draft.model ?? ""}
                 onChange={(e) => update("model", e.target.value)}
                 list={modelOptions.length > 0 ? modelDatalistId : undefined}
                 autoComplete="off"
+                required={modelRequired}
               />
               <button
                 type="button"
@@ -1893,6 +2128,32 @@ function ProviderEditor({
             )}
           </label>
 
+          {isOpencode && (
+            <label className="providerField">
+              <span className="providerFieldLabel">Additional models</span>
+              <input
+                type="text"
+                className="providerInput mono"
+                placeholder="e.g. claude-sonnet-4-5, gpt-5-mini"
+                value={(draft.opencode?.models ?? []).join(", ")}
+                onChange={(e) =>
+                  update("opencode", {
+                    ...(draft.opencode ?? {}),
+                    models: e.target.value
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter((s) => s.length > 0),
+                  })
+                }
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <span className="providerFieldHelp">
+                Comma-separated extra model ids surfaced in OpenCode's picker. The primary "Model" above is always included.
+              </span>
+            </label>
+          )}
+
           {draft.app === "claude" && (
             <details className="providerAdvanced">
               <summary className="providerAdvancedSummary">
@@ -1905,9 +2166,9 @@ function ProviderEditor({
               </p>
               {(
                 [
-                  ["claudeSonnetModel", "Sonnet route", "e.g. gpt-5"],
-                  ["claudeOpusModel", "Opus route", "e.g. claude-opus-4-7"],
-                  ["claudeHaikuModel", "Haiku route", "e.g. deepseek-chat"]
+                  ["sonnetModel", "Sonnet route", "e.g. gpt-5"],
+                  ["opusModel", "Opus route", "e.g. claude-opus-4-7"],
+                  ["haikuModel", "Haiku route", "e.g. deepseek-chat"],
                 ] as const
               ).map(([key, label, ph]) => (
                 <label key={key} className="providerField providerAdvancedField">
@@ -1916,8 +2177,13 @@ function ProviderEditor({
                     type="text"
                     className="providerInput mono"
                     placeholder={ph}
-                    value={(draft[key] as string | undefined) ?? ""}
-                    onChange={(e) => update(key, e.target.value)}
+                    value={draft.claude?.[key] ?? ""}
+                    onChange={(e) =>
+                      update("claude", {
+                        ...(draft.claude ?? {}),
+                        [key]: e.target.value,
+                      })
+                    }
                   />
                 </label>
               ))}
@@ -1948,7 +2214,7 @@ function customProviderHint(app: CliApp): string {
     case "gemini":
       return "Writes ~/.gemini/.env (GOOGLE_GEMINI_BASE_URL + GEMINI_API_KEY), file mode 0600.";
     case "opencode":
-      return "Writes ~/.config/opencode/opencode.json (provider.termory.options + qualified model).";
+      return "Writes ~/.config/opencode/opencode.json provider.<termory-id> block (npm + name + options.{baseURL, apiKey} + models). auth.json is left untouched for /connect.";
   }
 }
 
