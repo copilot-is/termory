@@ -210,60 +210,90 @@ fn merge_tool_outputs(messages: Vec<SessionMessage>) -> Vec<SessionMessage> {
                 msg.text = format!("{marker}{}", msg.text);
 
                 if let Some((output, is_error, exit_code)) = matched {
-                    // Build the merged body. On failures, prefix with
-                    // `Error:` and the exit code (when known) — matching
-                    // Claude Code TUI's `⎿ Error: Exit code N` line and
-                    // unifying the format across platforms. Codex carries
-                    // an exit_code, Claude doesn't (is_error alone signals
-                    // failure).
                     let trimmed = output.trim();
-                    let mut body = String::new();
+                    // Write tool: tool_use card already has the
+                    // `⎿ Wrote N lines to file` summary + content
+                    // preview from `claude_tool_use_text`. Drop the
+                    // redundant tool_result confirmation entirely.
+                    if !*is_error && msg.text.contains("⏺ **Write**(") {
+                        return Some(msg);
+                    }
+                    // Read tool: emit a `⎿ Read **N** lines` summary
+                    // as a markdown paragraph (where `⎿` width doesn't
+                    // matter and `**N**` renders bold), then content in
+                    // a plain fence below. Mirrors FileReadTool/UI.tsx.
+                    let is_read = !*is_error
+                        && (msg.text.contains("⏺ **Read**(")
+                            || msg.text.contains("⏺ **Read agent output**("));
+                    if is_read {
+                        let line_count = trimmed.lines().count();
+                        let label = if line_count == 1 { "line" } else { "lines" };
+                        msg.text.push_str(&format!(
+                            "\n\n⎿ Read **{line_count}** {label}"
+                        ));
+                        if !trimmed.is_empty() {
+                            msg.text
+                                .push_str(&format!("\n\n````\n{trimmed}\n````"));
+                        }
+                        return Some(msg);
+                    }
+                    // Grep / Glob: split off the `Found **N** …` summary
+                    // line so the bold count renders outside the fence
+                    // (GrepTool/UI.tsx:14-72).
+                    if !*is_error && msg.text.contains("⏺ **Search**(") {
+                        if let Some((summary, rest)) = claude_split_grep_summary(trimmed) {
+                            msg.text.push_str(&format!("\n\n⎿ {summary}"));
+                            if !rest.is_empty() {
+                                msg.text
+                                    .push_str(&format!("\n\n````\n{rest}\n````"));
+                            }
+                            return Some(msg);
+                        }
+                    }
+                    // Error path: `⎿ Error: ...` summary as a markdown
+                    // paragraph so the font width of `⎿` never affects
+                    // alignment. Codex has exit codes — `⎿ Error: Exit
+                    // code N` summary + stdout/stderr fence below.
+                    // Claude has no exit code — `⎿ Error: {message}`
+                    // inline on one line (typical Claude errors are a
+                    // single sentence, e.g. InputValidationError).
                     if *is_error {
-                        body.push_str("Error:");
-                        // Codex: `Error: Exit code N` then (if any) the
-                        // command output on subsequent lines.
-                        // Claude: no exit_code — content comes inline
-                        // after `Error: ` (single line head + multi-line
-                        // continuation if the error message has \n).
+                        msg.text.push_str("\n\n");
                         match *exit_code {
                             Some(code) if code != 0 => {
-                                body.push_str(&format!(" Exit code {code}"));
+                                msg.text
+                                    .push_str(&format!("⎿ Error: Exit code {code}"));
                                 if !trimmed.is_empty() {
-                                    body.push('\n');
-                                    body.push_str(trimmed);
+                                    msg.text
+                                        .push_str(&format!("\n\n````\n{trimmed}\n````"));
                                 }
                             }
-                            _ if !trimmed.is_empty() => {
-                                body.push(' ');
-                                body.push_str(trimmed);
+                            _ => {
+                                msg.text.push_str("⎿ Error:");
+                                if !trimmed.is_empty() {
+                                    msg.text.push(' ');
+                                    msg.text.push_str(trimmed);
+                                }
                             }
-                            _ => {}
                         }
-                    } else {
-                        body.push_str(trimmed);
+                        return Some(msg);
                     }
-                    if !body.is_empty() {
+                    // Generic success: when the tool_result body is
+                    // already markdown (structured-result builders emit
+                    // a `... **bold** ...\n\n```fence`), append it as
+                    // a markdown paragraph. Otherwise emit a plain
+                    // 4-backtick fence — no `⎿` inside, so monospace
+                    // alignment is the browser's native fence behavior
+                    // and not dependent on U+23BF rendering width.
+                    if !trimmed.is_empty() {
                         msg.text.push_str("\n\n");
-                        // If the body ALREADY starts with a code fence
-                        // (e.g. Claude's structuredPatch builder emits
-                        // ```diff\n...\n```), append it verbatim so the
-                        // markdown layer sees a single fence — wrapping
-                        // it in another 4-backtick fence would make the
-                        // inner fence render as literal characters.
-                        // Also pass through verbatim when the body
-                        // already has a triple-backtick fence anywhere
-                        // (e.g. the Claude structuredPatch builder emits
-                        // `*Added N lines, removed M lines*\n\n```diff\n...`
-                        // — the leading italic summary precedes the fence,
-                        // so `starts_with("```")` is false but the body is
-                        // already structured markdown).
-                        let already_markdown = body.starts_with("```") || body.contains("\n```");
+                        let already_markdown = trimmed.starts_with("```")
+                            || trimmed.contains("\n```")
+                            || trimmed.contains("**");
                         if already_markdown {
-                            msg.text.push_str(&body);
+                            msg.text.push_str(trimmed);
                         } else {
-                            msg.text.push_str("````\n");
-                            msg.text.push_str(&body);
-                            msg.text.push_str("\n````");
+                            msg.text.push_str(&format!("````\n{trimmed}\n````"));
                         }
                     }
                 }
@@ -4456,12 +4486,23 @@ fn claude_message_from_value(value: &Value) -> Vec<SessionMessage> {
             //    `+`/`-` lines. We prefer that diff over the brief
             //    "The file ... has been updated successfully" content
             //    when present, matching the official UI's verbosity.
+            //
+            //    Other tools (WebFetch / NotebookEdit / EnterWorktree /
+            //    ExitWorktree / ConfigTool / ScheduleCron) store their
+            //    own structured fields on `toolUseResult`; the
+            //    `claude_format_structured_result` dispatcher tries each
+            //    in turn so the bold-count summary line matches the
+            //    per-tool TUI rendering.
             let tool_use_result = value.get("toolUseResult");
             let diff_text = tool_use_result.and_then(claude_format_structured_patch);
             for tool_result in claude_tool_results(content) {
+                let structured = tool_use_result.and_then(|tur| {
+                    claude_format_structured_result(tur, &tool_result.text)
+                });
                 let body_text = diff_text
                     .clone()
                     .filter(|_| !tool_result.is_error)
+                    .or_else(|| structured.filter(|_| !tool_result.is_error))
                     .or_else(|| claude_display_text(&tool_result.text));
                 if let Some(display) = body_text {
                     out.push(SessionMessage {
@@ -4901,26 +4942,198 @@ fn claude_format_structured_patch(tool_use_result: &Value) -> Option<String> {
             }
         }
     }
-    // Summary line above the fence, italic notice. Mirrors the
-    // `Added N lines, removed M lines` phrasing Claude TUI uses for
-    // edit summaries (see DiffFileList.tsx:139-148 for the compact
-    // `+N -M` form; Termory uses the readable long form).
+    // Summary line above the fence. Mirrors FileEditToolUpdatedMessage
+    // (`components/FileEditToolUpdatedMessage.tsx:38-54`): only the
+    // counts are bolded. `merge_tool_outputs` prepends the `⎿ ` hang-
+    // indent marker when merging via the `already_markdown` path.
     let mut out = String::new();
-    let added_part = format!("{added} {}", if added == 1 { "line" } else { "lines" });
-    let removed_part = format!("{removed} {}", if removed == 1 { "line" } else { "lines" });
-    // Blank line between the bold summary and the fence is required
-    // by CommonMark for the fence to be recognized — without it the
-    // `**Added ...**` line and ` ```diff ` get merged into one paragraph
-    // and render as literal asterisks + backticks. CSS in styles.css
-    // tightens the visual gap via `.messageBody p + pre` and indents
-    // the summary 1em via `.message.tool .messageBody p + p`.
-    out.push_str(&format!(
-        "**Added {added_part}, removed {removed_part}**\n\n"
-    ));
-    out.push_str("```diff\n");
+    let added_label = if added == 1 { "line" } else { "lines" };
+    let removed_label = if removed == 1 { "line" } else { "lines" };
+    if added > 0 && removed > 0 {
+        out.push_str(&format!(
+            "Added **{added}** {added_label}, removed **{removed}** {removed_label}"
+        ));
+    } else if added > 0 {
+        out.push_str(&format!("Added **{added}** {added_label}"));
+    } else if removed > 0 {
+        out.push_str(&format!("Removed **{removed}** {removed_label}"));
+    }
+    out.push_str("\n\n```diff\n");
     out.push_str(&body);
     out.push_str("```");
     Some(out)
+}
+
+/// Try every known structured-result shape in turn; return the first
+/// match. Each helper inspects `toolUseResult` for tool-specific
+/// fields and produces a body with a bold-count summary followed
+/// (optionally) by a fenced preview, matching the MessageResponse
+/// layout of Claude's per-tool UI components.
+fn claude_format_structured_result(
+    tool_use_result: &Value,
+    fallback_content: &str,
+) -> Option<String> {
+    claude_format_webfetch_body(tool_use_result, fallback_content)
+        .or_else(|| claude_format_notebook_edit_body(tool_use_result))
+        .or_else(|| claude_format_worktree_body(tool_use_result))
+        .or_else(|| claude_format_config_body(tool_use_result))
+        .or_else(|| claude_format_schedule_cron_body(tool_use_result))
+}
+
+/// WebFetch (`WebFetchTool/UI.tsx:31-58`): `Received **{size}** ({code}
+/// {codeText})` summary + 4-backtick fence with the fetched body. The
+/// `\n\n````` separator makes `merge_tool_outputs` treat the whole
+/// thing as `already_markdown` so the bold renders outside the fence.
+fn claude_format_webfetch_body(
+    tool_use_result: &Value,
+    fallback_content: &str,
+) -> Option<String> {
+    let bytes = tool_use_result.get("bytes").and_then(Value::as_u64)?;
+    let size = claude_format_file_size(bytes);
+    let code = tool_use_result.get("code").and_then(Value::as_i64);
+    let code_text = tool_use_result
+        .get("codeText")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let result_text = tool_use_result
+        .get("result")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback_content.trim());
+    let mut out = format!("Received **{size}**");
+    match (code, code_text) {
+        (Some(c), Some(t)) => out.push_str(&format!(" ({c} {t})")),
+        (Some(c), None) => out.push_str(&format!(" ({c})")),
+        (None, Some(t)) => out.push_str(&format!(" ({t})")),
+        (None, None) => {}
+    }
+    if !result_text.is_empty() {
+        out.push_str("\n\n````\n");
+        out.push_str(result_text);
+        out.push_str("\n````");
+    }
+    Some(out)
+}
+
+/// Human-readable byte count: `1.4 KB`, `12.4 MB`, etc.
+fn claude_format_file_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else if bytes < GB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    }
+}
+
+/// NotebookEdit (`NotebookEditTool/UI.tsx:99-124`):
+/// `Updated cell **{cell_id}**` + fenced `new_source` preview.
+fn claude_format_notebook_edit_body(tool_use_result: &Value) -> Option<String> {
+    let cell_id = tool_use_result.get("cell_id").and_then(Value::as_str)?;
+    let mut out = format!("Updated cell **{cell_id}**");
+    if let Some(src) = tool_use_result
+        .get("new_source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str("\n\n````\n");
+        out.push_str(src);
+        out.push_str("\n````");
+    }
+    Some(out)
+}
+
+/// EnterWorktree / ExitWorktree: distinguished by `worktreePath`
+/// (enter) vs `originalCwd` (exit).
+fn claude_format_worktree_body(tool_use_result: &Value) -> Option<String> {
+    let branch = tool_use_result.get("worktreeBranch").and_then(Value::as_str)?;
+    let path = tool_use_result
+        .get("worktreePath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let original_cwd = tool_use_result
+        .get("originalCwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let mut out = if path.is_some() {
+        format!("Switched to worktree on branch **{branch}**")
+    } else if original_cwd.is_some() {
+        format!("Exited worktree (branch **{branch}**)")
+    } else {
+        format!("Worktree branch **{branch}**")
+    };
+    if let Some(p) = path {
+        out.push_str(&format!("\n\n⎿ {p}"));
+    }
+    if let Some(c) = original_cwd {
+        out.push_str(&format!("\n\n⎿ Returned to {c}"));
+    }
+    Some(out)
+}
+
+/// ConfigTool (`ConfigTool/UI.tsx:20-43`): get → bold setting + value;
+/// set → bold setting + bold newValue.
+fn claude_format_config_body(tool_use_result: &Value) -> Option<String> {
+    let setting = tool_use_result.get("setting").and_then(Value::as_str)?;
+    if tool_use_result.get("success").and_then(Value::as_bool) == Some(false) {
+        let err = tool_use_result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("(unknown error)");
+        return Some(format!("Failed: {err}"));
+    }
+    let op = tool_use_result
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if op == "get" {
+        let value = tool_use_result
+            .get("value")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(no value)".to_string());
+        return Some(format!("**{setting}** = {value}"));
+    }
+    let new_value = tool_use_result
+        .get("newValue")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "(no value)".to_string());
+    Some(format!("Set **{setting}** to **{new_value}**"))
+}
+
+/// ScheduleCron create (`ScheduleCronTool/UI.tsx:17-28`):
+/// `Scheduled **{id}** ({humanSchedule})`. Delete shape is ambiguous
+/// without tool_use context, so handled only when humanSchedule is set.
+fn claude_format_schedule_cron_body(tool_use_result: &Value) -> Option<String> {
+    let id = tool_use_result.get("id").and_then(Value::as_str)?;
+    let human = tool_use_result
+        .get("humanSchedule")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some(format!("Scheduled **{id}** ({human})"))
+}
+
+/// Split a Grep / Glob tool_result body into `(summary, rest)` where
+/// the summary line gets the count bolded per GrepTool/UI.tsx:30-45.
+/// Returns `None` when the body doesn't begin with `Found N …`.
+fn claude_split_grep_summary(body: &str) -> Option<(String, &str)> {
+    let (first, rest) = body.split_once('\n').unwrap_or((body, ""));
+    let after_found = first.strip_prefix("Found ")?;
+    let (count, label) = after_found.split_once(' ')?;
+    if count.is_empty() || !count.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((format!("Found **{count}** {label}"), rest))
 }
 
 fn claude_tool_results(content: &Value) -> Vec<ClaudeToolResult> {
@@ -5087,13 +5300,22 @@ fn claude_tool_use_text(name: &str, input: &Value) -> Option<String> {
             let mut text = format!("**Read**({}", wrap_inline_code(&path));
             if let Some(p) = pages {
                 text.push_str(&format!(" · pages {p}"));
-            } else if let Some(off) = offset.as_deref() {
-                match limit.as_deref() {
-                    Some(lim) => text.push_str(&format!(" · lines {off}-{lim}")),
-                    None => text.push_str(&format!(" · from line {off}")),
+            } else {
+                // Match FileReadTool/UI.tsx:58-67 exactly:
+                //   * offset defaults to 1 when absent
+                //   * with limit  → `lines {start}-{start + limit - 1}`
+                //   * without limit but with offset → `from line {start}`
+                //   * neither → no suffix
+                let start: i64 = offset
+                    .as_deref()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+                let limit_n: Option<i64> = limit.as_deref().and_then(|s| s.parse().ok());
+                if let Some(n) = limit_n {
+                    text.push_str(&format!(" · lines {start}-{}", start + n - 1));
+                } else if offset.is_some() {
+                    text.push_str(&format!(" · from line {start}"));
                 }
-            } else if let Some(lim) = limit {
-                text.push_str(&format!(" · limit {lim}"));
             }
             text.push(')');
             text
@@ -5101,10 +5323,33 @@ fn claude_tool_use_text(name: &str, input: &Value) -> Option<String> {
         "write" => {
             let path = get("file_path").unwrap_or_default();
             if path.is_empty() {
-                "**Write**".to_string()
-            } else {
-                format!("**Write**({})", wrap_inline_code(&path))
+                return Some("**Write**".to_string());
             }
+            // Mirror FileWriteTool/UI.tsx:55-74: emit a `⎿ Wrote **N**
+            // lines to **{file}**` summary + syntax-hinted content
+            // preview inside a fence. The tool_result confirmation
+            // gets dropped in merge_tool_outputs (Write tool branch).
+            let content = get("content").unwrap_or_default();
+            let line_count = content.lines().count();
+            let label = if line_count == 1 { "line" } else { "lines" };
+            let basename = path
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&path);
+            let lang = filetype_hint(&path);
+            let mut text = format!("**Write**({})", wrap_inline_code(&path));
+            text.push_str(&format!(
+                "\n\n⎿ Wrote **{line_count}** {label} to **{basename}**"
+            ));
+            if !content.is_empty() {
+                if lang.is_empty() {
+                    text.push_str(&format!("\n\n```\n{content}\n```"));
+                } else {
+                    text.push_str(&format!("\n\n```{lang}\n{content}\n```"));
+                }
+            }
+            text
         }
         "edit" | "multiedit" | "str_replace" | "str_replace_editor" => {
             let path = get("file_path").unwrap_or_default();
@@ -8367,10 +8612,12 @@ mod tests {
             ]
         }))
         .unwrap();
-        // Output must include the **Added .. removed ..** summary on its own
-        // line, blank line, then the ```diff fence — NO `@@` hunk header.
+        // Output must include the `Added N lines, removed M lines` summary
+        // (bold COUNTS only, matching FileEditToolUpdatedMessage.tsx:47-52)
+        // on its own line, blank line, then the ```diff fence — NO `@@`
+        // hunk header.
         assert!(
-            body.starts_with("**Added 2 lines, removed 1 line**\n\n```diff\n"),
+            body.starts_with("Added **2** lines, removed **1** line\n\n```diff\n"),
             "missing or wrong summary header; got:\n{body}"
         );
         assert!(!body.contains("@@ "), "should not include `@@` hunk header");
@@ -8390,7 +8637,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert!(body.starts_with("**Added 1 line, removed 1 line**\n\n```diff\n"));
+        assert!(body.starts_with("Added **1** line, removed **1** line\n\n```diff\n"));
         assert!(!body.contains("@@ "));
         assert!(
             body.contains("+a\n\n-b\n"),
@@ -8615,9 +8862,12 @@ mod tests {
             .iter()
             .find(|m| m.role == "tool")
             .expect("tool message present");
+        // Error path: `⎿ Error: Exit code N` summary line outside the
+        // fence (markdown paragraph — no monospace-width concerns for
+        // `⎿`), stdout/stderr inside a plain 4-backtick fence below.
         assert_eq!(
             tool.text,
-            "✗ **Bash**(`npm test`)\n\n````\nError: Exit code 1\nFAIL\ntrace\n````"
+            "✗ **Bash**(`npm test`)\n\n⎿ Error: Exit code 1\n\n````\nFAIL\ntrace\n````"
         );
     }
 
@@ -8654,9 +8904,10 @@ mod tests {
             .iter()
             .find(|m| m.role == "tool")
             .expect("tool message present");
+        // Empty-output failure: no fence, just the bare `⎿ Error:` line.
         assert_eq!(
             tool.text,
-            "✗ **Bash**(`rg --files -g '*release-airouter.yml' -g '!*node_modules*' -g '!web/**/node_modules/**'`)\n\n````\nError: Exit code 1\n````"
+            "✗ **Bash**(`rg --files -g '*release-airouter.yml' -g '!*node_modules*' -g '!web/**/node_modules/**'`)\n\n⎿ Error: Exit code 1"
         );
     }
 
@@ -8892,9 +9143,12 @@ mod tests {
             .expect("merged tool card should exist");
         // Unified tool card: `⏺` status marker on success (matches Claude
         // TUI's BLACK_CIRCLE prefix in constants/figures.ts:4) + bold verb
-        // + inline-code argument + 4-backtick fence with the merged
-        // tool_result body. Commands are wrapped in inline backticks for
-        // markdown-injection safety.
+        // + inline-code argument + 4-backtick fence with the raw merged
+        // tool_result body. The fence body is plain monospace so the
+        // browser's native code-block rendering keeps lines aligned
+        // without depending on the visual width of `⎿` (U+23BF varies
+        // across browser font fallbacks). Commands are wrapped in
+        // inline backticks for markdown-injection safety.
         assert_eq!(
             tool_card.text,
             "⏺ **Bash**(`ls`)\n\n````\nsrc\nREADME.md\n````"
