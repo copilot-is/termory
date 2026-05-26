@@ -1339,7 +1339,7 @@ input {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 18px 24px 14px;
+  padding: 12px 24px;
   background: #ffffff;
   border-bottom: 1px solid #e1e6e8;
 }
@@ -1589,7 +1589,7 @@ input {
 .providersTabs {
   display: flex;
   align-items: stretch;
-  padding: 0 18px;
+  padding: 0 24px;
   background: #ffffff;
   border-bottom: 1px solid #e1e6e8;
   overflow-x: auto;
@@ -1641,7 +1641,7 @@ input {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 16px 24px 32px;
+  padding: 18px 24px 32px;
   display: flex;
   flex-direction: column;
   gap: 16px;
