@@ -2380,6 +2380,10 @@ function SearchPage({
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             autoFocus
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
           />
           {loading && <Loader2 className="spin searchSpinner" size={14} />}
         </div>
@@ -2708,6 +2712,10 @@ function CommandPalette({
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={handleKeyDown}
             autoFocus
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
           />
           {loading && <Loader2 className="spin paletteSpinner" size={14} />}
           <kbd className="paletteKbd">ESC</kbd>
