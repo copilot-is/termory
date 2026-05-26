@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eef3f7"/>
+    </linearGradient>
+
+    <linearGradient id="chevGrad" x1="0" y1="430" x2="0" y2="640" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3a9aff"/>
+      <stop offset="1" stop-color="#005ac2"/>
+    </linearGradient>
+
+    <linearGradient id="sheenGrad" x1="0" y1="0" x2="0" y2="600" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <filter id="chevShadow" x="-15%" y="-15%" width="130%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="8"/>
+      <feOffset dx="0" dy="8"/>
+      <feComponentTransfer>
+        <feFuncA type="linear" slope="0.2"/>
+      </feComponentTransfer>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" rx="229" fill="url(#bgGrad)"/>
+  <rect width="1024" height="1024" rx="229" fill="url(#sheenGrad)"/>
+
+  <g filter="url(#chevShadow)">
+    <path d="M 281 436 L 425 532 L 281 628"
+          stroke="url(#chevGrad)" stroke-width="72"
+          fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <path d="M 501 464 L 609 532 L 501 600"
+          stroke="url(#chevGrad)" stroke-width="52"
+          fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <path d="M 681 492 L 761 532 L 681 572"
+          stroke="url(#chevGrad)" stroke-width="36"
+          fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>
