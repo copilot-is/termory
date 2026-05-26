@@ -15,7 +15,7 @@
       <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
     </linearGradient>
 
-    <filter id="chevShadow" x="-15%" y="-15%" width="130%" height="140%">
+    <filter id="chevShadow" filterUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
       <feGaussianBlur in="SourceAlpha" stdDeviation="8"/>
       <feOffset dx="0" dy="8"/>
       <feComponentTransfer>
