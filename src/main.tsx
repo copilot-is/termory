@@ -23,10 +23,14 @@ import {
   Loader2,
   MessageSquare,
   Plug,
+  Pencil,
+  Plus,
   RefreshCw,
   Search,
   Settings as SettingsIcon,
-  Sparkles
+  Sparkles,
+  Trash2,
+  Zap
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -1613,20 +1617,31 @@ function ProvidersPage({
 
   return (
     <div className="providersPage">
-      <div className="providersTabs" role="tablist">
-        {CLI_APPS.map((id) => (
-          <button
-            key={id}
-            type="button"
-            role="tab"
-            aria-selected={app === id}
-            className={app === id ? "providersTab active" : "providersTab"}
-            onClick={() => setApp(id)}
-          >
-            <BrandIcon source={CLI_APP_SOURCE_BADGE[id]} />
-            <span>{CLI_APP_LABEL[id]}</span>
-          </button>
-        ))}
+      <div className="providersTabsRow">
+        <div className="providersTabs" role="tablist">
+          {CLI_APPS.map((id) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={app === id}
+              className={app === id ? "providersTab active" : "providersTab"}
+              onClick={() => setApp(id)}
+            >
+              <BrandIcon source={CLI_APP_SOURCE_BADGE[id]} />
+              <span>{CLI_APP_LABEL[id]}</span>
+            </button>
+          ))}
+        </div>
+        <button
+          type="button"
+          className="providersPrimary providersAdd"
+          onClick={startNew}
+          title="Add provider"
+          aria-label="Add provider"
+        >
+          <Plus size={16} />
+        </button>
       </div>
 
       <div className="providersBody">
@@ -1637,33 +1652,39 @@ function ProvidersPage({
           </div>
         )}
 
-        <section className="providersSection">
-          <header className="providersSectionHeader">
-            <h3>Official</h3>
-            <span className="providersSectionHint">
-              {app === "opencode"
-                ? `Clear the OpenCode startup default. Enabled Termory providers stay configured and remain selectable via \`/model\`.`
-                : `Use ${CLI_APP_LABEL[app]}'s native login. Activating clears Termory-injected fields.`}
-            </span>
-          </header>
+        <div className="providersList">
           <ProviderOfficialCard
-            app={app}
             isInUse={activeState?.kind === "official"}
             settingDefault={settingDefault === "__official__"}
             onSetDefault={() => void setOfficialAsDefault()}
           />
-        </section>
 
-        <section className="providersSection">
-          <header className="providersSectionHeader">
-            <h3>API platforms</h3>
-            <span className="providersSectionHint">
-              {customProviderHint(app)}
-            </span>
-            <button type="button" className="providersPrimary" onClick={startNew}>
-              + Add provider
-            </button>
-          </header>
+          {customProviders.map((p) => {
+            const configuredIds = activeState?.configuredProviderIds ?? [];
+            const matchedId = activeState?.matchedProviderId ?? null;
+            const isOpencode = p.app === "opencode";
+            const isConfigured = isOpencode
+              ? configuredIds.includes(p.id)
+              : matchedId === p.id;
+            const isInUse = matchedId === p.id;
+            return (
+              <ProviderCard
+                key={p.id}
+                provider={p}
+                isConfigured={isConfigured}
+                isInUse={isInUse}
+                toggling={toggling === p.id}
+                settingDefault={settingDefault === p.id}
+                testing={testing === p.id}
+                testResult={testResults[p.id]}
+                onToggleEnabled={isOpencode ? () => void toggleEnabled(p) : undefined}
+                onSetDefault={() => void setAsDefault(p)}
+                onEdit={() => startEdit(p)}
+                onDelete={() => deleteProvider(p.id)}
+                onTest={() => void testOne(p)}
+              />
+            );
+          })}
 
           {customProviders.length === 0 && (
             <EmptyState
@@ -1673,36 +1694,7 @@ function ProvidersPage({
               action={{ label: "+ Add provider", onClick: startNew }}
             />
           )}
-
-          <div className="providersList">
-            {customProviders.map((p) => {
-              const configuredIds = activeState?.configuredProviderIds ?? [];
-              const matchedId = activeState?.matchedProviderId ?? null;
-              const isOpencode = p.app === "opencode";
-              const isConfigured = isOpencode
-                ? configuredIds.includes(p.id)
-                : matchedId === p.id;
-              const isInUse = matchedId === p.id;
-              return (
-                <ProviderCard
-                  key={p.id}
-                  provider={p}
-                  isConfigured={isConfigured}
-                  isInUse={isInUse}
-                  toggling={toggling === p.id}
-                  settingDefault={settingDefault === p.id}
-                  testing={testing === p.id}
-                  testResult={testResults[p.id]}
-                  onToggleEnabled={isOpencode ? () => void toggleEnabled(p) : undefined}
-                  onSetDefault={() => void setAsDefault(p)}
-                  onEdit={() => startEdit(p)}
-                  onDelete={() => deleteProvider(p.id)}
-                  onTest={() => void testOne(p)}
-                />
-              );
-            })}
-          </div>
-        </section>
+        </div>
       </div>
 
       {editing && (
@@ -1718,49 +1710,36 @@ function ProvidersPage({
 }
 
 function ProviderOfficialCard({
-  app,
   isInUse,
   settingDefault,
   onSetDefault,
 }: {
-  app: CliApp;
   isInUse: boolean;
   settingDefault: boolean;
   onSetDefault: () => void;
 }) {
-  const subtitle = {
-    claude: "Anthropic OAuth via `claude login`",
-    codex: "ChatGPT login via `codex login`",
-    gemini: "Google OAuth via `gemini auth`",
-    opencode: "No Termory provider is the startup default — OpenCode picks via `/model`.",
-  }[app];
-  const authBadge = {
-    claude: "OAuth",
-    codex: "OAuth",
-    gemini: "OAuth",
-    opencode: "Native",
-  }[app];
   return (
     <div className={isInUse ? "providerCard active" : "providerCard"}>
-      <div className="providerCardHeader">
-        <div className="providerCardTitle">
-          <h3>
-            {CLI_APP_LABEL[app]} <span className="providerCardAuthBadge">({authBadge})</span>
-          </h3>
-          {isInUse && <span className="providerActiveBadge">In use</span>}
+      <div className="providerCardMain">
+        <div className="providerCardContent">
+          <div className="providerCardTitle">
+            <h3>Official</h3>
+            {isInUse && <span className="providerActiveBadge">In use</span>}
+          </div>
         </div>
-        {!isInUse && (
-          <button
-            type="button"
-            className="providersSecondary"
-            onClick={onSetDefault}
-            disabled={settingDefault}
-          >
-            {settingDefault ? "Setting…" : "Set as default"}
-          </button>
-        )}
+        <div className="providerCardActions">
+          {!isInUse && (
+            <button
+              type="button"
+              className="providersSecondary"
+              onClick={onSetDefault}
+              disabled={settingDefault}
+            >
+              {settingDefault ? "Setting…" : "Set as default"}
+            </button>
+          )}
+        </div>
       </div>
-      <p className="providerCardSubtitle">{subtitle}</p>
     </div>
   );
 }
@@ -1802,19 +1781,34 @@ function ProviderCard({
   const isOpencode = provider.app === "opencode";
   return (
     <div className={isInUse ? "providerCard active" : "providerCard"}>
-      <div className="providerCardHeader">
-        <div className="providerCardTitle">
-          <h3>{provider.name || "(unnamed)"}</h3>
-          {/* Only the In use badge is rendered. The Enabled/Disabled
-              state surfaces through the Enable/Disable button label
-              itself (showing "Disable" means already enabled). */}
-          {isInUse && <span className="providerActiveBadge">In use</span>}
+      <div className="providerCardMain">
+        <div className="providerCardContent">
+          <div className="providerCardTitle">
+            <h3>{provider.name || "(unnamed)"}</h3>
+            {isInUse && <span className="providerActiveBadge">In use</span>}
+          </div>
+          <dl className="providerCardFields">
+            {provider.baseUrl && (
+              <div>
+                <dt>Base URL</dt>
+                <dd className="mono">{provider.baseUrl}</dd>
+              </div>
+            )}
+            {provider.apiKey && (
+              <div>
+                <dt>API key</dt>
+                <dd className="mono">{maskKey(provider.apiKey)}</dd>
+              </div>
+            )}
+            {provider.model && (
+              <div>
+                <dt>Model</dt>
+                <dd className="mono">{provider.model}</dd>
+              </div>
+            )}
+          </dl>
         </div>
         <div className="providerCardActions">
-          {/* Universal "Set as default" — the action that puts a
-              provider into "In use". Hidden when already In use
-              (the badge already conveys that state). For OpenCode
-              it requires the slot to exist first. */}
           {!isInUse && (
             <button
               type="button"
@@ -1830,8 +1824,6 @@ function ProviderCard({
               {settingDefault ? "Setting…" : "Set as default"}
             </button>
           )}
-          {/* OpenCode-only Enable/Disable — toggles slot membership in
-              opencode.json. Single-slot CLIs don't show this button. */}
           {onToggleEnabled && (
             <button
               type="button"
@@ -1848,37 +1840,36 @@ function ProviderCard({
                   : "Enable"}
             </button>
           )}
-          <button type="button" className="providersGhost" onClick={onTest} disabled={testing}>
-            {testing ? "Testing…" : "Test"}
+          <button
+            type="button"
+            className="providersGhost providersIconBtn"
+            onClick={onTest}
+            disabled={testing}
+            title="Test"
+            aria-label="Test"
+          >
+            {testing ? <Loader2 size={16} className="spin" /> : <Zap size={16} />}
           </button>
-          <button type="button" className="providersGhost" onClick={onEdit}>
-            Edit
+          <button
+            type="button"
+            className="providersGhost providersIconBtn"
+            onClick={onEdit}
+            title="Edit"
+            aria-label="Edit"
+          >
+            <Pencil size={16} />
           </button>
-          <button type="button" className="providersGhost danger" onClick={onDelete}>
-            Delete
+          <button
+            type="button"
+            className="providersGhost danger providersIconBtn"
+            onClick={onDelete}
+            title="Delete"
+            aria-label="Delete"
+          >
+            <Trash2 size={16} />
           </button>
         </div>
       </div>
-      <dl className="providerCardFields">
-        {provider.baseUrl && (
-          <div>
-            <dt>Base URL</dt>
-            <dd className="mono">{provider.baseUrl}</dd>
-          </div>
-        )}
-        {provider.apiKey && (
-          <div>
-            <dt>API key</dt>
-            <dd className="mono">{maskKey(provider.apiKey)}</dd>
-          </div>
-        )}
-        {provider.model && (
-          <div>
-            <dt>Model</dt>
-            <dd className="mono">{provider.model}</dd>
-          </div>
-        )}
-      </dl>
       {testResult && (
         <div className={`providerTestResult ${testResult.ok ? "ok" : "fail"}`}>
           {testResult.ok ? <Check size={13} /> : <AlertTriangle size={13} />}
@@ -2227,19 +2218,6 @@ function ProviderEditor({
   );
 }
 
-function customProviderHint(app: CliApp): string {
-  switch (app) {
-    case "claude":
-      return "Writes ~/.claude/settings.json env block (ANTHROPIC_BASE_URL + auth token + model).";
-    case "codex":
-      return "Writes ~/.codex/auth.json (OPENAI_API_KEY) + ~/.codex/config.toml ([model_providers.termory] block).";
-    case "gemini":
-      return "Writes ~/.gemini/.env (GOOGLE_GEMINI_BASE_URL + GEMINI_API_KEY), file mode 0600.";
-    case "opencode":
-      return "Writes ~/.config/opencode/opencode.json provider.<termory-id> block (npm + name + options.{baseURL, apiKey} + models). auth.json is left untouched for /connect.";
-  }
-}
-
 function baseUrlPlaceholder(app: CliApp): string {
   switch (app) {
     case "claude":
@@ -2256,27 +2234,18 @@ function baseUrlPlaceholder(app: CliApp): string {
 function baseUrlHelp(app: CliApp): string {
   switch (app) {
     case "claude":
-      return "Hits ANTHROPIC_BASE_URL. Don't include /v1 — Claude appends it.";
+      return "Don't include /v1 — Claude appends it.";
     case "codex":
-      return "Include /v1 (Codex uses it as model_providers.<id>.base_url verbatim).";
+      return "Include /v1 at the end of the URL.";
     case "gemini":
-      return "Triggers Gemini's GATEWAY mode via GOOGLE_GEMINI_BASE_URL env var.";
+      return "The base URL of your provider's API.";
     case "opencode":
-      return "Goes to provider.termory.options.baseURL. Use the OpenAI/Anthropic-compatible root URL.";
+      return "Use the provider's OpenAI/Anthropic-compatible root URL.";
   }
 }
 
-function apiKeyHelp(app: CliApp): string {
-  switch (app) {
-    case "claude":
-      return "Stored in ~/.claude/settings.json env block.";
-    case "codex":
-      return "Stored in ~/.codex/auth.json under OPENAI_API_KEY.";
-    case "gemini":
-      return "Stored in ~/.gemini/.env (chmod 600).";
-    case "opencode":
-      return "Stored in opencode.json under provider.termory.options.apiKey.";
-  }
+function apiKeyHelp(_app: CliApp): string {
+  return "Stored locally on this machine and only sent to the provider you choose.";
 }
 
 

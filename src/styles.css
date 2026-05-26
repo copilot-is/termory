@@ -1586,14 +1586,34 @@ input {
   background: #f5f7f8;
 }
 
-.providersTabs {
+.providersTabsRow {
   display: flex;
-  align-items: stretch;
+  align-items: center;
+  gap: 12px;
   padding: 0 24px;
   background: #ffffff;
   border-bottom: 1px solid #e1e6e8;
+}
+
+.providersTabs {
+  flex: 1;
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
   overflow-x: auto;
   scrollbar-width: thin;
+}
+
+.providersPrimary.providersAdd {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  margin: 0 14px;
+  border-radius: 50%;
 }
 
 .providersTab {
@@ -1770,34 +1790,6 @@ input {
   color: #8b2f2f;
 }
 
-.providersSection {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.providersSectionHeader {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.providersSectionHeader h3 {
-  margin: 0;
-  font-size: 14px;
-  color: #1d2025;
-  font-weight: 600;
-}
-
-.providersSectionHint {
-  flex: 1;
-  min-width: 0;
-  color: #5b696c;
-  font-size: 12px;
-  line-height: 1.5;
-}
-
 .providersList {
   display: flex;
   flex-direction: column;
@@ -1815,16 +1807,25 @@ input {
 }
 
 .providerCard.active {
+  background: #f0f7f6;
   border-color: #1f6f68;
-  box-shadow: 0 0 0 3px rgba(31, 111, 104, 0.08);
 }
 
-.providerCardHeader {
+.providerCardMain {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
+  min-height: 28px;
+}
+
+.providerCardContent {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .providerCardTitle {
@@ -1837,12 +1838,6 @@ input {
   margin: 0;
   font-size: 14.5px;
   color: #1d2025;
-}
-
-.providerCardAuthBadge {
-  color: #758184;
-  font-size: 12px;
-  font-weight: 400;
 }
 
 .providerActiveDot {
@@ -1867,12 +1862,6 @@ input {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-}
-
-.providerCardSubtitle {
-  margin: 0;
-  color: #5b696c;
-  font-size: 12.5px;
 }
 
 .providerCardFields {
@@ -1969,6 +1958,21 @@ input {
 .providersGhost:hover { background: #eef3f2; }
 .providersGhost.danger { color: #8b2f2f; }
 .providersGhost.danger:hover { background: #fbeded; }
+
+.providersGhost.providersIconBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 6px;
+}
+
+.providersGhost.providersIconBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 
 /* Editor modal */
 
