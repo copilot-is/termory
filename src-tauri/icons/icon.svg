@@ -1,25 +1,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
   <defs>
-    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#ffffff"/>
-      <stop offset="1" stop-color="#eef3f7"/>
-    </linearGradient>
-
-    <linearGradient id="chevGrad" x1="0" y1="430" x2="0" y2="640" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#3a9aff"/>
-      <stop offset="1" stop-color="#005ac2"/>
-    </linearGradient>
-
-    <linearGradient id="sheenGrad" x1="0" y1="0" x2="0" y2="600" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#ffffff" stop-opacity="0.5"/>
+    <linearGradient id="sheenGrad" x1="0" y1="0" x2="0" y2="640" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.35"/>
       <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
     </linearGradient>
 
-    <filter id="chevShadow" filterUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+    <filter id="cardShadow" filterUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
       <feGaussianBlur in="SourceAlpha" stdDeviation="8"/>
       <feOffset dx="0" dy="8"/>
       <feComponentTransfer>
-        <feFuncA type="linear" slope="0.2"/>
+        <feFuncA type="linear" slope="0.25"/>
       </feComponentTransfer>
       <feMerge>
         <feMergeNode/>
@@ -28,20 +18,18 @@
     </filter>
   </defs>
 
-  <rect width="1024" height="1024" rx="229" fill="url(#bgGrad)"/>
+  <rect width="1024" height="1024" rx="229" fill="#0585F7"/>
   <rect width="1024" height="1024" rx="229" fill="url(#sheenGrad)"/>
 
-  <g filter="url(#chevShadow)">
-    <path d="M 281 431 L 425 527 L 281 623"
-          stroke="url(#chevGrad)" stroke-width="72"
+  <g filter="url(#cardShadow)">
+    <rect x="302" y="272" width="540" height="360" rx="44" fill="#ffffff" opacity="0.45"/>
+    <rect x="242" y="332" width="540" height="360" rx="44" fill="#ffffff" opacity="0.70"/>
+    <rect x="182" y="392" width="540" height="360" rx="44" fill="#ffffff"/>
+
+    <path d="M 260 492 L 380 572 L 260 652"
+          stroke="#007AFF" stroke-width="36"
           fill="none" stroke-linecap="round" stroke-linejoin="round"/>
 
-    <path d="M 501 459 L 609 527 L 501 595"
-          stroke="url(#chevGrad)" stroke-width="52"
-          fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-
-    <path d="M 681 487 L 761 527 L 681 567"
-          stroke="url(#chevGrad)" stroke-width="36"
-          fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="420" y="634" width="180" height="24" rx="8" fill="#007AFF"/>
   </g>
 </svg>
