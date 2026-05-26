@@ -23,6 +23,12 @@ pub struct AppSession {
     pub updated_at: Option<String>,
     pub message_count: usize,
     pub preview: String,
+    /// One-line content hint shown beneath the project on list cards.
+    /// For sessions: the last (or first) user prompt, trimmed and
+    /// single-lined. For Memory/Skill: the first non-empty body line.
+    /// Empty when nothing reasonable could be extracted.
+    #[serde(default)]
+    pub snippet: String,
     pub message_previews: Vec<SessionMessage>,
 }
 
@@ -228,12 +234,10 @@ fn merge_tool_outputs(messages: Vec<SessionMessage>) -> Vec<SessionMessage> {
                     if is_read {
                         let line_count = trimmed.lines().count();
                         let label = if line_count == 1 { "line" } else { "lines" };
-                        msg.text.push_str(&format!(
-                            "\n\n⎿ Read **{line_count}** {label}"
-                        ));
+                        msg.text
+                            .push_str(&format!("\n\n⎿ Read **{line_count}** {label}"));
                         if !trimmed.is_empty() {
-                            msg.text
-                                .push_str(&format!("\n\n````\n{trimmed}\n````"));
+                            msg.text.push_str(&format!("\n\n````\n{trimmed}\n````"));
                         }
                         return Some(msg);
                     }
@@ -244,8 +248,7 @@ fn merge_tool_outputs(messages: Vec<SessionMessage>) -> Vec<SessionMessage> {
                         if let Some((summary, rest)) = claude_split_grep_summary(trimmed) {
                             msg.text.push_str(&format!("\n\n⎿ {summary}"));
                             if !rest.is_empty() {
-                                msg.text
-                                    .push_str(&format!("\n\n````\n{rest}\n````"));
+                                msg.text.push_str(&format!("\n\n````\n{rest}\n````"));
                             }
                             return Some(msg);
                         }
@@ -261,11 +264,9 @@ fn merge_tool_outputs(messages: Vec<SessionMessage>) -> Vec<SessionMessage> {
                         msg.text.push_str("\n\n");
                         match *exit_code {
                             Some(code) if code != 0 => {
-                                msg.text
-                                    .push_str(&format!("⎿ Error: Exit code {code}"));
+                                msg.text.push_str(&format!("⎿ Error: Exit code {code}"));
                                 if !trimmed.is_empty() {
-                                    msg.text
-                                        .push_str(&format!("\n\n````\n{trimmed}\n````"));
+                                    msg.text.push_str(&format!("\n\n````\n{trimmed}\n````"));
                                 }
                             }
                             _ => {
@@ -278,18 +279,26 @@ fn merge_tool_outputs(messages: Vec<SessionMessage>) -> Vec<SessionMessage> {
                         }
                         return Some(msg);
                     }
-                    // Generic success: when the tool_result body is
-                    // already markdown (structured-result builders emit
-                    // a `... **bold** ...\n\n```fence`), append it as
-                    // a markdown paragraph. Otherwise emit a plain
-                    // 4-backtick fence — no `⎿` inside, so monospace
-                    // alignment is the browser's native fence behavior
-                    // and not dependent on U+23BF rendering width.
+                    // Generic success: when the tool_result body was
+                    // pre-formatted by a structured-result builder
+                    // (Edit / WebFetch / NotebookEdit / Worktree /
+                    // Config / ScheduleCron — all return `⎿ summary
+                    // ...\n\n```fence`), pass it through verbatim. A
+                    // body that begins with a code fence is also
+                    // already-markdown. Everything else (raw shell
+                    // output, etc.) goes into a plain 4-backtick fence.
+                    //
+                    // The `⎿ ` start-anchor is the strict signal —
+                    // earlier heuristics that triggered on `**`
+                    // anywhere in the body misfired on shell output
+                    // containing `/**` JSDoc comments, `**kwargs`,
+                    // emphasis examples in docs, etc., causing the
+                    // whole block to render as paragraphs instead of
+                    // monospace code.
                     if !trimmed.is_empty() {
                         msg.text.push_str("\n\n");
-                        let already_markdown = trimmed.starts_with("```")
-                            || trimmed.contains("\n```")
-                            || trimmed.contains("**");
+                        let already_markdown =
+                            trimmed.starts_with("⎿ ") || trimmed.starts_with("```");
                         if already_markdown {
                             msg.text.push_str(trimmed);
                         } else {
@@ -526,6 +535,7 @@ fn scan_codex_state_db(path: &Path) -> Result<Vec<AppSession>, Box<dyn Error>> {
             .or_else(|| codex_display_title(&first_user_message))
             .unwrap_or_default();
         let message_count = estimate_codex_message_count(Path::new(&rollout_path));
+        let snippet = snippet_line(&first_user_message);
 
         Ok(AppSession {
             id: id.clone(),
@@ -537,6 +547,7 @@ fn scan_codex_state_db(path: &Path) -> Result<Vec<AppSession>, Box<dyn Error>> {
             updated_at: normalize_time(updated_at.to_string()),
             message_count,
             preview: String::new(),
+            snippet,
             message_previews: Vec::new(),
         })
     })?;
@@ -1397,12 +1408,24 @@ fn doc_session_from_file(path: &Path, project: &str, source: &str) -> Option<App
     let updated_at = file_time(path, true);
     let started_at = file_time(path, false);
     let preview = if !description.is_empty() {
-        description
+        description.clone()
     } else if !mem_type.is_empty() {
-        mem_type
+        mem_type.clone()
     } else {
         memory_tool_for_file(&file_name).to_string()
     };
+    // Snippet: prefer the `description:` frontmatter (already a
+    // human-curated summary) over the raw body's first line.
+    let snippet_source = if !description.is_empty() {
+        description
+    } else {
+        body.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let snippet = snippet_line(&snippet_source);
     Some(AppSession {
         id,
         source: source.to_string(),
@@ -1413,6 +1436,7 @@ fn doc_session_from_file(path: &Path, project: &str, source: &str) -> Option<App
         updated_at,
         message_count: if body_is_empty { 0 } else { 1 },
         preview,
+        snippet,
         message_previews: Vec::new(),
     })
 }
@@ -1510,6 +1534,15 @@ fn parse_doc_file(path: &Path, source: &str) -> Result<SessionDetail, Box<dyn Er
         body_text.to_string()
     };
 
+    let snippet_source = if !description.is_empty() {
+        description.clone()
+    } else {
+        body.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or_default()
+            .to_string()
+    };
     let session = AppSession {
         id: name.clone(),
         source: source.to_string(),
@@ -1520,6 +1553,7 @@ fn parse_doc_file(path: &Path, source: &str) -> Result<SessionDetail, Box<dyn Er
         updated_at: updated_at.clone(),
         message_count: 1,
         preview: description,
+        snippet: snippet_line(&snippet_source),
         message_previews: Vec::new(),
     };
     let role = if !mem_type.is_empty() {
@@ -1704,15 +1738,26 @@ fn parse_claude_lite_session(
         .or_else(|| extract_last_json_string_field(&lite.tail, "aiTitle"))
         .or_else(|| extract_last_json_string_field(&lite.head, "aiTitle"));
     let first_prompt = extract_claude_first_prompt_from_head(&lite.head);
+    let last_prompt = extract_last_json_string_field(&lite.tail, "lastPrompt");
     let summary = custom_or_ai_title
-        .or_else(|| extract_last_json_string_field(&lite.tail, "lastPrompt"))
+        .or_else(|| last_prompt.clone())
         .or_else(|| extract_last_json_string_field(&lite.tail, "summary"))
-        .or(first_prompt)
+        .or(first_prompt.clone())
         .filter(|summary| !summary.trim().is_empty())
         .ok_or("Claude metadata-only session is hidden from resume")?;
     let project = extract_json_string_field(&lite.head, "cwd")
         .or_else(|| project_path.map(ToString::to_string))
         .unwrap_or_default();
+    // Snippet for the list card: the latest user prompt is most
+    // informative ("what was this conversation just about?"); fall
+    // back to the first prompt for short sessions that have no
+    // separate lastPrompt yet.
+    let snippet = snippet_line(
+        last_prompt
+            .as_deref()
+            .or(first_prompt.as_deref())
+            .unwrap_or(""),
+    );
 
     Ok(AppSession {
         id: session_id.clone(),
@@ -1726,6 +1771,7 @@ fn parse_claude_lite_session(
         updated_at: Some(system_time_to_iso(lite.mtime)),
         message_count: estimate_claude_message_count(path),
         preview: String::new(),
+        snippet,
         message_previews: Vec::new(),
     })
 }
@@ -3061,6 +3107,7 @@ fn codex_thread_from_state(id: &str) -> Result<AppSession, Box<dyn Error>> {
         let display_title = codex_display_title(&title)
             .or_else(|| codex_display_title(&first_user_message))
             .unwrap_or_default();
+        let snippet = snippet_line(&first_user_message);
         Ok(AppSession {
             id,
             source: "Codex".to_string(),
@@ -3071,6 +3118,7 @@ fn codex_thread_from_state(id: &str) -> Result<AppSession, Box<dyn Error>> {
             updated_at: normalize_time(updated_at.to_string()),
             message_count: 0,
             preview: String::new(),
+            snippet,
             message_previews: Vec::new(),
         })
     })?;
@@ -3093,6 +3141,11 @@ fn scan_opencode_db(path: &Path) -> Result<Vec<AppSession>, Box<dyn Error>> {
         let created_raw: i64 = row.get(3)?;
         let updated_raw: i64 = row.get(4)?;
         let message_count = count_opencode_visible_messages(&conn, &id).unwrap_or(0);
+        // OpenCode's `session.title` is an auto-summarized prompt
+        // (matches what the user sees in their TUI); reusing it as
+        // the snippet keeps the card informative without a second
+        // query per session.
+        let snippet = snippet_line(&opencode_display_title(&title));
         Ok(AppSession {
             id: id.clone(),
             source: "OpenCode".to_string(),
@@ -3103,6 +3156,7 @@ fn scan_opencode_db(path: &Path) -> Result<Vec<AppSession>, Box<dyn Error>> {
             updated_at: normalize_time(updated_raw.to_string()),
             message_count,
             preview: String::new(),
+            snippet,
             message_previews: Vec::new(),
         })
     })?;
@@ -3152,6 +3206,7 @@ fn opencode_session_from_db(
                 let title: String = row.get(2)?;
                 let created_raw: i64 = row.get(3)?;
                 let updated_raw: i64 = row.get(4)?;
+                let snippet = snippet_line(&opencode_display_title(&title));
                 Ok(AppSession {
                     id: id.clone(),
                     source: "OpenCode".to_string(),
@@ -3162,6 +3217,7 @@ fn opencode_session_from_db(
                     updated_at: normalize_time(updated_raw.to_string()),
                     message_count: 0,
                     preview: String::new(),
+                    snippet,
                     message_previews: Vec::new(),
                 })
             },
@@ -3239,10 +3295,11 @@ fn read_opencode_db_messages(
             let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
             match part_type {
                 "text" => {
-                    // Skip synthetic env / tool-ack injections.
-                    if part.get("synthetic").and_then(Value::as_bool) == Some(true) {
-                        continue;
-                    }
+                    // OpenCode TUI hides `synthetic: true` text parts
+                    // (env / tool-ack injections). Termory surfaces them
+                    // as `*[synthetic]* {body}` so the transcript shows
+                    // every part recorded in the database.
+                    let synthetic = part.get("synthetic").and_then(Value::as_bool) == Some(true);
                     let Some(text) = part.get("text").and_then(value_to_string) else {
                         continue;
                     };
@@ -3250,9 +3307,14 @@ fn read_opencode_db_messages(
                     if trimmed.is_empty() {
                         continue;
                     }
+                    let display = if synthetic {
+                        format!("*[synthetic]* {trimmed}")
+                    } else {
+                        trimmed.to_string()
+                    };
                     out.push(SessionMessage {
                         role: role.clone(),
-                        text: trimmed.to_string(),
+                        text: display,
                         timestamp: timestamp.clone(),
                         kind: kind::TEXT.to_string(),
                         tool_use_id: None,
@@ -3410,9 +3472,31 @@ fn opencode_v2_message_from_value(value: &Value, created: i64) -> Option<Session
                 exit_code: None,
             })
         }
-        // session-v2.tsx:105-107 — synthetic messages render nothing
-        // in the TUI; drop them silently.
-        "synthetic" => None,
+        // session-v2.tsx:105-107 — OpenCode TUI hides synthetic
+        // messages; Termory surfaces them as `*[synthetic]*` notices
+        // so the transcript shows every recorded part. The full body
+        // is included when present so the user can see what was
+        // injected (env, tool acks, etc.).
+        "synthetic" => {
+            let body = value
+                .get("content")
+                .or_else(|| value.get("text"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let text = match body {
+                Some(b) => format!("*[synthetic]*\n\n{b}"),
+                None => "*[synthetic]*".to_string(),
+            };
+            Some(SessionMessage {
+                role: "system".to_string(),
+                text,
+                timestamp,
+                kind: kind::TEXT.to_string(),
+                tool_use_id: None,
+                exit_code: None,
+            })
+        }
         "shell" => {
             let command = value.get("command").and_then(value_to_string)?;
             let mut lines = vec![format!("$ {command}")];
@@ -4078,6 +4162,33 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
+/// Collapse a multi-line / messy string into a single, trimmed,
+/// length-capped line suitable for the list-card snippet row.
+/// Returns empty string on empty input so callers can drop it cleanly.
+fn snippet_line(raw: &str) -> String {
+    const MAX: usize = 120;
+    let mut buf = String::new();
+    let mut prev_space = false;
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            if !buf.is_empty() && !prev_space {
+                buf.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        buf.push(ch);
+        prev_space = false;
+    }
+    let trimmed = buf.trim_end().to_string();
+    if trimmed.chars().count() <= MAX {
+        return trimmed;
+    }
+    let mut out: String = trimmed.chars().take(MAX).collect();
+    out.push('…');
+    out
+}
+
 fn todo_icon(status: &str) -> &'static str {
     // Matches packages/opencode/src/cli/cmd/tui/feature-plugins/system/session-v2.tsx
     // (todoIcon helper) — ✓ completed, ~ in_progress, ✕ cancelled, ☐ pending.
@@ -4335,6 +4446,16 @@ fn detail_from_messages(
         .filter_map(|t| normalize_time(t.clone()))
         .max();
     let title = explicit_title.unwrap_or_default();
+    // Snippet for the list card: prefer the latest user message in the
+    // parsed transcript (last what the human said), falling back to the
+    // first. Empty when no user messages are present.
+    let snippet = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .or_else(|| messages.iter().find(|m| m.role == "user"))
+        .map(|m| snippet_line(&m.text))
+        .unwrap_or_default();
 
     SessionDetail {
         session: AppSession {
@@ -4347,6 +4468,7 @@ fn detail_from_messages(
             updated_at,
             message_count: messages.len(),
             preview: String::new(),
+            snippet,
             message_previews: Vec::new(),
         },
         messages,
@@ -4454,12 +4576,29 @@ fn claude_message_from_value(value: &Value) -> Vec<SessionMessage> {
 
     match entry_type {
         "user" => {
-            if value.get("isMeta").and_then(Value::as_bool) == Some(true) {
-                return out;
-            }
+            // Claude TUI hides `isMeta: true` user messages (synthetic
+            // wrappers like `<local-command-caveat>` injected by the
+            // CLI). Termory shows them as italic notices so the user
+            // can see what was sent. The wrapped content itself is
+            // surfaced via claude_display_text's wrapper handling.
+            let is_meta = value.get("isMeta").and_then(Value::as_bool) == Some(true);
             let Some(content) = value.get("message").and_then(|m| m.get("content")) else {
                 return out;
             };
+            if is_meta {
+                let text = claude_text_blocks(content).join("\n");
+                if let Some(display) = claude_display_text(&text) {
+                    out.push(SessionMessage {
+                        role: "system".to_string(),
+                        text: format!("*[meta]* {display}"),
+                        timestamp: timestamp.clone(),
+                        kind: kind::TEXT.to_string(),
+                        tool_use_id: None,
+                        exit_code: None,
+                    });
+                }
+                return out;
+            }
             // 1. Plain text portion (skipped when empty).
             let text = claude_text_blocks(content).join("\n");
             if !text.trim().is_empty() {
@@ -4496,9 +4635,8 @@ fn claude_message_from_value(value: &Value) -> Vec<SessionMessage> {
             let tool_use_result = value.get("toolUseResult");
             let diff_text = tool_use_result.and_then(claude_format_structured_patch);
             for tool_result in claude_tool_results(content) {
-                let structured = tool_use_result.and_then(|tur| {
-                    claude_format_structured_result(tur, &tool_result.text)
-                });
+                let structured = tool_use_result
+                    .and_then(|tur| claude_format_structured_result(tur, &tool_result.text));
                 let body_text = diff_text
                     .clone()
                     .filter(|_| !tool_result.is_error)
@@ -4721,7 +4859,10 @@ fn claude_attachment_messages(value: &Value, timestamp: Option<String>) -> Vec<S
         .unwrap_or("");
     match att_type {
         // AttachmentMessage.tsx:163-168
-        "directory" => push(format!("Listed directory {}", wrap_inline_code(&format!("{display_path}/")))),
+        "directory" => push(format!(
+            "Listed directory {}",
+            wrap_inline_code(&format!("{display_path}/"))
+        )),
         // AttachmentMessage.tsx:169-194
         "file" | "already_read_file" => {
             let content = att.get("content");
@@ -4775,15 +4916,13 @@ fn claude_attachment_messages(value: &Value, timestamp: Option<String>) -> Vec<S
             }
         }
         // AttachmentMessage.tsx:195-200
-        "compact_file_reference" => {
-            push(format!("Referenced file {}", wrap_inline_code(display_path)))
-        }
+        "compact_file_reference" => push(format!(
+            "Referenced file {}",
+            wrap_inline_code(display_path)
+        )),
         // AttachmentMessage.tsx:201-207
         "pdf_reference" => {
-            let pages = att
-                .get("pageCount")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
+            let pages = att.get("pageCount").and_then(Value::as_i64).unwrap_or(0);
             push(format!(
                 "Referenced PDF {} ({pages} pages)",
                 wrap_inline_code(display_path)
@@ -4834,9 +4973,7 @@ fn claude_attachment_messages(value: &Value, timestamp: Option<String>) -> Vec<S
             if text.trim().is_empty() {
                 Vec::new()
             } else {
-                claude_display_text(&text)
-                    .map(push)
-                    .unwrap_or_default()
+                claude_display_text(&text).map(push).unwrap_or_default()
             }
         }
         // AttachmentMessage.tsx:324-329
@@ -4876,21 +5013,218 @@ fn claude_attachment_messages(value: &Value, timestamp: Option<String>) -> Vec<S
                 wrap_inline_code(name)
             ))
         }
-        // NULL_RENDERING per nullRenderingAttachments.ts:14-49 and
-        // explicit returns in AttachmentMessage.tsx — drop silently.
-        "task_reminder"
-        | "deferred_tools_delta"
-        | "command_permissions"
-        | "date_change"
-        | "hook_success"
-        | "async_hook_response"
-        | "agent_setting"
-        | "relevant_memories" // Usually absorbed into a CollapsedReadSearchGroup; safe to drop for now
-        | "dynamic_skill"
-        | "agent_listing_delta" => Vec::new(),
-        // Unknown attachment type — drop (matches Claude TUI's
-        // `_exhaustive` fall-through).
-        _ => Vec::new(),
+        // `date_change`: `{newDate: "2026-05-25"}` — Claude TUI hides
+        // (NULL_RENDERING). Termory surfaces the new date inline.
+        "date_change" => {
+            let date = att
+                .get("newDate")
+                .and_then(Value::as_str)
+                .unwrap_or("(unknown)");
+            push(format!("*[date changed to {date}]*"))
+        }
+        // `auto_mode`: `{}` — flag-only attachment indicating auto
+        // mode toggled on. Show as a single italic notice.
+        "auto_mode" => push("*[auto mode]*".to_string()),
+        // `deferred_tools_delta`: `{addedNames: [...], removedNames?: [...]}`
+        // — Claude TUI hides. Termory surfaces a count + truncated
+        // list so the user can see what changed without a wall of text.
+        "deferred_tools_delta" => {
+            let added = att
+                .get("addedNames")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let removed = att
+                .get("removedNames")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut text = String::from("**Deferred tools changed**");
+            if !added.is_empty() {
+                text.push_str(&format!(
+                    "\n\n⎿ Added ({}): {}",
+                    added.len(),
+                    added.join(", ")
+                ));
+            }
+            if !removed.is_empty() {
+                text.push_str(&format!(
+                    "\n\n⎿ Removed ({}): {}",
+                    removed.len(),
+                    removed.join(", ")
+                ));
+            }
+            push(text)
+        }
+        // `task_reminder`: `{content: [...], itemCount: N}` — Claude
+        // TUI hides. When `content` has items, render them; otherwise
+        // just show the count so the empty case is still visible.
+        "task_reminder" => {
+            let count = att.get("itemCount").and_then(Value::as_i64).unwrap_or(0);
+            let items: Vec<String> = att
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            v.get("content")
+                                .and_then(Value::as_str)
+                                .or_else(|| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut text = format!("**Task reminder** ({count} items)");
+            for item in items {
+                text.push_str(&format!("\n\n⎿ {item}"));
+            }
+            push(text)
+        }
+        // `command_permissions`: `{allowedTools: [...]}` — Claude TUI
+        // hides (SkillTool renders the success message instead).
+        "command_permissions" => {
+            let tools: Vec<String> = att
+                .get("allowedTools")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let text = if tools.is_empty() {
+                "*[command permissions: none allowed]*".to_string()
+            } else {
+                format!(
+                    "**Command permissions** ({} allowed)\n\n⎿ {}",
+                    tools.len(),
+                    tools.join(", ")
+                )
+            };
+            push(text)
+        }
+        // `edited_text_file`: `{filename, snippet}` — context Claude
+        // sends back to the model showing recent edits. Surface so the
+        // user sees what the model saw.
+        "edited_text_file" => {
+            let filename = att.get("filename").and_then(Value::as_str).unwrap_or("");
+            let snippet = att.get("snippet").and_then(Value::as_str);
+            let mut text = format!("**Edited text file**({})", wrap_inline_code(filename));
+            if let Some(s) = snippet.map(str::trim).filter(|s| !s.is_empty()) {
+                text.push_str(&format!("\n\n````\n{s}\n````"));
+            }
+            push(text)
+        }
+        // `plan_mode` / `plan_mode_exit`: `{planFilePath, planExists,
+        // reminderType?, isSubAgent?}` — plan-mode lifecycle markers.
+        // Claude TUI hides these; Termory surfaces the plan path so
+        // the user can see which plan was entered/exited.
+        "plan_mode" | "plan_mode_exit" => {
+            let verb = if att_type == "plan_mode" {
+                "Entered plan mode"
+            } else {
+                "Exited plan mode"
+            };
+            let plan_path = att
+                .get("planFilePath")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let exists = att.get("planExists").and_then(Value::as_bool);
+            let mut text = format!("**{verb}**");
+            if let Some(p) = plan_path {
+                text.push_str(&format!("\n\n⎿ {}", wrap_inline_code(p)));
+            }
+            if exists == Some(false) {
+                text.push_str("\n\n⎿ *(plan file does not exist yet)*");
+            }
+            push(text)
+        }
+        // Goal-mode sentinel attachments. Two flavors observed in real
+        // sessions:
+        //   sentinel:true, met:false → goal was just set (initial)
+        //   met:true → goal was checked and satisfied (with reason +
+        //              stats: iterations, durationMs, tokens)
+        //   met:false, sentinel missing → goal was checked, not met
+        //              (failure with reason)
+        "goal_status" => {
+            let condition = att
+                .get("condition")
+                .and_then(Value::as_str)
+                .unwrap_or("(no condition)");
+            let met = att.get("met").and_then(Value::as_bool).unwrap_or(false);
+            let sentinel = att
+                .get("sentinel")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let reason = att.get("reason").and_then(Value::as_str);
+            let iterations = att.get("iterations").and_then(Value::as_i64);
+            let duration_ms = att.get("durationMs").and_then(Value::as_i64);
+            let tokens = att.get("tokens").and_then(Value::as_i64);
+            if sentinel && !met {
+                push(format!("**Goal set**\n\n⎿ {condition}"))
+            } else {
+                let verb = if met { "Goal met" } else { "Goal not met" };
+                let mut stats: Vec<String> = Vec::new();
+                if let Some(n) = iterations {
+                    stats.push(format!("{n} iter"));
+                }
+                if let Some(ms) = duration_ms {
+                    stats.push(format_duration_short(ms));
+                }
+                if let Some(t) = tokens {
+                    stats.push(format!("{t} tokens"));
+                }
+                let header = if stats.is_empty() {
+                    format!("**{verb}**")
+                } else {
+                    format!("**{verb}** ({})", stats.join(", "))
+                };
+                let mut text = format!("{header}\n\n⎿ {condition}");
+                if let Some(r) = reason {
+                    text.push_str(&format!("\n\n⎿ {r}"));
+                }
+                push(text)
+            }
+        }
+        // Any other attachment type (NULL_RENDERING ones that Claude
+        // TUI silently drops, plus types we don't have a specialized
+        // formatter for yet) — surface the type name AND a compact
+        // JSON dump of the remaining fields so payload data isn't lost.
+        // Termory's history-browser promise: nothing on disk should
+        // vanish silently. Even if we don't know how to format
+        // `hook_success` / `async_hook_response` / `dynamic_skill`
+        // nicely, the user can read the raw fields.
+        other => {
+            let mut extras = serde_json::Map::new();
+            if let Some(obj) = att.as_object() {
+                for (k, v) in obj {
+                    if k == "type" {
+                        continue;
+                    }
+                    extras.insert(k.clone(), v.clone());
+                }
+            }
+            let header = format!("*[attachment: {other}]*");
+            if extras.is_empty() {
+                push(header)
+            } else {
+                let payload =
+                    serde_json::to_string_pretty(&Value::Object(extras)).unwrap_or_default();
+                push(format!("{header}\n\n````json\n{payload}\n````"))
+            }
+        }
     }
 }
 
@@ -4944,9 +5278,9 @@ fn claude_format_structured_patch(tool_use_result: &Value) -> Option<String> {
     }
     // Summary line above the fence. Mirrors FileEditToolUpdatedMessage
     // (`components/FileEditToolUpdatedMessage.tsx:38-54`): only the
-    // counts are bolded. `merge_tool_outputs` prepends the `⎿ ` hang-
-    // indent marker when merging via the `already_markdown` path.
-    let mut out = String::new();
+    // counts are bolded. Every Termory tool summary starts with `⎿ `
+    // (locked rule — see CLAUDE.md "Unified tool-message format").
+    let mut out = String::from("⎿ ");
     let added_label = if added == 1 { "line" } else { "lines" };
     let removed_label = if removed == 1 { "line" } else { "lines" };
     if added > 0 && removed > 0 {
@@ -4984,10 +5318,7 @@ fn claude_format_structured_result(
 /// {codeText})` summary + 4-backtick fence with the fetched body. The
 /// `\n\n````` separator makes `merge_tool_outputs` treat the whole
 /// thing as `already_markdown` so the bold renders outside the fence.
-fn claude_format_webfetch_body(
-    tool_use_result: &Value,
-    fallback_content: &str,
-) -> Option<String> {
+fn claude_format_webfetch_body(tool_use_result: &Value, fallback_content: &str) -> Option<String> {
     let bytes = tool_use_result.get("bytes").and_then(Value::as_u64)?;
     let size = claude_format_file_size(bytes);
     let code = tool_use_result.get("code").and_then(Value::as_i64);
@@ -5002,7 +5333,7 @@ fn claude_format_webfetch_body(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| fallback_content.trim());
-    let mut out = format!("Received **{size}**");
+    let mut out = format!("⎿ Received **{size}**");
     match (code, code_text) {
         (Some(c), Some(t)) => out.push_str(&format!(" ({c} {t})")),
         (Some(c), None) => out.push_str(&format!(" ({c})")),
@@ -5037,7 +5368,7 @@ fn claude_format_file_size(bytes: u64) -> String {
 /// `Updated cell **{cell_id}**` + fenced `new_source` preview.
 fn claude_format_notebook_edit_body(tool_use_result: &Value) -> Option<String> {
     let cell_id = tool_use_result.get("cell_id").and_then(Value::as_str)?;
-    let mut out = format!("Updated cell **{cell_id}**");
+    let mut out = format!("⎿ Updated cell **{cell_id}**");
     if let Some(src) = tool_use_result
         .get("new_source")
         .and_then(Value::as_str)
@@ -5054,7 +5385,9 @@ fn claude_format_notebook_edit_body(tool_use_result: &Value) -> Option<String> {
 /// EnterWorktree / ExitWorktree: distinguished by `worktreePath`
 /// (enter) vs `originalCwd` (exit).
 fn claude_format_worktree_body(tool_use_result: &Value) -> Option<String> {
-    let branch = tool_use_result.get("worktreeBranch").and_then(Value::as_str)?;
+    let branch = tool_use_result
+        .get("worktreeBranch")
+        .and_then(Value::as_str)?;
     let path = tool_use_result
         .get("worktreePath")
         .and_then(Value::as_str)
@@ -5066,11 +5399,11 @@ fn claude_format_worktree_body(tool_use_result: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let mut out = if path.is_some() {
-        format!("Switched to worktree on branch **{branch}**")
+        format!("⎿ Switched to worktree on branch **{branch}**")
     } else if original_cwd.is_some() {
-        format!("Exited worktree (branch **{branch}**)")
+        format!("⎿ Exited worktree (branch **{branch}**)")
     } else {
-        format!("Worktree branch **{branch}**")
+        format!("⎿ Worktree branch **{branch}**")
     };
     if let Some(p) = path {
         out.push_str(&format!("\n\n⎿ {p}"));
@@ -5090,7 +5423,7 @@ fn claude_format_config_body(tool_use_result: &Value) -> Option<String> {
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("(unknown error)");
-        return Some(format!("Failed: {err}"));
+        return Some(format!("⎿ Failed: {err}"));
     }
     let op = tool_use_result
         .get("operation")
@@ -5101,13 +5434,13 @@ fn claude_format_config_body(tool_use_result: &Value) -> Option<String> {
             .get("value")
             .map(|v| v.to_string())
             .unwrap_or_else(|| "(no value)".to_string());
-        return Some(format!("**{setting}** = {value}"));
+        return Some(format!("⎿ **{setting}** = {value}"));
     }
     let new_value = tool_use_result
         .get("newValue")
         .map(|v| v.to_string())
         .unwrap_or_else(|| "(no value)".to_string());
-    Some(format!("Set **{setting}** to **{new_value}**"))
+    Some(format!("⎿ Set **{setting}** to **{new_value}**"))
 }
 
 /// ScheduleCron create (`ScheduleCronTool/UI.tsx:17-28`):
@@ -5120,7 +5453,7 @@ fn claude_format_schedule_cron_body(tool_use_result: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
-    Some(format!("Scheduled **{id}** ({human})"))
+    Some(format!("⎿ Scheduled **{id}** ({human})"))
 }
 
 /// Split a Grep / Glob tool_result body into `(summary, rest)` where
@@ -5195,8 +5528,8 @@ fn claude_tool_uses(content: &Value) -> Vec<ClaudeToolUse> {
                 return None;
             }
             let input = item.get("input").unwrap_or(&Value::Null);
-            // None → tool suppressed in Claude TUI (userFacingName='' AND
-            // renderToolUseMessage returns null). Skip the whole card.
+            // Termory shows every tool card even when Claude TUI suppresses
+            // it — see specialized branches at the top of claude_tool_use_text.
             let text = claude_tool_use_text(&name, input)?;
             Some(ClaudeToolUse {
                 text,
@@ -5241,27 +5574,100 @@ fn claude_agent_output_task_id(path: &str) -> Option<String> {
     }
 }
 
+/// `TodoWrite` (`TodoWriteTool.ts:15`): input.todos = `[{status, content, ...}]`.
+/// Claude TUI hides this; Termory shows it with the same `✓/~/✕/☐`
+/// glyphs OpenCode TUI uses (matches `todo_icon` helper).
+fn format_todowrite_card(input: &Value) -> String {
+    let mut out = String::from("**Todos**");
+    let Some(todos) = input.get("todos").and_then(Value::as_array) else {
+        return out;
+    };
+    if todos.is_empty() {
+        out.push_str("\n\n⎿ (no todos)");
+        return out;
+    }
+    out.push_str("\n");
+    for todo in todos {
+        let status = todo
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
+        let content = todo
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("(no content)");
+        out.push_str(&format!("\n{} {}", todo_icon(status), content));
+    }
+    out
+}
+
+/// `AskUserQuestion` (`AskUserQuestionTool.tsx:135-149`): input.questions =
+/// `[{question, options: [{label, description?}], multiSelect?}]`. Claude
+/// TUI hides this; Termory renders it as a Q+choices block.
+fn format_ask_user_question_card(input: &Value) -> String {
+    let mut out = String::from("**Ask User Question**");
+    let Some(questions) = input.get("questions").and_then(Value::as_array) else {
+        return out;
+    };
+    for q in questions {
+        let question = q
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or("(no question)");
+        out.push_str(&format!("\n\n⎿ {question}"));
+        if let Some(options) = q.get("options").and_then(Value::as_array) {
+            for opt in options {
+                if let Some(label) = opt.get("label").and_then(Value::as_str) {
+                    out.push_str(&format!("\n  - {label}"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `EnterPlanMode` (`EnterPlanModeTool.ts:29`) / `ExitPlanMode`
+/// (`ExitPlanModeV2Tool.ts:99,112`): both carry either `message` (enter)
+/// or `plan` (exit) as a string. Claude TUI hides these; Termory shows
+/// the body so the transcript records the plan content.
+fn format_plan_mode_card(verb: &str, input: &Value) -> String {
+    let body = input
+        .get("plan")
+        .or_else(|| input.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let mut out = format!("**{verb}**");
+    if let Some(b) = body {
+        out.push_str("\n\n");
+        out.push_str(b);
+    }
+    out
+}
+
 fn claude_tool_use_text(name: &str, input: &Value) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     let obj = input.as_object();
     let get = |key: &str| obj.and_then(|o| o.get(key)).and_then(value_to_string);
     // Tools that Claude TUI suppresses entirely (`userFacingName: ''`
-    // AND `renderToolUseMessage: () => null`). The entire `<bold>x</bold>(args)`
-    // card is hidden. We return None so the caller skips emitting any
-    // SessionMessage. Per `.audit-sources/claude-code/src/tools/`:
-    //   * TodoWriteTool.ts:48,62
-    //   * AskUserQuestionTool.tsx:222-278
-    //   * EnterPlanModeTool.ts:52
-    //   * ExitPlanModeTool.ts / ExitPlanModeV2Tool.ts:163
-    //   * TaskCreateTool.ts:64,77 + sibling TaskUpdate/Get/List/Stop/Output
-    //   * ToolSearchTool.ts:438
-    match lower.as_str() {
-        "todowrite" | "todo_write" | "askuserquestion" | "ask_user_question" | "enterplanmode"
-        | "enter_plan_mode" | "exitplanmode" | "exit_plan_mode" | "exitplanmodev2"
-        | "taskcreate" | "task_create" | "taskupdate" | "task_update" | "taskget" | "task_get"
-        | "tasklist" | "task_list" | "taskstop" | "task_stop" | "taskoutput" | "task_output"
-        | "toolsearch" | "tool_search" => return None,
-        _ => {}
+    // AND `renderToolUseMessage: () => null`) are RENDERED HERE — Termory
+    // is a history browser, so hiding parts of the transcript would be
+    // misleading. We provide compact summaries; full input is rendered
+    // as fallback when no specialized formatter matches.
+    if matches!(lower.as_str(), "todowrite" | "todo_write") {
+        return Some(format_todowrite_card(input));
+    }
+    if matches!(lower.as_str(), "askuserquestion" | "ask_user_question") {
+        return Some(format_ask_user_question_card(input));
+    }
+    if matches!(lower.as_str(), "enterplanmode" | "enter_plan_mode") {
+        return Some(format_plan_mode_card("EnterPlanMode", input));
+    }
+    if matches!(
+        lower.as_str(),
+        "exitplanmode" | "exit_plan_mode" | "exitplanmodev2"
+    ) {
+        return Some(format_plan_mode_card("ExitPlanMode", input));
     }
     // All dynamic arguments (commands, paths, URLs, patterns) are wrapped
     // with `wrap_inline_code` so any markdown special characters inside the
@@ -5306,10 +5712,7 @@ fn claude_tool_use_text(name: &str, input: &Value) -> Option<String> {
                 //   * with limit  → `lines {start}-{start + limit - 1}`
                 //   * without limit but with offset → `from line {start}`
                 //   * neither → no suffix
-                let start: i64 = offset
-                    .as_deref()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1);
+                let start: i64 = offset.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1);
                 let limit_n: Option<i64> = limit.as_deref().and_then(|s| s.parse().ok());
                 if let Some(n) = limit_n {
                     text.push_str(&format!(" · lines {start}-{}", start + n - 1));
@@ -5611,10 +6014,11 @@ fn claude_user_content_is_tool_result_only(value: &Value) -> bool {
 
 fn claude_display_text(text: &str) -> Option<String> {
     let trimmed_full = text.trim();
-    // `(no content)` NO_CONTENT_MESSAGE → drop (UserTextMessage.tsx:48,
-    // constants/messages.ts:1).
+    // `(no content)` NO_CONTENT_MESSAGE: Claude TUI hides; Termory
+    // shows it as an italic placeholder so the transcript still
+    // reflects that an empty message was recorded.
     if trimmed_full == "(no content)" {
-        return None;
+        return Some("*(no content)*".to_string());
     }
     // `[Request interrupted by user]` / `[Request interrupted by user
     // for tool use]` → italic notice (UserTextMessage.tsx:83-92 renders
@@ -5624,14 +6028,26 @@ fn claude_display_text(text: &str) -> Option<String> {
     {
         return Some("*[Interrupted by user]*".to_string());
     }
-    // `<tick>...</tick>` → drop (UserTextMessage.tsx:57-59 returns null).
-    if text.contains("<tick>") {
-        return None;
+    // `<tick>...</tick>` (UserTextMessage.tsx:57-59 returns null) —
+    // Termory unwraps to show the inner text. Empty tick → drop.
+    if let Some(inner) = extract_xml_tag_value(text, "tick") {
+        let inner = inner.trim();
+        return if inner.is_empty() {
+            Some("*[tick]*".to_string())
+        } else {
+            Some(inner.to_string())
+        };
     }
-    // `<local-command-caveat>` → drop (UserTextMessage.tsx:61-64
-    // synthetic caveat, hidden by Claude).
-    if text.contains("<local-command-caveat>") {
-        return None;
+    // `<local-command-caveat>...</local-command-caveat>` — Claude TUI
+    // hides; Termory shows the caveat text wrapped in an italic
+    // notice so the user knows it was a synthetic caveat.
+    if let Some(inner) = extract_xml_tag_value(text, "local-command-caveat") {
+        let inner = inner.trim();
+        return if inner.is_empty() {
+            Some("*[local-command-caveat]*".to_string())
+        } else {
+            Some(format!("*[local-command-caveat]* {inner}"))
+        };
     }
     // `<user-memory-input>...</user-memory-input>` → `\# {content}`
     // memory entry (UserMemoryInputMessage.tsx:21-43 renders the inner
@@ -5714,6 +6130,27 @@ fn claude_display_text(text: &str) -> Option<String> {
     }
     if let Some(stderr) = extract_xml_tag_value(text, "local-command-stderr") {
         return Some(non_empty_xml_value(stderr).unwrap_or_else(|| "(no content)".to_string()));
+    }
+    // Feature-gated wrappers that Claude TUI drops via the generic
+    // strip path. Termory surfaces each one as `*[wrapper-name]* {inner}`
+    // so the transcript records that one was present.
+    for tag in &[
+        "github-webhook-activity",
+        "teammate-message",
+        "fork-boilerplate",
+        "cross-session-message",
+        "channel",
+        "mcp-resource-update",
+        "mcp-polling-update",
+    ] {
+        if let Some(inner) = extract_xml_tag_value(text, tag) {
+            let inner = inner.trim();
+            return Some(if inner.is_empty() {
+                format!("*[{tag}]*")
+            } else {
+                format!("*[{tag}]* {inner}")
+            });
+        }
     }
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -5862,24 +6299,6 @@ fn strip_codex_git_directives(line: &str) -> String {
     }
     visible.push_str(remaining);
     visible
-}
-
-fn is_codex_contextual_user_text(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    [
-        "<environment_context>",
-        "<user_instructions>",
-        "<skill_instructions>",
-        "<user_shell_command>",
-        "<turn_aborted>",
-        "<subagent_notification>",
-        "<goal_context>",
-        "<legacy_unified_exec_process_limit_warning>",
-        "<legacy_apply_patch_exec_command_warning>",
-        "<legacy_model_mismatch_warning>",
-    ]
-    .iter()
-    .any(|tag| trimmed.starts_with(tag))
 }
 
 fn codex_plan_message(payload: &Value, timestamp: Option<String>) -> Option<SessionMessage> {
@@ -6926,11 +7345,26 @@ fn codex_user_message_event(payload: &Value, timestamp: Option<String>) -> Optio
     if message.trim().is_empty() {
         return None;
     }
-    // Codex hides specific contextual user fragments from the visible
-    // transcript (environment_context / user_instructions / ...). Apply the
-    // same filter we use for ResponseItem-derived user messages.
-    if is_codex_contextual_user_text(message) {
-        return None;
+    // Codex TUI hides contextual user fragments (environment_context,
+    // user_instructions, skill_instructions, ...). Termory surfaces
+    // them as system notices so the transcript still shows what the
+    // model received — the user wanted full history visibility.
+    if let Some(tag) = codex_contextual_tag(message) {
+        let inner = extract_xml_tag_value(message, tag).unwrap_or_else(|| message.to_string());
+        let inner = inner.trim();
+        let body = if inner.is_empty() {
+            format!("*[Codex {tag}]*")
+        } else {
+            format!("*[Codex {tag}]*\n\n{inner}")
+        };
+        return Some(SessionMessage {
+            role: "system".to_string(),
+            text: body,
+            timestamp,
+            kind: kind::TEXT.to_string(),
+            tool_use_id: None,
+            exit_code: None,
+        });
     }
     Some(SessionMessage {
         role: "user".to_string(),
@@ -6940,6 +7374,30 @@ fn codex_user_message_event(payload: &Value, timestamp: Option<String>) -> Optio
         tool_use_id: None,
         exit_code: None,
     })
+}
+
+/// Return the wrapper tag name if `text` starts with one of Codex's
+/// known contextual prefixes; otherwise `None`.
+fn codex_contextual_tag(text: &str) -> Option<&'static str> {
+    let trimmed = text.trim_start();
+    for tag in [
+        "environment_context",
+        "user_instructions",
+        "skill_instructions",
+        "user_shell_command",
+        "turn_aborted",
+        "subagent_notification",
+        "goal_context",
+        "legacy_unified_exec_process_limit_warning",
+        "legacy_apply_patch_exec_command_warning",
+        "legacy_model_mismatch_warning",
+    ] {
+        let open = format!("<{tag}>");
+        if trimmed.starts_with(&open) {
+            return Some(tag);
+        }
+    }
+    None
 }
 
 fn codex_agent_message_event(payload: &Value, timestamp: Option<String>) -> Option<SessionMessage> {
@@ -8190,31 +8648,51 @@ mod tests {
         );
 
         // ExitPlanMode / EnterPlanMode / AskUserQuestion / TodoWrite /
-        // Task* / ToolSearch — Claude TUI suppresses these via
-        // `userFacingName: ''` + `renderToolUseMessage: null`. Termory
-        // returns None so no card is emitted.
+        // Task* / ToolSearch — Claude TUI suppresses these but Termory
+        // renders every tool card because the transcript is the source
+        // of truth (history browser, not live UI).
         assert_eq!(
-            claude_tool_use_text("ExitPlanMode", &serde_json::json!({"plan": "..."})),
-            None
+            claude_tool_use_text(
+                "ExitPlanMode",
+                &serde_json::json!({"plan": "1. step\n2. step"})
+            ),
+            Some("**ExitPlanMode**\n\n1. step\n2. step".to_string())
+        );
+        assert_eq!(
+            claude_tool_use_text("EnterPlanMode", &serde_json::json!({"message": "OK"})),
+            Some("**EnterPlanMode**\n\nOK".to_string())
         );
         assert_eq!(
             claude_tool_use_text(
                 "AskUserQuestion",
-                &serde_json::json!({"questions": [{"question": "Which path?"}]})
+                &serde_json::json!({"questions": [{"question": "Which path?", "options": [{"label": "A"}, {"label": "B"}]}]})
             ),
-            None
+            Some("**Ask User Question**\n\n⎿ Which path?\n  - A\n  - B".to_string())
         );
         assert_eq!(
             claude_tool_use_text("TodoWrite", &serde_json::json!({"todos": []})),
-            None
+            Some("**Todos**\n\n⎿ (no todos)".to_string())
         );
+        assert_eq!(
+            claude_tool_use_text(
+                "TodoWrite",
+                &serde_json::json!({"todos": [
+                    {"status": "completed", "content": "Read code"},
+                    {"status": "in_progress", "content": "Patch parser"},
+                    {"status": "pending", "content": "Run tests"}
+                ]})
+            ),
+            Some("**Todos**\n\n✓ Read code\n~ Patch parser\n☐ Run tests".to_string())
+        );
+        // TaskCreate / ToolSearch hit the generic fallback and render as
+        // `**ToolName**({json})` so the transcript records the call.
         assert_eq!(
             claude_tool_use_text("TaskCreate", &serde_json::json!({})),
-            None
+            Some("**TaskCreate**".to_string())
         );
         assert_eq!(
-            claude_tool_use_text("ToolSearch", &serde_json::json!({})),
-            None
+            claude_tool_use_text("ToolSearch", &serde_json::json!({"query": "ls"})),
+            Some("**ToolSearch**({\"query\":\"ls\"})".to_string())
         );
 
         // ReadMcpResource — verb is literal `readMcpResource` (camelCase
@@ -8355,19 +8833,45 @@ mod tests {
         );
         assert_eq!(msgs[0].text, "Run tests");
 
-        // NULL_RENDERING subtypes drop silently — match nullRenderingAttachments.ts.
-        for sub in &[
-            "task_reminder",
-            "deferred_tools_delta",
-            "command_permissions",
-            "date_change",
-            "hook_success",
-            "async_hook_response",
-        ] {
-            let msgs =
-                claude_attachment_messages(&serde_json::json!({"attachment": {"type": sub}}), None);
-            assert!(msgs.is_empty(), "subtype {sub} should drop");
-        }
+        // NULL_RENDERING subtypes (Claude TUI hides). Termory surfaces
+        // each with the payload exposed — specialized formatters for
+        // the common ones, JSON-dump fallback for the rest. The user
+        // must be able to see what was recorded.
+        let msgs = claude_attachment_messages(
+            &serde_json::json!({"attachment": {"type": "date_change", "newDate": "2026-05-25"}}),
+            None,
+        );
+        assert_eq!(msgs[0].text, "*[date changed to 2026-05-25]*");
+
+        let msgs = claude_attachment_messages(
+            &serde_json::json!({"attachment": {"type": "task_reminder", "itemCount": 0, "content": []}}),
+            None,
+        );
+        assert_eq!(msgs[0].text, "**Task reminder** (0 items)");
+
+        let msgs = claude_attachment_messages(
+            &serde_json::json!({"attachment": {"type": "command_permissions", "allowedTools": []}}),
+            None,
+        );
+        assert_eq!(msgs[0].text, "*[command permissions: none allowed]*");
+
+        let msgs = claude_attachment_messages(
+            &serde_json::json!({"attachment": {"type": "deferred_tools_delta", "addedNames": ["X", "Y"]}}),
+            None,
+        );
+        assert_eq!(
+            msgs[0].text,
+            "**Deferred tools changed**\n\n⎿ Added (2): X, Y"
+        );
+
+        // Types we don't have a specialized formatter for fall through
+        // to the JSON-dump fallback — the type name + payload survive.
+        let msgs = claude_attachment_messages(
+            &serde_json::json!({"attachment": {"type": "hook_success", "hookEvent": "PostToolUse"}}),
+            None,
+        );
+        assert!(msgs[0].text.starts_with("*[attachment: hook_success]*"));
+        assert!(msgs[0].text.contains("PostToolUse"));
     }
 
     #[test]
@@ -8415,9 +8919,10 @@ mod tests {
     }
 
     #[test]
-    fn claude_suppress_hidden_tool_cards() {
-        // Claude TUI's `userFacingName: ''` + `renderToolUseMessage: () => null`
-        // tools — Termory returns None so no card is emitted.
+    fn claude_unhide_hidden_tool_cards() {
+        // Tools Claude TUI hides (`userFacingName: ''` +
+        // `renderToolUseMessage: () => null`) are surfaced in Termory
+        // because the transcript should reflect every recorded call.
         for name in &[
             "TodoWrite",
             "AskUserQuestion",
@@ -8432,10 +8937,14 @@ mod tests {
             "TaskOutput",
             "ToolSearch",
         ] {
-            assert_eq!(
-                claude_tool_use_text(name, &serde_json::json!({"foo": "bar"})),
-                None,
-                "tool {name} should be suppressed"
+            let card = claude_tool_use_text(name, &serde_json::json!({"foo": "bar"}));
+            assert!(
+                card.is_some(),
+                "tool {name} should now produce a visible card"
+            );
+            assert!(
+                card.as_ref().is_some_and(|t| !t.is_empty()),
+                "tool {name} card should not be empty"
             );
         }
     }
@@ -8465,8 +8974,12 @@ mod tests {
             Some("/tmp/log.txt".to_string())
         );
 
-        // `(no content)` (NO_CONTENT_MESSAGE) → drop.
-        assert_eq!(claude_display_text("(no content)"), None);
+        // `(no content)` (NO_CONTENT_MESSAGE) — Termory surfaces as
+        // italic placeholder so the empty message stays in the transcript.
+        assert_eq!(
+            claude_display_text("(no content)"),
+            Some("*(no content)*".to_string())
+        );
 
         // `[Request interrupted by user]` / `[Request interrupted by user for tool use]`
         // → italic notice.
@@ -8479,13 +8992,25 @@ mod tests {
             Some("*[Interrupted by user]*".to_string())
         );
 
-        // `<tick>` wrapper → drop.
-        assert_eq!(claude_display_text("<tick>ignored</tick>"), None);
+        // `<tick>` wrapper — Termory unwraps the inner text instead of
+        // dropping the whole message.
+        assert_eq!(
+            claude_display_text("<tick>ignored</tick>"),
+            Some("ignored".to_string())
+        );
 
-        // `<local-command-caveat>` → drop.
+        // `<local-command-caveat>` — Termory shows the caveat content
+        // wrapped in an italic type tag.
         assert_eq!(
             claude_display_text("<local-command-caveat>hidden</local-command-caveat>"),
-            None
+            Some("*[local-command-caveat]* hidden".to_string())
+        );
+
+        // Feature-gated wrappers (`<github-webhook-activity>`, etc.) —
+        // Termory surfaces each as `*[tag-name]* {inner}` notice.
+        assert_eq!(
+            claude_display_text("<teammate-message>Hi from Bob</teammate-message>"),
+            Some("*[teammate-message]* Hi from Bob".to_string())
         );
 
         // `<user-memory-input>...</user-memory-input>` → `\# {content}` memory line.
@@ -8617,7 +9142,7 @@ mod tests {
         // on its own line, blank line, then the ```diff fence — NO `@@`
         // hunk header.
         assert!(
-            body.starts_with("Added **2** lines, removed **1** line\n\n```diff\n"),
+            body.starts_with("⎿ Added **2** lines, removed **1** line\n\n```diff\n"),
             "missing or wrong summary header; got:\n{body}"
         );
         assert!(!body.contains("@@ "), "should not include `@@` hunk header");
@@ -8637,7 +9162,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert!(body.starts_with("Added **1** line, removed **1** line\n\n```diff\n"));
+        assert!(body.starts_with("⎿ Added **1** line, removed **1** line\n\n```diff\n"));
         assert!(!body.contains("@@ "));
         assert!(
             body.contains("+a\n\n-b\n"),
@@ -8912,15 +9437,55 @@ mod tests {
     }
 
     #[test]
-    fn codex_hides_environment_context_from_visible_messages() {
+    fn codex_shell_output_with_double_star_stays_in_fence() {
+        // Regression: shell output that incidentally contains `**`
+        // (e.g. `/**` JSDoc, `**kwargs`, markdown emphasis examples)
+        // used to slip past the `already_markdown` heuristic in
+        // merge_tool_outputs, so the body was emitted as a raw
+        // markdown paragraph instead of wrapped in a code fence. The
+        // browser then rendered it as h1/h2/p depending on line shape.
+        // Strict rule: only `⎿ ` (structured-result builder marker)
+        // or a leading ```fence are treated as already-markdown.
+        let dir = TestDir::new("codex-doublestars");
+        let path = dir.path().join("rollout.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"thread-stars","cwd":"/workspace/project"}}"#.to_string()
+                + "\n"
+                + r#"{"type":"event_msg","timestamp":"2026-05-01T00:00:00Z","payload":{"type":"user_message","message":"show jsdoc"}}"#
+                + "\n"
+                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:01Z","payload":{"type":"function_call","call_id":"call_X","name":"shell","arguments":"{\"cmd\":\"head -3 a.js\"}"}}"#
+                + "\n"
+                + r#"{"type":"response_item","timestamp":"2026-05-01T00:00:02Z","payload":{"type":"function_call_output","call_id":"call_X","output":"Chunk ID: 1\nWall time: 0.0 seconds\nProcess exited with code 0\nOutput:\n308-/**\n309- * doc\n310- */"}}"#,
+        )
+        .unwrap();
+
+        let detail = parse_codex_session(&path, "thread-stars").unwrap();
+        let tool = detail
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool message present");
+        // The `/**` in line 1 must NOT cause the body to skip fence
+        // wrapping — the whole output goes inside a 4-backtick fence
+        // so the browser renders monospace, not paragraphs.
+        assert_eq!(
+            tool.text,
+            "⏺ **Bash**(`head -3 a.js`)\n\n````\n308-/**\n309- * doc\n310- */\n````"
+        );
+    }
+
+    #[test]
+    fn codex_surfaces_environment_context_as_system_notice() {
         let dir = TestDir::new("codex-environment-context");
         let path = dir.path().join("rollout.jsonl");
         // EventMsg::UserMessage carries the user input verbatim — Codex's
-        // TUI never displays environment_context wrappers because they are
+        // TUI hides `<environment_context>` wrappers because they are
         // synthetic prefixes added before sending to the model, not real
-        // user text. Termory applies the same filter (see
-        // `is_codex_contextual_user_text` invoked from
-        // `codex_user_message_event`).
+        // user text. Termory now SURFACES them as `*[Codex {tag}]*`
+        // system notices (see `codex_contextual_tag` +
+        // `codex_user_message_event`); user wanted full transcript
+        // visibility regardless of TUI suppression.
         fs::write(
             &path,
             r#"{"type":"session_meta","payload":{"id":"thread-env","cwd":"/workspace/project"}}"#.to_string()
@@ -8935,14 +9500,21 @@ mod tests {
 
         let detail = parse_codex_session(&path, "thread-env").unwrap();
         assert_eq!(detail.session.title, "");
-        assert_eq!(detail.session.message_count, 2);
-        assert_eq!(detail.messages.len(), 2);
-        assert_eq!(detail.messages[0].text, "Build the app");
-        assert_eq!(detail.messages[1].text, "Done");
+        // Termory shows the contextual prefix as a system notice (was
+        // dropped in earlier versions to match Codex TUI). User asked
+        // for full transcript visibility.
+        assert_eq!(detail.session.message_count, 3);
+        assert_eq!(detail.messages.len(), 3);
+        assert_eq!(detail.messages[0].role, "system");
+        assert!(detail.messages[0]
+            .text
+            .starts_with("*[Codex environment_context]*"));
+        assert_eq!(detail.messages[1].text, "Build the app");
+        assert_eq!(detail.messages[2].text, "Done");
     }
 
     #[test]
-    fn codex_hides_official_contextual_user_fragments() {
+    fn codex_surfaces_official_contextual_user_fragments() {
         let dir = TestDir::new("codex-contextual-fragments");
         let path = dir.path().join("rollout.jsonl");
         // Same contextual-fragment filter applied to EventMsg::UserMessage:
@@ -8964,10 +9536,18 @@ mod tests {
 
         let detail = parse_codex_session(&path, "thread-fragments").unwrap();
         assert_eq!(detail.session.title, "");
-        assert_eq!(detail.session.message_count, 2);
-        assert_eq!(detail.messages.len(), 2);
-        assert_eq!(detail.messages[0].text, "Fix contextual filtering");
-        assert_eq!(detail.messages[1].text, "Done");
+        // Termory shows BOTH contextual fragments as system notices
+        // (was dropped earlier to match Codex TUI).
+        assert_eq!(detail.session.message_count, 4);
+        assert_eq!(detail.messages.len(), 4);
+        assert!(detail.messages[0]
+            .text
+            .starts_with("*[Codex user_instructions]*"));
+        assert!(detail.messages[1]
+            .text
+            .starts_with("*[Codex skill_instructions]*"));
+        assert_eq!(detail.messages[2].text, "Fix contextual filtering");
+        assert_eq!(detail.messages[3].text, "Done");
     }
 
     // Removed: `codex_renders_resume_picker_tool_events`. The fixture used
@@ -9805,16 +10385,21 @@ mod tests {
         .unwrap();
 
         let detail = parse_opencode_db_session(&db, "ses_syn").unwrap();
-        assert_eq!(detail.messages.len(), 1);
-        let text = &detail.messages[0].text;
+        // Two parts: synthetic env block + real prompt. Termory shows
+        // BOTH (OpenCode TUI hides synthetic; Termory wraps each as
+        // `*[synthetic]* {body}` and renders).
+        assert_eq!(detail.messages.len(), 2);
+        let synth = &detail.messages[0].text;
+        let real = &detail.messages[1].text;
         assert!(
-            text.contains("Real prompt"),
-            "non-synthetic text part must remain"
+            synth.starts_with("*[synthetic]*"),
+            "synthetic text part should surface with a marker"
         );
         assert!(
-            !text.contains("<env>"),
-            "synthetic text part must be filtered"
+            synth.contains("<env>"),
+            "synthetic content should be visible"
         );
+        assert!(real.contains("Real prompt"), "real prompt should remain");
     }
 
     #[test]
@@ -10230,18 +10815,19 @@ mod tests {
     }
 
     #[test]
-    fn opencode_synthetic_messages_drop_silently() {
-        // session-v2.tsx:105-107 — synthetic messages render `<></>`
-        // (nothing). Termory drops them so they don't pollute the
-        // transcript.
+    fn opencode_synthetic_messages_surface_with_marker() {
+        // session-v2.tsx:105-107 — OpenCode TUI hides synthetic
+        // messages. Termory wraps them in `*[synthetic]*` notices
+        // because the user asked for the full transcript.
         let msg = opencode_v2_message_from_value(
             &serde_json::json!({
-                "type":"synthetic","text":"system-generated",
+                "type":"synthetic","content":"system-generated",
                 "sessionID":"s","time":{"created":1_714_000_000_000_i64}
             }),
             1_714_000_000_000,
-        );
-        assert!(msg.is_none());
+        )
+        .unwrap();
+        assert_eq!(msg.text, "*[synthetic]*\n\nsystem-generated");
     }
 
     #[test]

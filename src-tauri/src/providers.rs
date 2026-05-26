@@ -1168,9 +1168,7 @@ fn read_active_opencode(providers: &[Provider]) -> Result<ActiveState, Box<dyn E
     // Build the list of Termory provider ids whose slots exist in
     // opencode.json. "Activated" = slot exists; "default" = top-level
     // `model` points at it. They're independent for OpenCode.
-    let provider_map = config_root
-        .get("provider")
-        .and_then(|v| v.as_object());
+    let provider_map = config_root.get("provider").and_then(|v| v.as_object());
     let configured_provider_ids: Vec<String> = providers
         .iter()
         .filter(|p| p.app == CliApp::Opencode && p.kind == ProviderKind::Custom)

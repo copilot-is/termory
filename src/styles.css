@@ -559,7 +559,7 @@ input {
 .sessionCard {
   display: block;
   width: 100%;
-  padding: 10px 12px;
+  padding: 8px 12px;
   text-align: left;
   border: 1px solid #dfe5e7;
   border-radius: 8px;
@@ -572,23 +572,26 @@ input {
   border-color: #1f6f68;
 }
 
-.sessionHeader,
-.sessionMeta,
-.messageTop {
+/* Two-line list card. Title (2-line clamp) sits above a meta row.
+   Relative time hugs the title's right edge. The meta row carries
+   project + msg count + optional source mark. Snippet (last user
+   prompt) is moved into the card's `title=` so it surfaces on hover
+   without competing for horizontal space. */
+.cardTitleRow {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  align-items: baseline;
   gap: 10px;
+  margin-bottom: 4px;
 }
 
-.sessionCard h2 {
-  margin-top: 7px;
-  margin-bottom: 9px;
+.cardTitle {
+  margin: 0;
+  flex: 1 1 auto;
+  min-width: 0;
   color: #1d2528;
-  font-size: 15px;
+  font-size: 14px;
+  font-weight: 600;
   line-height: 1.35;
-  /* Clamp the card title to 2 lines. Long titles get ellipsized rather
-   * than letting the card grow taller. */
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
@@ -596,35 +599,83 @@ input {
   word-break: break-word;
 }
 
-.sessionMeta > span {
-  /* The project path can be long. Clip to a single line with ellipsis
-   * (the full path is still in the `title` attribute on hover). */
+.cardTime {
+  flex: 0 0 auto;
+  color: #8a939a;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cardMeta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #758184;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+}
+
+.cardProject {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1 1 auto;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.sessionMetaProject {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  min-width: 0;
-}
-
-.sessionMetaProject > svg {
+.cardProject > svg {
   flex-shrink: 0;
   color: #8a939a;
 }
 
-.sessionMetaProject > span {
+.cardProject > span {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.cardMetaRight {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
   white-space: nowrap;
 }
 
-.sessionHeader + .sessionMeta {
-  margin-top: 9px;
+.cardMsgs {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: #8a939a;
+}
+
+.cardMsgs > svg {
+  flex-shrink: 0;
+  color: #9aa7ac;
+  /* Nudge down ~1px so the icon's optical center aligns with the
+   * digit baseline (lucide's MessageSquare sits slightly higher than
+   * the text x-height when centered geometrically). */
+  transform: translateY(1px);
+}
+
+/* Source mark: bare brand icon in the card meta row. Each icon
+   keeps its native brand color (see `.codexIcon` / `.claudeIcon` /
+   ... fill rules above). No chip background. */
+.sourceMark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+.sourceMark .brandIcon {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
 }
 
 .sessionSnippet {
@@ -666,13 +717,15 @@ input {
   border-radius: 2px;
 }
 
-.sessionMeta,
-.date,
-.messageTop {
+.date {
   color: #758184;
   font-size: 12px;
 }
 
+/* Type pill used by the command palette result rows. Three color
+   variants: session (sky), memory (purple), skill (emerald). The
+   per-brand variants (codex/claude/gemini/opencode) were removed
+   along with the list-card source badges. */
 .badge {
   display: inline-flex;
   align-items: center;
@@ -682,22 +735,6 @@ input {
   color: #ffffff;
   font-size: 12px;
   font-weight: 700;
-}
-
-.badge.codex {
-  background: #0e0e10;
-}
-
-.badge.claude {
-  background: #cc785c;
-}
-
-.badge.gemini {
-  background: linear-gradient(135deg, #4285f4 0%, #a142f4 50%, #34a853 100%);
-}
-
-.badge.opencode {
-  background: #374151;
 }
 
 .badge.session {
@@ -774,6 +811,11 @@ input {
   align-items: center;
   gap: 5px;
   min-width: 0;
+}
+
+.detailMetaMsgs > svg {
+  /* Same 1px optical nudge applied to the list-card MessageSquare. */
+  transform: translateY(1px);
 }
 
 .detailMetaProject {
@@ -933,25 +975,28 @@ input {
   flex-shrink: 0;
 }
 
+/* TUI-style scrollback: continuous vertical flow, no per-message
+   borders. Each message has a colored left-bar role marker and a
+   lowercase role label (mirrors OpenCode TUI's session-v2.tsx:267/284
+   layout). */
 .messageList {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 22px;
   overflow: auto;
-  padding: 12px;
+  padding: 16px;
 }
 
 .message {
-  border: 1px solid #e0e5e7;
-  border-radius: 8px;
-  background: #ffffff;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
 }
 
-/* Memory / Skill detail — render the .md content as a single
-   continuous document. No card chrome, no role label; the .messageBody
-   styles still apply so headings / code / lists stay consistent with
-   session messages. */
+/* Memory / Skill detail keeps the original card chrome — it's a
+   single-document .md view, not a multi-turn scrollback. */
 .docBody {
   background: #ffffff;
   border: 1px solid #e0e5e7;
@@ -959,37 +1004,43 @@ input {
   padding: 18px 22px;
 }
 
-.message.user {
-  border-color: #bdd7d2;
-}
-
-.message.assistant {
-  border-color: #d7dfeb;
-}
-
-.message.tool {
-  border-color: #e4d7c9;
-}
-
-.messageTop {
+.messageHeader {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 9px 12px;
-  border-bottom: 1px solid #edf0f1;
-  text-transform: capitalize;
+  gap: 8px;
+  margin-bottom: 4px;
 }
 
-.messageRole {
-  color: #1f282c;
+.roleBar {
+  width: 3px;
+  height: 0.95em;
+  border-radius: 1.5px;
+  background: #9aa7ac;
+  flex: 0 0 auto;
 }
 
-.messageTop time {
-  color: #7a868c;
-  font-size: 11.5px;
+.roleLabel {
+  font-size: 12px;
+  font-weight: 500;
+  color: #56636a;
+  text-transform: lowercase;
   font-variant-numeric: tabular-nums;
-  text-transform: none;
+}
+
+.message.user .roleBar {
+  background: #4a9d97;
+}
+
+.message.assistant .roleBar {
+  background: #6f88c4;
+}
+
+.message.tool .roleBar {
+  background: #c08a4f;
+}
+
+.message.event .roleBar {
+  background: #9aa7ac;
 }
 
 .message pre {
@@ -1006,11 +1057,17 @@ input {
 }
 
 .messageBody {
-  padding: 13px 16px;
+  padding: 0 0 0 11px;
   color: #1f282c;
   font-size: 13.5px;
-  line-height: 1.6;
   overflow-wrap: anywhere;
+}
+
+/* Memory/Skill `.docBody` keeps its inner padding via the wrapper —
+   override the per-line padding-left from `.messageBody` so the
+   document doesn't get an off-center indent. */
+.docBody .messageBody {
+  padding: 0;
 }
 
 .messageBody > *:first-child {

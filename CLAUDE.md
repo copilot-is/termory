@@ -217,25 +217,44 @@ Implementation notes:
     - `.badge.memory` `#9333EA` (purple 600 — knowledge/recall)
     - `.badge.skill` `#059669` (emerald 600 — capability/action)
 
-### Unified tool-message format
+### Unified tool-message format — LOCKED RULE
 
-Every tool message — regardless of source platform — funnels into the same markdown shape so the detail pane reads consistently across Codex / Claude / Gemini / OpenCode.
+Every tool message — regardless of source platform — uses the same markdown shape. This is a hard rule: any new tool / structured-result formatter MUST follow it without exception.
 
 **Shape:**
 
 `````
 {status} **{Verb}**({args})
 
-````
-{body — may include `Error: ...` prefix on failures}
+⎿ {summary}              ← present when the tool has a structured summary
+                           (line counts, status codes, settings, etc.)
+
+```{lang}                ← optional fence for diff / source / structured output
+{body}
+```
+
+or
+
+````                     ← 4-backtick fence for unstructured text output
+{body}                     (avoids collision with content containing ```)
 ````
 `````
 
-- `{status}` is the leading glyph: `⏺` on success, `✗` on failure. Inserted by `merge_tool_outputs` (for paired tool_use/tool_result) or by the tool emitter directly (for self-contained EventMsg-derived cards like MCP / WebSearch). Matches Claude TUI's BLACK_CIRCLE prefix in `constants/figures.ts:4` (`⏺` on darwin, `●` elsewhere) for success; `✗` mirrors Codex's failure badge in `exec_cell/render.rs:236`.
-- `{Verb}` text is platform-native (per `session-v2.tsx` for OpenCode, `userFacingName` for Claude, `exec_cell/render.rs` for Codex, `displayName` for Gemini) — but the wrapper SHAPE `**Verb**(args)` is unified across all four. Platform-native verbs preserved: OpenCode keeps `Shell` / `Todos` / `Questions` / `{Agent} Task`; Codex shell uses `Bash` (was `Ran`, unified with Claude per design call so users don't see two different verbs for the same operation); apply_patch uses `Added` / `Deleted` / `Edited`.
-- `{args}` content (commands, paths, URLs, patterns) is wrapped with `wrap_inline_code` (sessions.rs:48 — CommonMark §6.1 delimiter sizing) so embedded backticks / asterisks / parens don't escape into markdown formatting.
-- `Error:` prefix appears INSIDE the fence body on failures, replacing the old footer-style `**Error**` line. Format is `Error: Exit code N` for Codex (exit code parsed from the `Process exited with code N` wrapper line) or `Error: {message}` for Claude (`is_error: true` with no exit code).
-- Reasoning across all four platforms goes through `format_reasoning_body(content)` → `> *line*\n> *line*\n...` (italic blockquote) so the visual style is consistent.
+**Rules:**
+
+1. `{status}` glyph: `⏺` success, `✗` failure (Claude `constants/figures.ts:4` + Codex `exec_cell/render.rs:236`). Cross-platform — applied to every tool card.
+2. `{Verb}` text is platform-native (Claude `userFacingName`, OpenCode `session-v2.tsx`, Codex `exec_cell/render.rs`, Gemini `displayName`); the wrapper shape `**Verb**(args)` is identical across platforms.
+3. `{args}` always passes through `wrap_inline_code` (sessions.rs:48) so embedded backticks / `*` / `()` don't break markdown.
+4. **`⎿ ` prefix is REQUIRED on every summary line**, with one trailing space before the content. Tools without a structured summary skip the line entirely (Bash, generic MCP, etc.). NEVER put `⎿` inside a code fence — browser monospace fonts render U+23BF inconsistently, breaking column alignment.
+5. Summary content matches the per-tool Claude TUI component verbatim (count bolding, label pluralization). Examples:
+   - `⎿ Read **N** lines` — `FileReadTool/UI.tsx:138-139`
+   - `⎿ Wrote **N** lines to **{file}**` — `FileWriteTool/UI.tsx:58`
+   - `⎿ Found **N** {label}` — `GrepTool/UI.tsx:32-33`
+   - `⎿ Added **N** lines, removed **M** lines` — `FileEditToolUpdatedMessage.tsx:42-50`
+   - `⎿ Received **{size}** ({code} {codeText})` — `WebFetchTool/UI.tsx:31-58`
+   - `⎿ Error: Exit code N` (Codex) / `⎿ Error: {message}` (Claude — no exit code)
+6. Reasoning across all platforms: `format_reasoning_body(content)` → `> *line*` italic blockquote.
+7. **No content is dropped to match official TUI behavior.** Suppressed tools (Claude `TodoWrite`, `AskUserQuestion`, `EnterPlanMode`, etc.) and synthetic / contextual wrappers (Codex `<environment_context>`, OpenCode `synthetic` parts, Claude `<tick>` / `<local-command-caveat>` / NULL_RENDERING attachments) all surface in Termory — usually as italic `*[wrapper-name]*` notices when there's no structured representation. Termory is a history browser; hiding things misleads the user.
 
 **Failure detection per platform** (`SessionMessage.exit_code: Option<i64>` carries the parsed value through `merge_tool_outputs`):
 
@@ -415,9 +434,11 @@ Audit reference is OpenCode `1.15.5` (commit `9324ef0`). Compared against `v1.15
 - The detail-pane body uses `react-markdown` + `remark-gfm` (tables / task lists / strikethrough). No syntax-highlight pass: code blocks render as plain monospace until a per-language renderer is added intentionally.
 - No DOMPurify / rehype-sanitize: react-markdown emits React elements (not HTML strings), so raw `<tag>` in session content is auto-escaped by React's text node rendering and displays as literal text — same characters the CLI shows.
 - No raw / rendered toggle and no `viewMode` state — every message renders through the same react-markdown pipeline. The "open original file" affordance in the detail header still lets the user inspect the underlying JSONL / db row outside Termory.
+- **TUI-style scrollback layout**: messages render as continuous vertical flow without card borders. Each message has a colored left bar (`.roleBar`) + lowercase `.roleLabel` (OpenCode TUI inspired — `session-v2.tsx:267, 284, 357`). The bar color encodes role: user teal, assistant blue, tool tan, event gray. No per-message timestamp chip; `<TimeSeparator>` between turn boundaries handles big time jumps.
+- `.messageBody` has `padding-left: 11px` so body text aligns under the role label (label sits 3px bar + 8px gap = 11px from the message left edge). Overridden to `padding: 0` for `.docBody` (memory/skill single-doc view).
 - Inline `<code>` carries `word-break: break-all` so a long no-space path inside `**Read**(\`/very/long/path\`)` wraps with the surrounding paragraph instead of overflowing the message card.
 - `.messageBody pre` has `margin: 0; padding: 0 0 0 1em` — code fences sit flush with the verb header above, with a 1em left indent so the fence content visually aligns with the verb under the `⏺` marker.
-- `.message.tool .messageBody p + p { padding-left: 1em }` — second-and-later paragraphs inside tool cards (e.g. the `**Added N lines, removed M lines**` summary above an Edit diff) indent 1em to align with the verb past the `⏺` glyph. Scoped to `.message.tool` so plain-text assistant messages with multi-paragraph layouts stay flush-left.
+- `.message.tool .messageBody p + p { padding-left: 1em }` — second-and-later paragraphs inside tool cards (e.g. the `⎿ Added N lines, removed M lines` summary above an Edit diff) indent 1em to align with the verb past the `⏺` glyph. Scoped to `.message.tool` so plain-text assistant messages with multi-paragraph layouts stay flush-left.
 - `.messageBody p + pre { margin-top: -0.4em }` — pulls a fence visually onto the preceding paragraph when they form a logical pair (summary + diff). The CommonMark-required blank line between them stays in the markdown source so the fence is still recognized as a block.
 - Unordered lists render with the `- ` text marker via `list-style-type: "- "` (matching Codex TUI's `start_item` output at `codex-rs/tui/src/markdown_render.rs:754-760`).
 - Tool detail-pane loading state shows only the spinner icon (no `Loading transcript` label) so the brief delay between session select and detail load is unobtrusive.
@@ -428,15 +449,14 @@ Audit reference is OpenCode `1.15.5` (commit `9324ef0`). Compared against `v1.15
 - Session list fields should use official values when available: title, project/cwd, timestamps, source id, and original path.
 - Loading a session should parse the underlying transcript/messages for that exact selected record.
 - Message previews in the detail pane should show the same user-visible content style as the official tool, including command/tool output formatting.
-- Internal context, metadata, hidden tool payloads, and storage-only records should stay hidden when the official tool hides them.
+- **Show everything that was recorded.** Termory deliberately surfaces content that the official TUIs hide (Claude's suppressed tools, `<tick>` / `<local-command-caveat>` / NULL_RENDERING attachments / `isMeta` user messages; Codex's `<environment_context>` / `<user_instructions>` / `<skill_instructions>` / etc.; OpenCode's `synthetic` parts). The transcript is the source of truth — hiding things makes the history misleading. List-time filters (`isSidechain`, `kind === "subagent"`) that decide *which sessions* appear in the list are separate and still apply.
 - Compatibility readers are allowed only for real older/alternate storage layouts and should not override the current official path.
 - App-only UI features such as source filters, project grouping, search, stats, cross-source sorting, and the Memory/Skills pane organization must not be used as evidence for official data behavior.
 
 ## Implementation Rules
 
-- Keep data acquisition and message preview formatting aligned with the official tool behavior.
+- Keep data acquisition and message preview formatting aligned with the official tool behavior, but **never hide content** — Termory is a history browser, so anything recorded must be surfaced (usually as an italic `*[wrapper-name]*` notice when there's no nicer representation). See the "Unified tool-message format — LOCKED RULE" rule 7.
 - Do not add custom title/message fallbacks unless the official tool does the same.
-- Hide internal metadata when the official tool hides it.
 - Format command and tool output the way the official tool **actually renders it in its TUI** — not what its docs say, and not what feels right. Always grep `.audit-sources/<repo>/` for the real render function and put a `// path/to/file.tsx:LINE` citation next to the matching Termory branch. Earlier rounds of this codebase had ~600 lines of tool-formatting guesswork that diverged from every TUI; those have been replaced and the rule exists to prevent regressing.
 - Treat UI behavior separately from official data behavior. Source filters, project grouping, search, stats, cross-source sorting, and the Memory/Skills views are app UI behavior.
 - Keep changes scoped. Avoid unrelated refactors.

@@ -110,6 +110,7 @@ type AppSession = {
   updated_at?: string | null;
   message_count: number;
   preview: string;
+  snippet?: string;
   message_previews: SessionMessage[];
 };
 
@@ -786,18 +787,37 @@ function App() {
                     key={sessionKey(session)}
                     className={selected?.path === session.path && selected?.id === session.id ? "sessionCard active" : "sessionCard"}
                     onClick={() => setSelected(session)}
+                    title={session.snippet || undefined}
                   >
-                    <div className="sessionHeader">
-                      <span className={`badge ${session.source.toLowerCase()}`}>{sourceDisplayName(session.source)}</span>
-                      <span className="date">{formatDate(session.updated_at ?? session.started_at)}</span>
+                    <div className="cardTitleRow">
+                      <h2 className="cardTitle">{session.title}</h2>
+                      <span
+                        className="cardTime"
+                        title={formatDate(session.updated_at ?? session.started_at)}
+                      >
+                        {formatRelativeDate(session.updated_at ?? session.started_at)}
+                      </span>
                     </div>
-                    <h2>{session.title}</h2>
-                    <div className="sessionMeta">
-                      <span className="sessionMetaProject" title={session.project}>
+                    <div className="cardMeta">
+                      <span className="cardProject" title={session.project}>
                         <Folder size={12} />
                         <span>{projectDisplayName(session.project)}</span>
                       </span>
-                      <span>{session.message_count} messages</span>
+                      <span className="cardMetaRight">
+                        <span className="cardMsgs" title={`${session.message_count} messages`}>
+                          <MessageSquare size={11} />
+                          <span>{session.message_count}</span>
+                        </span>
+                        {source === "All" && (
+                          <span
+                            className={`sourceMark ${session.source.toLowerCase()}`}
+                            title={sourceDisplayName(session.source)}
+                            aria-label={sourceDisplayName(session.source)}
+                          >
+                            <BrandIcon source={session.source} />
+                          </span>
+                        )}
+                      </span>
                     </div>
                     {showSnippet && (
                       <SnippetLine
@@ -848,6 +868,7 @@ function App() {
                 query={query.trim()}
                 contentQuery={contentQuery}
                 hit={contentHits.get(sessionKey(item))}
+                showSource={source === "All"}
               />
             ))}
           </div>
@@ -888,6 +909,7 @@ function App() {
                 query={query.trim()}
                 contentQuery={contentQuery}
                 hit={contentHits.get(sessionKey(item))}
+                showSource={source === "All"}
               />
             ))}
           </div>
@@ -921,7 +943,7 @@ function App() {
                 {isSessionItem(selected) && (
                   <>
                     <span className="detailMetaSep">·</span>
-                    <span className="detailMetaItem" title={`${selected.message_count} messages`}>
+                    <span className="detailMetaItem detailMetaMsgs" title={`${selected.message_count} messages`}>
                       <MessageSquare size={13} />
                       {selected.message_count}
                     </span>
@@ -976,10 +998,10 @@ function App() {
               {!detailLoading && isSessionItem(selected) &&
                 detail?.messages.map((message, index) => (
                   <article key={`${message.timestamp ?? "msg"}:${index}`} className={`message ${roleClass(message.role)}`}>
-                    <div className="messageTop">
-                      <span className="messageRole">{message.role || "event"}</span>
-                      <time>{formatDate(message.timestamp)}</time>
-                    </div>
+                    <header className="messageHeader">
+                      <span className="roleBar" aria-hidden="true" />
+                      <span className="roleLabel">{message.role || "event"}</span>
+                    </header>
                     <MessageBody text={message.text} />
                   </article>
                 ))}
@@ -2504,31 +2526,55 @@ function SearchResultCard({
   const sessionTypeLabel = !isSessionItem(session);
   const tools = memoryToolsOf(session);
   return (
-    <button className="sessionCard searchResultCard" onClick={onOpen}>
-      <div className="sessionHeader">
-        {sessionTypeLabel ? (
-          <span className="memoryBadges">
-            {tools.map((tool) => (
-              <span
-                key={tool}
-                className={`badge ${tool === "Other" ? "memory" : tool.toLowerCase()}`}
-              >
-                {tool === "Other" ? "Memory" : sourceDisplayName(tool)}
-              </span>
-            ))}
-          </span>
-        ) : (
-          <span className={`badge ${session.source.toLowerCase()}`}>{sourceDisplayName(session.source)}</span>
-        )}
-        <span className="date">{formatDate(session.updated_at ?? session.started_at)}</span>
+    <button
+      className="sessionCard searchResultCard"
+      onClick={onOpen}
+      title={session.snippet || undefined}
+    >
+      <div className="cardTitleRow">
+        <h2 className="cardTitle">{session.title || "(untitled)"}</h2>
+        <span
+          className="cardTime"
+          title={formatDate(session.updated_at ?? session.started_at)}
+        >
+          {formatRelativeDate(session.updated_at ?? session.started_at)}
+        </span>
       </div>
-      <h2>{session.title || "(untitled)"}</h2>
-      <div className="sessionMeta">
-        <span className="sessionMetaProject" title={session.project}>
+      <div className="cardMeta">
+        <span className="cardProject" title={session.project}>
           <Folder size={12} />
           <span>{projectDisplayName(session.project)}</span>
         </span>
-        {isSessionItem(session) && <span>{session.message_count} messages</span>}
+        <span className="cardMetaRight">
+          {isSessionItem(session) && (
+            <span className="cardMsgs" title={`${session.message_count} messages`}>
+              <MessageSquare size={11} />
+              <span>{session.message_count}</span>
+            </span>
+          )}
+          {/* Search spans all sources — always show the source mark. */}
+          {sessionTypeLabel ? (
+            <span className="memoryBadges">
+              {tools.map((tool) => {
+                const label = tool === "Other" ? "Memory" : sourceDisplayName(tool);
+                const cls = tool === "Other" ? "memory" : tool.toLowerCase();
+                return (
+                  <span key={tool} className={`sourceMark ${cls}`} title={label} aria-label={label}>
+                    <BrandIcon source={tool === "Other" ? "Memory" : tool} />
+                  </span>
+                );
+              })}
+            </span>
+          ) : (
+            <span
+              className={`sourceMark ${session.source.toLowerCase()}`}
+              title={sourceDisplayName(session.source)}
+              aria-label={sourceDisplayName(session.source)}
+            >
+              <BrandIcon source={session.source} />
+            </span>
+          )}
+        </span>
       </div>
       <SnippetLine
         snippet={hit.snippet}
@@ -2804,7 +2850,8 @@ function MemoryCard({
   onClick,
   query,
   contentQuery,
-  hit
+  hit,
+  showSource
 }: {
   item: AppSession;
   selected: AppSession | null;
@@ -2812,6 +2859,7 @@ function MemoryCard({
   query: string;
   contentQuery: string;
   hit: SearchHit | undefined;
+  showSource: boolean;
 }) {
   const showSnippet = !!hit && query.toLowerCase() === contentQuery.toLowerCase();
   const isActive = selected?.path === item.path && selected?.id === item.id;
@@ -2820,26 +2868,37 @@ function MemoryCard({
     <button
       className={isActive ? "sessionCard active" : "sessionCard"}
       onClick={onClick}
+      title={item.snippet || undefined}
     >
-      <div className="sessionHeader">
-        <span className="memoryBadges">
-          {tools.map((tool) => (
-            <span
-              key={tool}
-              className={`badge ${tool === "Other" ? "memory" : tool.toLowerCase()}`}
-            >
-              {tool === "Other" ? "Memory" : sourceDisplayName(tool)}
-            </span>
-          ))}
+      <div className="cardTitleRow">
+        <h2 className="cardTitle">{item.title}</h2>
+        <span
+          className="cardTime"
+          title={formatDate(item.updated_at ?? item.started_at)}
+        >
+          {formatRelativeDate(item.updated_at ?? item.started_at)}
         </span>
-        <span className="date">{formatDate(item.updated_at ?? item.started_at)}</span>
       </div>
-      <h2>{item.title}</h2>
-      <div className="sessionMeta">
-        <span className="sessionMetaProject" title={item.project}>
+      <div className="cardMeta">
+        <span className="cardProject" title={item.project}>
           <Folder size={12} />
           <span>{projectDisplayName(item.project)}</span>
         </span>
+        {showSource && (
+          <span className="cardMetaRight">
+            <span className="memoryBadges">
+              {tools.map((tool) => {
+                const label = tool === "Other" ? "Memory" : sourceDisplayName(tool);
+                const cls = tool === "Other" ? "memory" : tool.toLowerCase();
+                return (
+                  <span key={tool} className={`sourceMark ${cls}`} title={label} aria-label={label}>
+                    <BrandIcon source={tool === "Other" ? "Memory" : tool} />
+                  </span>
+                );
+              })}
+            </span>
+          </span>
+        )}
       </div>
       {showSnippet && (
         <SnippetLine
@@ -3004,6 +3063,51 @@ function formatDate(value?: string | null) {
   if (Number.isNaN(date.getTime())) return value;
   return dateFormatter.format(date);
 }
+
+// Compact relative timestamp used on list cards: `2h ago`,
+// `Yesterday`, `May 23`, `2024`. Drops absolute precision in
+// exchange for scannability — older absolute formats stay in
+// places that still need them (detail header, etc.).
+function formatRelativeDate(value?: string | null) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const now = Date.now();
+  const diffMs = now - date.getTime();
+  const sec = Math.round(diffMs / 1000);
+  if (sec < 60) return "just now";
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  // Compare calendar dates for "Yesterday" / "Today" so a 23h-old
+  // session at 11pm yesterday doesn't show "23h ago" forever.
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  const startOfDate = new Date(date);
+  startOfDate.setHours(0, 0, 0, 0);
+  const dayDiff = Math.round(
+    (startOfToday.getTime() - startOfDate.getTime()) / 86_400_000
+  );
+  if (dayDiff === 0) return `${hr}h ago`;
+  if (dayDiff === 1) return "Yesterday";
+  if (dayDiff < 7) return `${dayDiff}d ago`;
+  if (date.getFullYear() === new Date().getFullYear()) {
+    return shortDateFormatter.format(date);
+  }
+  return yearDateFormatter.format(date);
+}
+
+const shortDateFormatter = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric"
+});
+
+const yearDateFormatter = new Intl.DateTimeFormat(undefined, {
+  year: "numeric",
+  month: "short",
+  day: "numeric"
+});
 
 function roleClass(role: string) {
   const lowered = role.toLowerCase();
