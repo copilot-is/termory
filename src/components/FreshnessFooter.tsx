@@ -1,0 +1,90 @@
+import React from "react";
+import { AlertTriangle, Check, RefreshCw } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { formatTimeAgo } from "@/lib/format";
+
+export function FreshnessFooter({
+  syncing,
+  lastSyncedAt,
+  error
+}: {
+  syncing: boolean;
+  lastSyncedAt: number | null;
+  error: string | null;
+}) {
+  // Bump every 30s so "Synced 2m ago" stays accurate without
+  // re-rendering the rest of the app. tick is intentionally unused —
+  // its only job is to invalidate the rendered label.
+  const [, setTick] = React.useState(0);
+  React.useEffect(() => {
+    const id = window.setInterval(() => setTick((t) => t + 1), 30_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // Brief "just synced" pulse after a successful sync — gives the user
+  // a passive cue that the background actually did something. After
+  // ~1.8s the footer falls back to the idle "Synced 2m ago" state.
+  // Triggers on any `lastSyncedAt` advance, so both launch-time scans
+  // and watcher-driven re-scans get the cue.
+  const justSyncedWindow = 1800;
+  const [justSynced, setJustSynced] = React.useState(false);
+  const prevSyncedAt = React.useRef(lastSyncedAt);
+  React.useEffect(() => {
+    if (
+      lastSyncedAt != null &&
+      prevSyncedAt.current !== lastSyncedAt &&
+      !error
+    ) {
+      setJustSynced(true);
+      const timer = window.setTimeout(() => setJustSynced(false), justSyncedWindow);
+      prevSyncedAt.current = lastSyncedAt;
+      return () => window.clearTimeout(timer);
+    }
+    prevSyncedAt.current = lastSyncedAt;
+  }, [lastSyncedAt, error]);
+
+  let state: "idle" | "syncing" | "done" | "error" = "idle";
+  let icon: React.ReactNode = null;
+  let label = "";
+  let tooltip: string | undefined;
+  if (error) {
+    state = "error";
+    icon = <AlertTriangle size={12} strokeWidth={2.25} />;
+    label = "Sync failed";
+    tooltip = error;
+  } else if (syncing) {
+    state = "syncing";
+    icon = <RefreshCw size={12} strokeWidth={2.25} className="animate-spin" />;
+    label = "Syncing…";
+  } else if (justSynced) {
+    state = "done";
+    icon = <Check size={12} strokeWidth={2.25} />;
+    label = "Synced just now";
+  } else if (lastSyncedAt != null) {
+    state = "idle";
+    icon = <Check size={12} strokeWidth={2.25} />;
+    label = `Synced ${formatTimeAgo(lastSyncedAt)}`;
+    tooltip = new Date(lastSyncedAt).toLocaleString();
+  }
+
+  const stateClass = {
+    idle: "text-muted-foreground",
+    syncing: "text-muted-foreground",
+    done: "text-primary",
+    error: "text-destructive"
+  }[state];
+
+  return (
+    <footer
+      aria-label={label || "Freshness status"}
+      title={tooltip}
+      className={cn(
+        "flex items-center gap-1.5 px-3 py-1.5 border-t border-border bg-card text-[11px]",
+        stateClass
+      )}
+    >
+      <span className="shrink-0">{icon}</span>
+      <span>{label}</span>
+    </footer>
+  );
+}
