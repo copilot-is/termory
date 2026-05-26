@@ -32,15 +32,15 @@
   <rect width="1024" height="1024" rx="229" fill="url(#sheenGrad)"/>
 
   <g filter="url(#chevShadow)">
-    <path d="M 281 436 L 425 532 L 281 628"
+    <path d="M 281 431 L 425 527 L 281 623"
           stroke="url(#chevGrad)" stroke-width="72"
           fill="none" stroke-linecap="round" stroke-linejoin="round"/>
 
-    <path d="M 501 464 L 609 532 L 501 600"
+    <path d="M 501 459 L 609 527 L 501 595"
           stroke="url(#chevGrad)" stroke-width="52"
           fill="none" stroke-linecap="round" stroke-linejoin="round"/>
 
-    <path d="M 681 492 L 761 532 L 681 572"
+    <path d="M 681 487 L 761 527 L 681 567"
           stroke="url(#chevGrad)" stroke-width="36"
           fill="none" stroke-linecap="round" stroke-linejoin="round"/>
   </g>
