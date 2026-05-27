@@ -135,7 +135,7 @@ export function ProviderEditor({
     >
       <DialogContent className="sm:max-w-lg max-h-[88vh] overflow-y-auto">
         <form onSubmit={handleSubmit} className="contents">
-          <DialogHeader>
+          <DialogHeader className="flex-row items-baseline gap-2">
             <DialogTitle>{isNew ? "Add provider" : "Edit provider"}</DialogTitle>
             <DialogDescription>{CLI_APP_LABEL[draft.app]}</DialogDescription>
           </DialogHeader>
@@ -312,7 +312,7 @@ export function ProviderEditor({
             )}
 
             {draft.app === "claude" && (
-              <details className="group rounded-md border border-border bg-muted/40 px-3 py-2">
+              <details className="group rounded-md bg-muted/40 px-3 py-2">
                 <summary className="cursor-pointer text-xs font-medium select-none">
                   Advanced — per-size routing (Sonnet / Opus / Haiku)
                 </summary>

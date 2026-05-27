@@ -16,7 +16,7 @@ export function SnippetLine({
   const segments = React.useMemo(() => splitSnippet(snippet, query), [snippet, query]);
   const label = role ? role : "match";
   return (
-    <div className="flex flex-col gap-0.5 mt-1 pt-1 border-t border-border/60">
+    <div className="flex flex-col gap-0.5 mt-1 pt-1">
       <span className="flex items-center gap-1 text-[10.5px] uppercase tracking-wide text-muted-foreground">
         <MessageSquare size={11} />
         <span>{label}</span>

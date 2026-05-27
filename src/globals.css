@@ -4,8 +4,12 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  --radius: 0.625rem;
+  /* Big Sur+ style: bigger radii are part of the visual language. */
+  --radius: 0.5rem;
 
+  /* Pure white surfaces everywhere — content integrates with the window.
+   * Sidebar gets the very faintest cool tint (where vibrancy would be).
+   * No "darker band" toolbar concept — toolbar floats on the same white. */
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
 
@@ -18,20 +22,22 @@
   --primary: oklch(0.6204 0.195 253.83);
   --primary-foreground: oklch(0.985 0 0);
 
-  --secondary: oklch(0.97 0.005 256);
+  --secondary: oklch(0.965 0.004 250);
   --secondary-foreground: oklch(0.205 0 0);
 
-  --muted: oklch(0.97 0.005 256);
-  --muted-foreground: oklch(0.556 0.013 252);
+  --muted: oklch(0.965 0.004 250);
+  --muted-foreground: oklch(0.5 0.012 252);
 
-  --accent: oklch(0.97 0.005 256);
+  /* Accent carries a hint of the primary hue so hover pills feel
+   * "the same family" as selected (primary) pills, not generic gray. */
+  --accent: oklch(0.945 0.018 253);
   --accent-foreground: oklch(0.205 0 0);
 
   --destructive: oklch(0.577 0.245 27.325);
   --destructive-foreground: oklch(0.985 0 0);
 
-  --border: oklch(0.922 0.008 252);
-  --input: oklch(0.922 0.008 252);
+  --border: oklch(0.92 0.005 250);
+  --input: oklch(0.92 0.005 250);
   --ring: oklch(0.6204 0.195 253.83);
 
   --chart-1: oklch(0.646 0.222 41.116);
@@ -40,43 +46,48 @@
   --chart-4: oklch(0.828 0.189 84.429);
   --chart-5: oklch(0.769 0.188 70.08);
 
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
+  /* Sidebar gets the very faintest tint to suggest a vibrancy material
+   * without actually using one (vibrancy needs Tauri config). */
+  --sidebar: oklch(0.968 0.004 250);
+  --sidebar-foreground: oklch(0.18 0.005 250);
   --sidebar-primary: oklch(0.6204 0.195 253.83);
   --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0.005 256);
+  --sidebar-accent: oklch(0.94 0.018 253);
   --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0.008 252);
+  --sidebar-border: oklch(0.92 0.005 250);
   --sidebar-ring: oklch(0.6204 0.195 253.83);
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
+  /* Big Sur+ dark: content surfaces are a single near-black shade,
+   * sidebar a hair lighter (window-chrome / vibrancy zone). Hover and
+   * selected use blue-tinted accents in the same hue family as primary. */
+  --background: oklch(0.165 0.005 250);
+  --foreground: oklch(0.96 0.003 250);
 
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
+  --card: oklch(0.165 0.005 250);
+  --card-foreground: oklch(0.96 0.003 250);
 
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.21 0.006 250);
+  --popover-foreground: oklch(0.96 0.003 250);
 
   --primary: oklch(0.72 0.18 253.83);
   --primary-foreground: oklch(0.145 0 0);
 
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.22 0.006 250);
+  --secondary-foreground: oklch(0.96 0.003 250);
 
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
+  --muted: oklch(0.22 0.006 250);
+  --muted-foreground: oklch(0.7 0.01 250);
 
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
+  --accent: oklch(0.28 0.04 253);
+  --accent-foreground: oklch(0.96 0.003 250);
 
   --destructive: oklch(0.704 0.191 22.216);
   --destructive-foreground: oklch(0.985 0 0);
 
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
+  --border: oklch(1 0 0 / 9%);
+  --input: oklch(1 0 0 / 12%);
   --ring: oklch(0.72 0.18 253.83);
 
   --chart-1: oklch(0.488 0.243 264.376);
@@ -85,21 +96,21 @@
   --chart-4: oklch(0.627 0.265 303.9);
   --chart-5: oklch(0.645 0.246 16.439);
 
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar: oklch(0.195 0.006 250);
+  --sidebar-foreground: oklch(0.96 0.003 250);
   --sidebar-primary: oklch(0.72 0.18 253.83);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-primary-foreground: oklch(0.145 0 0);
+  --sidebar-accent: oklch(0.3 0.04 253);
+  --sidebar-accent-foreground: oklch(0.96 0.003 250);
+  --sidebar-border: oklch(1 0 0 / 8%);
   --sidebar-ring: oklch(0.72 0.18 253.83);
 }
 
 @theme inline {
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: var(--radius);
+  --radius-md: var(--radius);
   --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
+  --radius-xl: var(--radius);
 
   --color-background: var(--background);
   --color-foreground: var(--foreground);

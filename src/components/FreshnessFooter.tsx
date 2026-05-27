@@ -79,7 +79,7 @@ export function FreshnessFooter({
       aria-label={label || "Freshness status"}
       title={tooltip}
       className={cn(
-        "flex items-center gap-1.5 px-3 py-1.5 border-t border-border bg-card text-[11px]",
+        "absolute bottom-0 right-0 flex items-center gap-1.5 rounded-tl-md bg-sidebar px-3 py-1 text-[11px]",
         stateClass
       )}
     >

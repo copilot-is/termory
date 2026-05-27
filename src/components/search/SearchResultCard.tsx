@@ -25,28 +25,24 @@ export function SearchResultCard({
   return (
     <button
       onClick={onOpen}
-      title={session.snippet || undefined}
-      className="w-full text-left rounded-md border border-border bg-card px-3 py-2 transition-colors flex flex-col gap-1 hover:bg-accent/40"
+      className="w-full text-left rounded-md bg-card px-2 py-2 transition-colors flex flex-col gap-1 hover:bg-accent/40"
     >
       <div className="flex items-baseline justify-between gap-2">
-        <h2 className="text-sm font-medium leading-snug line-clamp-2 flex-1 min-w-0">
+        <h2 className="text-base font-medium leading-snug line-clamp-2 flex-1 min-w-0">
           {session.title || "(untitled)"}
         </h2>
-        <span
-          className="text-xs text-muted-foreground shrink-0"
-          title={formatDate(session.updated_at ?? session.started_at)}
-        >
+        <span className="text-xs text-muted-foreground shrink-0">
           {formatRelativeDate(session.updated_at ?? session.started_at)}
         </span>
       </div>
       <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-        <span className="flex items-center gap-1 min-w-0" title={session.project}>
+        <span className="flex items-center gap-1 min-w-0">
           <Folder size={12} className="shrink-0" />
           <span className="truncate">{projectDisplayName(session.project)}</span>
         </span>
         <span className="flex items-center gap-2 shrink-0">
           {isSessionItem(session) && (
-            <span className="flex items-center gap-1" title={`${session.message_count} messages`}>
+            <span className="flex items-center gap-1">
               <MessageSquare size={11} />
               <span className="tabular-nums">{session.message_count}</span>
             </span>
@@ -56,14 +52,14 @@ export function SearchResultCard({
               {tools.map((tool) => {
                 const label = tool === "Other" ? "Memory" : sourceDisplayName(tool);
                 return (
-                  <span key={tool} title={label} aria-label={label}>
+                  <span key={tool} aria-label={label}>
                     <BrandIcon source={tool === "Other" ? "Memory" : tool} />
                   </span>
                 );
               })}
             </span>
           ) : (
-            <span title={sourceDisplayName(session.source)} aria-label={sourceDisplayName(session.source)}>
+            <span aria-label={sourceDisplayName(session.source)}>
               <BrandIcon source={session.source} />
             </span>
           )}

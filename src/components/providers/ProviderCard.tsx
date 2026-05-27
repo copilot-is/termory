@@ -42,16 +42,16 @@ export function ProviderCard({
 }) {
   const isOpencode = provider.app === "opencode";
   return (
-    <Card className={cn("py-3 gap-0", isInUse && "border-primary bg-primary/5")}>
+    <Card className={cn("py-3 gap-0 outline outline-1 outline-foreground/5", isInUse && "outline-primary/15 bg-primary/10")}>
       <CardContent className="px-4 flex flex-col gap-2.5">
         <div className="flex items-center justify-between gap-3 flex-wrap min-h-7">
           <div className="flex-1 min-w-0 flex flex-col gap-2">
             <div className="flex items-center gap-2">
-              <h3 className="text-[14.5px] font-medium leading-none">
+              <h3 className="text-lg font-medium">
                 {provider.name || "(unnamed)"}
               </h3>
               {isInUse && (
-                <Badge className="uppercase text-[10.5px] tracking-wide">In use</Badge>
+                <Badge className="uppercase text-[9px] tracking-wide px-1.5 py-0">In use</Badge>
               )}
             </div>
             {(provider.baseUrl || provider.apiKey || provider.model) && (

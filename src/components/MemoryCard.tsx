@@ -33,27 +33,23 @@ export function MemoryCard({
   return (
     <button
       onClick={onClick}
-      title={item.snippet || undefined}
       className={cn(
-        "w-full text-left rounded-md border px-3 py-2 transition-colors flex flex-col gap-1",
+        "w-full text-left rounded-lg px-2 py-2 transition-colors flex flex-col gap-1",
         isActive
-          ? "border-primary bg-primary/5"
-          : "border-border bg-card hover:bg-accent/40"
+          ? "bg-primary text-primary-foreground [&_*]:text-primary-foreground"
+          : "hover:bg-accent/60"
       )}
     >
       <div className="flex items-baseline justify-between gap-2">
-        <h2 className="text-sm font-medium leading-snug line-clamp-2 flex-1 min-w-0">
+        <h2 className="text-base font-medium leading-snug line-clamp-2 flex-1 min-w-0">
           {item.title}
         </h2>
-        <span
-          className="text-xs text-muted-foreground shrink-0"
-          title={formatDate(item.updated_at ?? item.started_at)}
-        >
+        <span className="text-xs text-muted-foreground shrink-0">
           {formatRelativeDate(item.updated_at ?? item.started_at)}
         </span>
       </div>
       <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-        <span className="flex items-center gap-1 min-w-0" title={item.project}>
+        <span className="flex items-center gap-1 min-w-0">
           <Folder size={12} className="shrink-0" />
           <span className="truncate">{projectDisplayName(item.project)}</span>
         </span>
@@ -62,7 +58,7 @@ export function MemoryCard({
             {tools.map((tool) => {
               const label = tool === "Other" ? "Memory" : sourceDisplayName(tool);
               return (
-                <span key={tool} title={label} aria-label={label}>
+                <span key={tool} aria-label={label}>
                   <BrandIcon source={tool === "Other" ? "Memory" : tool} />
                 </span>
               );

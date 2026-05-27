@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Plug, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   ACTIVE_STATE_REFRESH_EVENT,
   CLI_APPS,
@@ -228,45 +228,37 @@ export function ProvidersPage({
 
   return (
     <div className="flex-1 min-h-0 flex flex-col bg-background">
-      <div className="flex items-center gap-3 px-6 bg-card border-b border-border">
-        <div role="tablist" className="flex-1 flex overflow-x-auto">
-          {CLI_APPS.map((id) => {
-            const isActive = app === id;
-            return (
-              <button
-                key={id}
-                type="button"
-                role="tab"
-                aria-selected={isActive}
-                onClick={() => setApp(id)}
-                className={cn(
-                  "relative inline-flex items-center gap-2 px-3.5 py-3 text-sm whitespace-nowrap shrink-0 transition-colors border-b-2 -mb-px",
-                  isActive
-                    ? "text-foreground border-primary"
-                    : "text-muted-foreground border-transparent hover:text-foreground"
-                )}
-              >
-                <BrandIcon source={CLI_APP_SOURCE_BADGE[id]} />
-                <span>{CLI_APP_LABEL[id]}</span>
-              </button>
-            );
-          })}
+      <div className="px-3 pt-3">
+        <div className="flex items-center gap-1 rounded-md bg-muted px-3 py-2">
+          <div className="flex-1 min-w-0 overflow-x-auto">
+            <Tabs value={app} onValueChange={(v) => setApp(v as CliApp)}>
+              <TabsList className="w-full justify-start gap-1 bg-transparent p-0 [&>button]:flex-none [&>button]:rounded-full [&>button]:px-3">
+                {CLI_APPS.map((id) => (
+                  <TabsTrigger key={id} value={id}>
+                    <BrandIcon source={CLI_APP_SOURCE_BADGE[id]} />
+                    <span>{CLI_APP_LABEL[id]}</span>
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+            </Tabs>
+          </div>
+          <Button
+            type="button"
+            size="icon"
+            onClick={startNew}
+            aria-label="Add provider"
+            title="Add provider"
+            className="rounded-full size-8 shrink-0"
+          >
+            <Plus className="size-4" />
+          </Button>
         </div>
-        <Button
-          type="button"
-          size="icon"
-          onClick={startNew}
-          aria-label="Add provider"
-          title="Add provider"
-          className="rounded-full size-7 shrink-0"
-        >
-          <Plus className="size-4" />
-        </Button>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-auto px-6 py-5">
+      <div className="flex-1 min-h-0 overflow-auto p-3">
         <div className="flex flex-col gap-2.5">
           <ProviderOfficialCard
+            app={app}
             isInUse={activeState?.kind === "official"}
             settingDefault={settingDefault === "__official__"}
             onSetDefault={() => void setOfficialAsDefault()}

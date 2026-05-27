@@ -4,18 +4,19 @@ import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   BookOpen,
-  ChevronDown,
   ChevronRight,
   Clock,
-  ExternalLink,
+  FolderOpen,
   File,
   FileJson,
   Folder,
   Loader2,
   MessageSquare,
+  RefreshCw,
   Sparkles
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import type {
   AppSession,
@@ -321,12 +322,6 @@ export function App() {
   const hasActiveFilters =
     source !== "All" || project !== null || query.trim().length > 0;
 
-  const clearFilters = React.useCallback(() => {
-    setSource("All");
-    setProject(null);
-    setQuery("");
-  }, []);
-
   const sourceGroups = React.useMemo(() => {
     const sources: string[] = ["All", "Codex", "Claude", "Gemini", "OpenCode"];
     return sources.map((item) => {
@@ -348,10 +343,10 @@ export function App() {
   }, [sessionItems]);
 
   return (
-    <div className="grid grid-rows-[1fr_auto] w-full h-screen text-foreground bg-background">
-      <div className="grid grid-cols-[62px_1fr] min-h-0 min-w-0">
+    <div className="relative grid grid-rows-[1fr_auto] w-full h-screen text-foreground bg-background">
+      <div className="grid grid-cols-[63px_1fr] min-h-0 min-w-0">
         <ActivityRail route={route} onChange={setRoute} />
-        <div className="min-w-0 min-h-0 flex flex-col">
+        <div className="min-w-0 min-h-0 flex flex-col mb-3">
           {route === "search" && (
             <SearchPage
               sessions={sessions}
@@ -373,172 +368,139 @@ export function App() {
             <RoutePlaceholder route={route} />
           )}
           {route === "records" && (
-            <main className="flex-1 min-h-0 grid grid-cols-[220px_minmax(280px,360px)_1fr]">
-              <aside className="flex flex-col min-h-0 bg-sidebar border-r border-sidebar-border">
-                <div className="flex-1 min-h-0 overflow-auto px-2 py-2">
-                  <div className="flex flex-col gap-0.5">
-                    {sourceGroups.map((group) => {
-                      const groupActive = source === group.source && !project;
-                      return (
-                        <div key={group.source} className="flex flex-col gap-0.5">
-                          <button
-                            aria-expanded={
-                              group.projects.length > 0
-                                ? expandedSources.has(group.source)
-                                : undefined
-                            }
+            <main className="flex-1 min-h-0 grid grid-cols-[220px_minmax(240px,300px)_1fr]">
+              <aside className="flex flex-col min-h-0 bg-sidebar mt-3 ml-3 rounded-md">
+                <div className="flex-1 min-h-0 overflow-auto p-3 flex flex-col">
+                  {sourceGroups.flatMap((group) => {
+                    const groupActive = source === group.source && !project;
+                    const isExpanded = expandedSources.has(group.source);
+                    const hasProjects = group.projects.length > 0;
+
+                    const rows: React.ReactNode[] = [];
+
+                    rows.push(
+                      <div
+                        key={`source:${group.source}`}
+                        role="button"
+                        tabIndex={0}
+                        aria-current={groupActive ? "page" : undefined}
+                        onClick={() => {
+                          setSource(group.source);
+                          setProject(null);
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key !== "Enter" && event.key !== " ") return;
+                          event.preventDefault();
+                          setSource(group.source);
+                          setProject(null);
+                        }}
+                        className={cn(
+                          "h-8 flex items-center gap-2 px-2 rounded-lg text-base cursor-pointer transition-colors shrink-0",
+                          groupActive
+                            ? "bg-primary text-primary-foreground"
+                            : "text-sidebar-foreground hover:bg-accent/60"
+                        )}
+                      >
+                        <button
+                          type="button"
+                          aria-label={hasProjects ? `${isExpanded ? "Collapse" : "Expand"} ${group.source} projects` : undefined}
+                          disabled={!hasProjects}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setExpandedSources((current) =>
+                              toggleSetValue(current, group.source)
+                            );
+                          }}
+                          className="flex items-center justify-center size-4 shrink-0 disabled:opacity-0 disabled:pointer-events-none"
+                        >
+                          <ChevronRight
+                            size={14}
+                            className={cn("block", isExpanded && "rotate-90")}
+                          />
+                        </button>
+                        <span className="flex items-center justify-center size-4 shrink-0">
+                          <BrandIcon source={group.source} />
+                        </span>
+                        <span className="flex-1 min-w-0 truncate font-medium text-base">
+                          {sourceDisplayName(group.source)}
+                        </span>
+                        <span
+                          className={cn(
+                            "shrink-0 text-[10px] tabular-nums rounded-full px-1.5 leading-[1.4]",
+                            groupActive ? "bg-primary-foreground/20" : "bg-foreground/10"
+                          )}
+                        >
+                          {group.count}
+                        </span>
+                      </div>
+                    );
+
+                    if (hasProjects && isExpanded) {
+                      for (const [projectName, count] of group.projects) {
+                        const projActive =
+                          source === group.source && project === projectName;
+                        rows.push(
+                          <div
+                            key={`project:${group.source}:${projectName}`}
+                            role="button"
+                            tabIndex={0}
+                            aria-current={projActive ? "page" : undefined}
                             onClick={() => {
                               setSource(group.source);
-                              setProject(null);
+                              setProject(projectName);
+                              setExpandedSources((current) =>
+                                addSetValue(current, group.source)
+                              );
+                            }}
+                            onKeyDown={(event) => {
+                              if (event.key !== "Enter" && event.key !== " ") return;
+                              event.preventDefault();
+                              setSource(group.source);
+                              setProject(projectName);
                             }}
                             className={cn(
-                              "w-full flex items-center justify-between gap-2 px-2 py-1.5 rounded-md text-sm transition-colors",
-                              groupActive
-                                ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                                : "text-sidebar-foreground hover:bg-sidebar-accent/60"
+                              "h-7 flex items-center gap-2 pl-8 pr-2 rounded-lg text-base cursor-pointer transition-colors shrink-0",
+                              projActive
+                                ? "bg-primary text-primary-foreground"
+                                : "text-foreground/70 hover:bg-accent/60 hover:text-foreground"
                             )}
                           >
-                            <span className="flex items-center gap-2 min-w-0">
-                              <span
-                                role={group.projects.length > 0 ? "button" : undefined}
-                                aria-label={
-                                  group.projects.length > 0
-                                    ? `${
-                                        expandedSources.has(group.source)
-                                          ? "Collapse"
-                                          : "Expand"
-                                      } ${group.source} projects`
-                                    : undefined
-                                }
-                                tabIndex={group.projects.length > 0 ? 0 : undefined}
-                                onClick={(event) => {
-                                  if (group.projects.length === 0) return;
-                                  event.stopPropagation();
-                                  setExpandedSources((current) =>
-                                    toggleSetValue(current, group.source)
-                                  );
-                                }}
-                                onKeyDown={(event) => {
-                                  if (group.projects.length === 0) return;
-                                  if (event.key !== "Enter" && event.key !== " ") return;
-                                  event.preventDefault();
-                                  event.stopPropagation();
-                                  setExpandedSources((current) =>
-                                    toggleSetValue(current, group.source)
-                                  );
-                                }}
-                                className={cn(
-                                  "inline-flex items-center justify-center size-5 shrink-0 rounded relative",
-                                  group.projects.length > 0 &&
-                                    "hover:bg-sidebar-accent/40 cursor-pointer"
-                                )}
-                              >
-                                {group.projects.length > 0 ? (
-                                  <>
-                                    <BrandIcon source={group.source} />
-                                    <span className="absolute inset-0 inline-flex items-center justify-center opacity-0 hover:opacity-100 bg-sidebar-accent rounded transition-opacity">
-                                      {expandedSources.has(group.source) ? (
-                                        <ChevronDown size={14} />
-                                      ) : (
-                                        <ChevronRight size={14} />
-                                      )}
-                                    </span>
-                                  </>
-                                ) : (
-                                  <BrandIcon source={group.source} />
-                                )}
-                              </span>
-                              <span className="truncate">
-                                {sourceDisplayName(group.source)}
-                              </span>
+                            <span className="flex items-center justify-center size-4 shrink-0">
+                              <Folder size={14} className="block" />
                             </span>
-                            <span className="text-xs text-muted-foreground tabular-nums shrink-0">
-                              {group.count}
+                            <span className="flex-1 min-w-0 truncate">
+                              {projectDisplayName(projectName)}
                             </span>
-                          </button>
+                            <span
+                              className={cn(
+                                "shrink-0 text-[10px] tabular-nums rounded-full px-1.5 leading-[1.4]",
+                                projActive ? "bg-primary-foreground/20" : "bg-foreground/10"
+                              )}
+                            >
+                              {count}
+                            </span>
+                          </div>
+                        );
+                      }
+                    }
 
-                          {group.projects.length > 0 &&
-                            expandedSources.has(group.source) && (
-                              <div className="pl-6 flex flex-col gap-0.5">
-                                {group.projects.map(([projectName, count]) => {
-                                  const projActive =
-                                    source === group.source && project === projectName;
-                                  return (
-                                    <button
-                                      key={`${group.source}:${projectName}`}
-                                      title={`${projectName} - ${formatFullNumber(count)} Sessions`}
-                                      onClick={() => {
-                                        setSource(group.source);
-                                        setProject(projectName);
-                                        setExpandedSources((current) =>
-                                          addSetValue(current, group.source)
-                                        );
-                                      }}
-                                      className={cn(
-                                        "w-full flex items-center justify-between gap-2 px-2 py-1 rounded-md text-xs transition-colors",
-                                        projActive
-                                          ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                                          : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-foreground"
-                                      )}
-                                    >
-                                      <span className="flex items-center gap-1.5 min-w-0">
-                                        <Folder size={12} className="shrink-0" />
-                                        <span className="truncate">
-                                          {projectDisplayName(projectName)}
-                                        </span>
-                                      </span>
-                                      <span className="tabular-nums shrink-0">{count}</span>
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                            )}
-                        </div>
-                      );
-                    })}
-                  </div>
+                    return rows;
+                  })}
                 </div>
               </aside>
 
-              <section className="flex flex-col min-h-0 bg-background border-r border-border">
-                <div
-                  role="tablist"
-                  className="flex items-center gap-1 px-3 pt-3 pb-2 bg-card border-b border-border"
-                >
-                  {(
-                    [
-                      { id: "sessions", label: "Sessions", count: filtered.length },
-                      { id: "memory", label: "Memories", count: filteredMemories.length },
-                      { id: "skills", label: "Skills", count: filteredSkills.length }
-                    ] as const
-                  ).map((tab) => {
-                    const isActive = pane === tab.id;
-                    return (
-                      <button
-                        key={tab.id}
-                        type="button"
-                        role="tab"
-                        aria-selected={isActive}
-                        onClick={() => setPane(tab.id)}
-                        className={cn(
-                          "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-colors",
-                          isActive
-                            ? "bg-accent text-accent-foreground"
-                            : "text-muted-foreground hover:text-foreground"
-                        )}
-                      >
-                        <span>{tab.label}</span>
-                        <span
-                          className={cn(
-                            "tabular-nums",
-                            isActive ? "text-foreground" : "text-muted-foreground/70"
-                          )}
-                        >
-                          {tab.count}
-                        </span>
-                      </button>
-                    );
-                  })}
+              <section className="flex flex-col min-h-0">
+                <div className="p-3">
+                  <Tabs
+                    value={pane}
+                    onValueChange={(v) => setPane(v as "sessions" | "memory" | "skills")}
+                  >
+                    <TabsList className="w-full gap-1 bg-transparent p-0 [&>button]:flex-1 [&>button]:rounded-full [&>button]:px-3 [&>button]:bg-muted [&>button]:whitespace-nowrap">
+                      <TabsTrigger value="sessions">Sessions</TabsTrigger>
+                      <TabsTrigger value="memory">Memories</TabsTrigger>
+                      <TabsTrigger value="skills">Skills</TabsTrigger>
+                    </TabsList>
+                  </Tabs>
                 </div>
 
                 {error && (
@@ -548,7 +510,7 @@ export function App() {
                 )}
 
                 {pane === "sessions" && (
-                  <div className="flex-1 min-h-0 overflow-auto px-3 py-2 flex flex-col gap-1.5">
+                  <div className="flex-1 min-h-0 overflow-auto px-3 flex flex-col gap-2">
                     {loading && sessionItems.length === 0 && (
                       <EmptyState
                         icon={<Loader2 className="animate-spin" />}
@@ -571,11 +533,7 @@ export function App() {
                             ? "Try a different source, project, or query."
                             : "Nothing matches your current view."
                         }
-                        action={
-                          hasActiveFilters
-                            ? { label: "Clear filters", onClick: clearFilters }
-                            : undefined
-                        }
+                        action={undefined}
                       />
                     )}
                     {(!loading || sessionItems.length > 0) &&
@@ -589,48 +547,35 @@ export function App() {
                           <button
                             key={sessionKey(session)}
                             onClick={() => setSelected(session)}
-                            title={session.snippet || undefined}
                             className={cn(
-                              "w-full text-left rounded-md border px-3 py-2 transition-colors flex flex-col gap-1",
+                              "w-full text-left rounded-lg px-2 py-2 transition-colors flex flex-col gap-1",
                               isActive
-                                ? "border-primary bg-primary/5"
-                                : "border-border bg-card hover:bg-accent/40"
+                                ? "bg-primary text-primary-foreground [&_*]:text-primary-foreground"
+                                : "hover:bg-accent/60"
                             )}
                           >
                             <div className="flex items-baseline justify-between gap-2">
-                              <h2 className="text-sm font-medium leading-snug line-clamp-2 flex-1 min-w-0">
+                              <h2 className="text-base font-medium leading-snug line-clamp-2 flex-1 min-w-0">
                                 {session.title}
                               </h2>
-                              <span
-                                className="text-xs text-muted-foreground shrink-0"
-                                title={formatDate(session.updated_at ?? session.started_at)}
-                              >
+                              <span className="text-xs text-muted-foreground shrink-0">
                                 {formatRelativeDate(session.updated_at ?? session.started_at)}
                               </span>
                             </div>
                             <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                              <span
-                                className="flex items-center gap-1 min-w-0"
-                                title={session.project}
-                              >
+                              <span className="flex items-center gap-1 min-w-0">
                                 <Folder size={12} className="shrink-0" />
                                 <span className="truncate">
                                   {projectDisplayName(session.project)}
                                 </span>
                               </span>
                               <span className="flex items-center gap-2 shrink-0">
-                                <span
-                                  className="flex items-center gap-1"
-                                  title={`${session.message_count} messages`}
-                                >
+                                <span className="flex items-center gap-1">
                                   <MessageSquare size={11} />
                                   <span className="tabular-nums">{session.message_count}</span>
                                 </span>
                                 {source === "All" && (
-                                  <span
-                                    title={sourceDisplayName(session.source)}
-                                    aria-label={sourceDisplayName(session.source)}
-                                  >
+                                  <span aria-label={sourceDisplayName(session.source)}>
                                     <BrandIcon source={session.source} />
                                   </span>
                                 )}
@@ -651,7 +596,7 @@ export function App() {
                 )}
 
                 {pane === "memory" && (
-                  <div className="flex-1 min-h-0 overflow-auto px-3 py-2 flex flex-col gap-1.5">
+                  <div className="flex-1 min-h-0 overflow-auto px-3 flex flex-col gap-2">
                     {loading && memoryItems.length === 0 && (
                       <EmptyState
                         icon={<Loader2 className="animate-spin" />}
@@ -674,11 +619,7 @@ export function App() {
                             ? "Try a different source or query."
                             : "Nothing matches your current view."
                         }
-                        action={
-                          hasActiveFilters
-                            ? { label: "Clear filters", onClick: clearFilters }
-                            : undefined
-                        }
+                        action={undefined}
                       />
                     )}
                     {filteredMemories.map((item) => (
@@ -697,7 +638,7 @@ export function App() {
                 )}
 
                 {pane === "skills" && (
-                  <div className="flex-1 min-h-0 overflow-auto px-3 py-2 flex flex-col gap-1.5">
+                  <div className="flex-1 min-h-0 overflow-auto px-3 flex flex-col gap-2">
                     {loading && skillItems.length === 0 && (
                       <EmptyState
                         icon={<Loader2 className="animate-spin" />}
@@ -720,11 +661,7 @@ export function App() {
                             ? "Try a different source or query."
                             : "Nothing matches your current view."
                         }
-                        action={
-                          hasActiveFilters
-                            ? { label: "Clear filters", onClick: clearFilters }
-                            : undefined
-                        }
+                        action={undefined}
                       />
                     )}
                     {filteredSkills.map((item) => (
@@ -743,7 +680,7 @@ export function App() {
                 )}
               </section>
 
-              <section className="flex flex-col min-h-0 bg-background">
+              <section className="flex flex-col min-h-0 min-w-0 bg-background">
                 {!selected && sessions.length === 0 && !loading && (
                   <EmptyState
                     icon={<Sparkles size={32} />}
@@ -762,9 +699,9 @@ export function App() {
                 )}
                 {selected && (
                   <>
-                    <header className="flex flex-col gap-2 px-5 py-3 bg-card border-b border-border">
+                    <header className="flex flex-col gap-2 p-3">
                       <h2
-                        className="text-base font-semibold leading-snug"
+                        className="text-lg font-semibold leading-snug"
                         title={selected.title}
                       >
                         {selected.title || "(untitled)"}
@@ -810,17 +747,16 @@ export function App() {
                           <File size={13} className="shrink-0" />
                           <span className="truncate">{selected.path}</span>
                         </div>
-                        <div className="inline-flex items-center gap-1 shrink-0">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-7"
+                        <div className="inline-flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
                             onClick={() => revealItemInDir(selected.path)}
                             title="Open in Finder"
                             aria-label="Open in Finder"
+                            className="inline-flex shrink-0 text-muted-foreground hover:text-foreground transition-colors"
                           >
-                            <ExternalLink size={14} />
-                          </Button>
+                            <FolderOpen size={13} />
+                          </button>
                           <CopyMenu
                             items={[
                               ...(isSessionItem(selected) &&
@@ -843,7 +779,7 @@ export function App() {
                       </div>
                     </header>
 
-                    <div className="flex-1 flex flex-col gap-5 overflow-auto p-4">
+                    <div className="flex-1 flex flex-col gap-5 overflow-auto px-4 py-2">
                       {detailLoading && (
                         <div className="flex items-center justify-center min-h-[120px] text-muted-foreground">
                           <Loader2 className="animate-spin" />
@@ -872,7 +808,7 @@ export function App() {
                       {!detailLoading &&
                       !isSessionItem(selected) &&
                       detail?.messages.length ? (
-                        <div className="rounded-lg border border-border bg-card text-card-foreground px-5 py-4">
+                        <div className="rounded-lg bg-card text-card-foreground px-5 py-4">
                           <MessageBody
                             text={detail.messages.map((m) => m.text).join("\n\n")}
                           />

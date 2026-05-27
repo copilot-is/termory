@@ -98,5 +98,5 @@ export function isRoute(value: string): value is Route {
 
 export function readRouteFromHash(): Route {
   const raw = window.location.hash.replace(/^#/, "");
-  return isRoute(raw) ? raw : "records";
+  return isRoute(raw) ? raw : "config";
 }
