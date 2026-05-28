@@ -7843,7 +7843,34 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool, Box<dyn Error>> {
     Ok(exists > 0)
 }
 
+/// Reject anything that isn't a bare alphanumeric/underscore SQL
+/// identifier (no quoting, no dots, no semicolons, no spaces). Our
+/// schemas only use plain names so this is strict enough to keep
+/// `format!()`-style PRAGMA injection at `column_exists` safe.
+fn is_safe_sql_identifier(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, Box<dyn Error>> {
+    // Defense in depth: SQLite `PRAGMA table_info(<name>)` does not
+    // accept bind parameters for the table identifier, so we have to
+    // inject `<name>` into the SQL string. Today the only caller
+    // passes the hardcoded literal `"threads"` — but reject anything
+    // that isn't a bare SQL identifier so a future caller that pipes
+    // a row value here can't accidentally introduce injection.
+    if !is_safe_sql_identifier(table) {
+        return Err(
+            format!("rejecting unsafe table identifier: {table}").into(),
+        );
+    }
     let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -7860,6 +7887,23 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn is_safe_sql_identifier_accepts_normal_names_and_rejects_injection() {
+        // Accept plain identifiers we actually use
+        assert!(is_safe_sql_identifier("threads"));
+        assert!(is_safe_sql_identifier("session_message"));
+        assert!(is_safe_sql_identifier("_internal"));
+        assert!(is_safe_sql_identifier("Table42"));
+        // Reject empty / leading digit / illegal chars / SQL fragments
+        assert!(!is_safe_sql_identifier(""));
+        assert!(!is_safe_sql_identifier("9threads"));
+        assert!(!is_safe_sql_identifier("threads;DROP TABLE x"));
+        assert!(!is_safe_sql_identifier("threads.name"));
+        assert!(!is_safe_sql_identifier("\"threads\""));
+        assert!(!is_safe_sql_identifier("threads--"));
+        assert!(!is_safe_sql_identifier("threads OR 1=1"));
+    }
 
     #[test]
     fn get_session_rejects_id_outside_scan_set() {

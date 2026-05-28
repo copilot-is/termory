@@ -144,6 +144,3 @@ export const ROUTES: Route[] = ["records", "search", "stats", "config", "setting
 // and ⌘1..5 bindings.
 export const RAIL_ROUTE_ORDER: Route[] = ["config", "records", "search", "stats", "settings"];
 
-// Time gap (ms) between two messages that triggers a TimeSeparator
-// row in the message stream.
-export const TIME_GAP_MS = 5 * 60 * 1000;

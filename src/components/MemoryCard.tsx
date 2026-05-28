@@ -1,6 +1,6 @@
 import { Folder } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { formatDate, formatRelativeDate } from "@/lib/format";
+import { formatRelativeDate } from "@/lib/format";
 import {
   memoryToolsOf,
   projectDisplayName,

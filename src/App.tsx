@@ -14,7 +14,6 @@ import {
   Folder,
   Loader2,
   MessageSquare,
-  RefreshCw,
   Sparkles
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -29,7 +28,7 @@ import type {
   SearchHit,
   SessionDetail
 } from "@/types";
-import { formatDate, formatFullNumber, formatRelativeDate } from "@/lib/format";
+import { formatDate, formatRelativeDate } from "@/lib/format";
 import {
   basename,
   isMemoryItem,

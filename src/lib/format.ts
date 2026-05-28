@@ -79,10 +79,3 @@ export function formatTimeAgo(timestamp: number): string {
 export function formatFullNumber(value: number): string {
   return numberFormatter.format(value);
 }
-
-export function formatCompactNumber(value: number): string {
-  if (value < 1000) return String(value);
-  const compact = value / 1000;
-  const rounded = compact >= 10 ? Math.round(compact).toString() : compact.toFixed(1);
-  return `${rounded.replace(/\.0$/, "")}k`;
-}
