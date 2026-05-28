@@ -71,6 +71,43 @@ Current Tauri IPC commands, called from the frontend with `invoke(...)`:
 
 The Tauri binary is renamed via `[[bin]] name = "Termory"` in `src-tauri/Cargo.toml` plus `mainBinaryName: "Termory"` in `tauri.conf.json`, so the macOS menu bar shows "Termory" rather than the lowercase Cargo package name.
 
+## Release & Updater
+
+GitHub Actions workflow at `.github/workflows/release.yml` is triggered when a `v*` tag is pushed (e.g. `git tag v0.2.0 && git push --tags`) or manually via `workflow_dispatch`. It uses `tauri-apps/tauri-action@v0` and builds installers for:
+
+- macOS Apple Silicon (`aarch64-apple-darwin`)
+- macOS Intel (`x86_64-apple-darwin`)
+- Linux x86_64 (`x86_64-unknown-linux-gnu`) — with apt deps for webkit2gtk-4.1, soup-3.0, javascriptcoregtk-4.1, etc.
+- Windows x86_64 (`x86_64-pc-windows-msvc`)
+
+A draft GitHub Release is created with the platform installers attached plus `latest.json` (the updater manifest). Review & publish the draft.
+
+### In-app updater (`tauri-plugin-updater`)
+
+- Plugin registered in `lib.rs`: `tauri_plugin_updater::Builder::new().build()` + `tauri_plugin_process::init()` for `relaunch()`.
+- `tauri.conf.json` declares `bundle.createUpdaterArtifacts: true` and `plugins.updater.endpoints` pointing at `https://github.com/copilot-is/termory/releases/latest/download/latest.json`.
+- `capabilities/default.json` grants `updater:default` + `process:default`.
+- Frontend: `Settings` page exposes "Check for updates" → `@tauri-apps/plugin-updater::check()` → "Download and install" → `update.downloadAndInstall()` → `@tauri-apps/plugin-process::relaunch()`.
+
+### One-time signing key setup (required before first signed release)
+
+The updater only installs artifacts whose signature matches a pubkey baked into the binary. Without a keypair, in-app updates won't work (but the GitHub Actions builds still produce installers — users can download manually).
+
+```sh
+# Generates ~/.tauri/termory.key (private, password-protected) + termory.key.pub
+npx @tauri-apps/cli signer generate -w ~/.tauri/termory.key
+```
+
+Then:
+
+1. Paste the contents of `~/.tauri/termory.key.pub` into `tauri.conf.json` `plugins.updater.pubkey`.
+2. Add GitHub repo secrets:
+   - `TAURI_SIGNING_PRIVATE_KEY` = contents of `~/.tauri/termory.key` (the private file)
+   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` = the password you set during generation
+3. Tag and push: `git tag v0.2.0 && git push --tags` — the workflow builds, signs, and publishes a draft release.
+
+Bump `src-tauri/tauri.conf.json` `version` and `src-tauri/Cargo.toml` `version` together before tagging so the binary self-reports the right version.
+
 macOS bundle identifier: `is.chats.termory` (reverse DNS of the `chats.is` domain the project ships under). Do NOT change this after a public release — macOS treats a different identifier as a different app, so existing user data and the Tauri updater would break.
 
 The repo also contains `.audit-sources/` (gitignored) with shallow clones of `openai/codex`, `google-gemini/gemini-cli`, `sst/opencode`, `videcoding/cli` (legacy Claude Code reference), and `farion1231/cc-switch` (reference for provider-switcher behavior). This is the source-of-truth for path/behavior verification when official docs disagree with implementation — grep here instead of WebFetching docs.

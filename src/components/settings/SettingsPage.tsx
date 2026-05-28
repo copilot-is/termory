@@ -2,7 +2,11 @@ import React from "react";
 import { useTheme } from "next-themes";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { homeDir, join } from "@tauri-apps/api/path";
-import { Check, Folder, FolderOpen, Monitor, Moon, Sun, Trash2 } from "lucide-react";
+import { getVersion } from "@tauri-apps/api/app";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { toast } from "sonner";
+import { Check, Download, Folder, FolderOpen, Loader2, Monitor, Moon, RefreshCw, Sun, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
@@ -32,6 +36,11 @@ export function SettingsPage({
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = React.useState(false);
   const [termoryDir, setTermoryDir] = React.useState<string | null>(null);
+  const [appVersion, setAppVersion] = React.useState<string>("");
+  const [update, setUpdate] = React.useState<Update | null>(null);
+  const [checking, setChecking] = React.useState(false);
+  const [installing, setInstalling] = React.useState(false);
+  const [updateState, setUpdateState] = React.useState<"idle" | "uptodate" | "available" | "error">("idle");
 
   React.useEffect(() => {
     setMounted(true);
@@ -42,8 +51,46 @@ export function SettingsPage({
       } catch {
         setTermoryDir(null);
       }
+      try {
+        setAppVersion(await getVersion());
+      } catch {
+        setAppVersion("");
+      }
     })();
   }, []);
+
+  const handleCheckUpdate = async () => {
+    setChecking(true);
+    setUpdateState("idle");
+    try {
+      const result = await check();
+      if (result) {
+        setUpdate(result);
+        setUpdateState("available");
+      } else {
+        setUpdate(null);
+        setUpdateState("uptodate");
+      }
+    } catch (err) {
+      setUpdateState("error");
+      toast.error(`Update check failed: ${String(err)}`);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const handleInstallUpdate = async () => {
+    if (!update) return;
+    setInstalling(true);
+    try {
+      await update.downloadAndInstall();
+      toast.success("Update installed. Restarting…");
+      await relaunch();
+    } catch (err) {
+      toast.error(`Install failed: ${String(err)}`);
+      setInstalling(false);
+    }
+  };
 
   const current = (mounted ? (theme as ThemeChoice) : "system") ?? "system";
 
@@ -147,12 +194,72 @@ export function SettingsPage({
             </ul>
           </SettingsSection>
 
+          <SettingsSection title="Updates">
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex flex-col gap-0.5 min-w-0">
+                  <div className="text-sm">Current version</div>
+                  <div className="text-xs text-muted-foreground font-mono">
+                    {appVersion || "—"}
+                  </div>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={checking || installing}
+                  onClick={() => void handleCheckUpdate()}
+                >
+                  {checking ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="size-4" />
+                  )}
+                  {checking ? "Checking…" : "Check for updates"}
+                </Button>
+              </div>
+              {updateState === "uptodate" && (
+                <div className="text-xs text-muted-foreground flex items-center gap-1.5">
+                  <Check className="size-3.5 text-primary" />
+                  You're on the latest version.
+                </div>
+              )}
+              {updateState === "available" && update && (
+                <div className="flex flex-col gap-2 rounded-md outline outline-1 outline-primary/15 bg-primary/10 p-3">
+                  <div className="text-sm font-medium text-primary">
+                    Update available: v{update.version}
+                  </div>
+                  {update.body && (
+                    <div className="text-xs text-muted-foreground leading-relaxed whitespace-pre-wrap">
+                      {update.body}
+                    </div>
+                  )}
+                  <div>
+                    <Button
+                      type="button"
+                      size="sm"
+                      disabled={installing}
+                      onClick={() => void handleInstallUpdate()}
+                    >
+                      {installing ? (
+                        <Loader2 className="size-4 animate-spin" />
+                      ) : (
+                        <Download className="size-4" />
+                      )}
+                      {installing ? "Installing…" : "Download and install"}
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </SettingsSection>
+
           <SettingsSection title="About">
             <div className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm">
               <span className="text-muted-foreground">App</span>
               <span>Termory</span>
               <span className="text-muted-foreground">Version</span>
-              <span className="font-mono">0.1.0</span>
+              <span className="font-mono">{appVersion || "—"}</span>
             </div>
           </SettingsSection>
         </div>
