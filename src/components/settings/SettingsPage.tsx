@@ -2,11 +2,9 @@ import React from "react";
 import { useTheme } from "next-themes";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { homeDir, join } from "@tauri-apps/api/path";
-import { getVersion } from "@tauri-apps/api/app";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { toast } from "sonner";
-import { Check, Download, Folder, FolderOpen, Loader2, Monitor, Moon, RefreshCw, Sun, Trash2 } from "lucide-react";
+import { Folder, FolderOpen, Loader2, Monitor, Moon, RefreshCw, Sun, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
@@ -28,19 +26,23 @@ const SHORTCUTS: { keys: string[]; label: string }[] = [
 
 export function SettingsPage({
   recentSearches,
-  onClearRecent
+  onClearRecent,
+  autoCheckUpdates,
+  onAutoCheckUpdatesChange,
+  appVersion,
+  onUpdateFound
 }: {
   recentSearches: string[];
   onClearRecent: () => void;
+  autoCheckUpdates: boolean;
+  onAutoCheckUpdatesChange: (next: boolean) => void;
+  appVersion: string;
+  onUpdateFound: (update: Update) => void;
 }) {
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = React.useState(false);
   const [termoryDir, setTermoryDir] = React.useState<string | null>(null);
-  const [appVersion, setAppVersion] = React.useState<string>("");
-  const [update, setUpdate] = React.useState<Update | null>(null);
   const [checking, setChecking] = React.useState(false);
-  const [installing, setInstalling] = React.useState(false);
-  const [updateState, setUpdateState] = React.useState<"idle" | "uptodate" | "available" | "error">("idle");
 
   React.useEffect(() => {
     setMounted(true);
@@ -51,44 +53,22 @@ export function SettingsPage({
       } catch {
         setTermoryDir(null);
       }
-      try {
-        setAppVersion(await getVersion());
-      } catch {
-        setAppVersion("");
-      }
     })();
   }, []);
 
   const handleCheckUpdate = async () => {
     setChecking(true);
-    setUpdateState("idle");
     try {
       const result = await check();
       if (result) {
-        setUpdate(result);
-        setUpdateState("available");
+        onUpdateFound(result);
       } else {
-        setUpdate(null);
-        setUpdateState("uptodate");
+        toast.success("You're on the latest version.");
       }
     } catch (err) {
-      setUpdateState("error");
       toast.error(`Update check failed: ${String(err)}`);
     } finally {
       setChecking(false);
-    }
-  };
-
-  const handleInstallUpdate = async () => {
-    if (!update) return;
-    setInstalling(true);
-    try {
-      await update.downloadAndInstall();
-      toast.success("Update installed. Restarting…");
-      await relaunch();
-    } catch (err) {
-      toast.error(`Install failed: ${String(err)}`);
-      setInstalling(false);
     }
   };
 
@@ -99,7 +79,7 @@ export function SettingsPage({
       <div className="flex-1 min-h-0 overflow-auto p-3">
         <div className="flex flex-col gap-2">
           <SettingsSection title="Appearance">
-            <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-3 gap-2">
                 {THEME_OPTIONS.map((opt) => {
                   const active = current === opt.value;
                   return (
@@ -110,17 +90,14 @@ export function SettingsPage({
                       className={cn(
                         "flex flex-col items-center gap-1.5 rounded-md px-3 py-3 text-sm transition-colors outline outline-1",
                         active
-                          ? "outline-primary/15 bg-primary/10 text-primary"
+                          ? "bg-primary text-primary-foreground outline-transparent"
                           : "outline-foreground/5 hover:bg-accent hover:text-accent-foreground"
                       )}
                     >
-                      <span className="inline-flex items-center justify-center size-8 rounded-md bg-background shadow-sm">
+                      <span className="inline-flex items-center justify-center size-8 rounded-md bg-background text-foreground shadow-sm">
                         {opt.icon}
                       </span>
-                      <span className="flex items-center gap-1">
-                        {opt.label}
-                        {active && <Check className="size-3.5" />}
-                      </span>
+                      <span>{opt.label}</span>
                     </button>
                   );
                 })}
@@ -194,20 +171,20 @@ export function SettingsPage({
             </ul>
           </SettingsSection>
 
-          <SettingsSection title="Updates">
+          <SettingsSection title="About">
             <div className="flex flex-col gap-3">
               <div className="flex items-center justify-between gap-3">
-                <div className="flex flex-col gap-0.5 min-w-0">
-                  <div className="text-sm">Current version</div>
-                  <div className="text-xs text-muted-foreground font-mono">
-                    {appVersion || "—"}
-                  </div>
+                <div className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm min-w-0">
+                  <span className="text-muted-foreground">App</span>
+                  <span>Termory</span>
+                  <span className="text-muted-foreground">Version</span>
+                  <span className="font-mono">{appVersion || "—"}</span>
                 </div>
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
-                  disabled={checking || installing}
+                  disabled={checking}
                   onClick={() => void handleCheckUpdate()}
                 >
                   {checking ? (
@@ -218,48 +195,31 @@ export function SettingsPage({
                   {checking ? "Checking…" : "Check for updates"}
                 </Button>
               </div>
-              {updateState === "uptodate" && (
-                <div className="text-xs text-muted-foreground flex items-center gap-1.5">
-                  <Check className="size-3.5 text-primary" />
-                  You're on the latest version.
-                </div>
-              )}
-              {updateState === "available" && update && (
-                <div className="flex flex-col gap-2 rounded-md outline outline-1 outline-primary/15 bg-primary/10 p-3">
-                  <div className="text-sm font-medium text-primary">
-                    Update available: v{update.version}
+              <div className="flex items-center justify-between gap-3 pt-1">
+                <div className="flex flex-col gap-0.5 min-w-0">
+                  <div className="text-sm">Check for updates automatically</div>
+                  <div className="text-xs text-muted-foreground">
+                    Runs once a few seconds after the app launches.
                   </div>
-                  {update.body && (
-                    <div className="text-xs text-muted-foreground leading-relaxed whitespace-pre-wrap">
-                      {update.body}
-                    </div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={autoCheckUpdates}
+                  onClick={() => onAutoCheckUpdatesChange(!autoCheckUpdates)}
+                  className={cn(
+                    "relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors",
+                    autoCheckUpdates ? "bg-primary" : "bg-muted"
                   )}
-                  <div>
-                    <Button
-                      type="button"
-                      size="sm"
-                      disabled={installing}
-                      onClick={() => void handleInstallUpdate()}
-                    >
-                      {installing ? (
-                        <Loader2 className="size-4 animate-spin" />
-                      ) : (
-                        <Download className="size-4" />
-                      )}
-                      {installing ? "Installing…" : "Download and install"}
-                    </Button>
-                  </div>
-                </div>
-              )}
-            </div>
-          </SettingsSection>
-
-          <SettingsSection title="About">
-            <div className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm">
-              <span className="text-muted-foreground">App</span>
-              <span>Termory</span>
-              <span className="text-muted-foreground">Version</span>
-              <span className="font-mono">{appVersion || "—"}</span>
+                >
+                  <span
+                    className={cn(
+                      "absolute top-0.5 inline-block size-4 rounded-full bg-background shadow-sm transition-transform",
+                      autoCheckUpdates ? "translate-x-[18px]" : "translate-x-0.5"
+                    )}
+                  />
+                </button>
+              </div>
             </div>
           </SettingsSection>
         </div>

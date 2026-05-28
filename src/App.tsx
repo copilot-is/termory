@@ -2,6 +2,8 @@ import React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { getVersion } from "@tauri-apps/api/app";
+import type { Update } from "@tauri-apps/plugin-updater";
 import {
   BookOpen,
   ChevronRight,
@@ -55,6 +57,7 @@ import { MessageBody } from "@/components/MessageBody";
 import { MessageList } from "@/components/MessageList";
 import { RoutePlaceholder } from "@/components/RoutePlaceholder";
 import { SettingsPage } from "@/components/settings/SettingsPage";
+import { UpdateDialog } from "@/components/UpdateDialog";
 import { SnippetLine } from "@/components/SnippetLine";
 import { SearchPage } from "@/components/search/SearchPage";
 import { ProvidersPage } from "@/components/providers/ProvidersPage";
@@ -95,6 +98,11 @@ export function App() {
     "claude",
     (raw): raw is CliApp =>
       raw === "claude" || raw === "codex" || raw === "gemini" || raw === "opencode"
+  );
+  const [autoCheckUpdates, setAutoCheckUpdates] = usePersistentState<boolean>(
+    "auto_check_updates",
+    true,
+    (raw): raw is boolean => typeof raw === "boolean"
   );
 
   const addRecentSearch = React.useCallback(
@@ -147,6 +155,40 @@ export function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  // Auto-check for updates on app launch when enabled. Delayed a few
+  // seconds so the persistent state has time to load (user might have
+  // it disabled) and so the network call doesn't fight with the
+  // initial scan_all_sessions. Found update pops the UpdateDialog;
+  // user clicks Install or Later.
+  const [pendingUpdate, setPendingUpdate] = React.useState<Update | null>(null);
+  const [appVersion, setAppVersion] = React.useState("");
+  React.useEffect(() => {
+    void getVersion().then(setAppVersion).catch(() => {});
+  }, []);
+  const autoCheckRef = React.useRef(autoCheckUpdates);
+  React.useEffect(() => {
+    autoCheckRef.current = autoCheckUpdates;
+  }, [autoCheckUpdates]);
+  React.useEffect(() => {
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (!autoCheckRef.current) return;
+      void import("@tauri-apps/plugin-updater")
+        .then(({ check }) => check())
+        .then((update) => {
+          if (cancelled || !update) return;
+          setPendingUpdate(update);
+        })
+        .catch(() => {
+          /* silent — manual check surfaces the error */
+        });
+    }, 3000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, []);
 
   // Shared "jump to this record" action — used by both the Search page
@@ -408,6 +450,10 @@ export function App() {
             <SettingsPage
               recentSearches={recentSearches}
               onClearRecent={clearRecentSearches}
+              autoCheckUpdates={autoCheckUpdates}
+              onAutoCheckUpdatesChange={setAutoCheckUpdates}
+              appVersion={appVersion}
+              onUpdateFound={(update) => setPendingUpdate(update)}
             />
           )}
           {route !== "records" && route !== "search" && route !== "config" && route !== "settings" && (
@@ -854,6 +900,11 @@ export function App() {
         recentSearches={recentSearches}
         onCommitSearch={addRecentSearch}
         onClearRecent={clearRecentSearches}
+      />
+      <UpdateDialog
+        update={pendingUpdate}
+        currentVersion={appVersion}
+        onClose={() => setPendingUpdate(null)}
       />
     </div>
   );
