@@ -6,22 +6,24 @@ import { CLI_APP_SOURCE_BADGE } from "@/constants";
 import { cn } from "@/lib/utils";
 import type { CliApp } from "@/types";
 
-const OFFICIAL_DESCRIPTION: Record<CliApp, string> = {
-  claude: "Uses the official Claude Code configuration.",
-  codex: "Uses the official Codex configuration.",
-  gemini: "Uses the official Gemini CLI configuration.",
-  opencode: "Uses the official OpenCode configuration."
-};
-
 export function ProviderOfficialCard({
   app,
   isInUse,
   settingDefault,
+  version,
+  versionLoading = false,
   onSetDefault
 }: {
   app: CliApp;
   isInUse: boolean;
   settingDefault: boolean;
+  // Installed CLI version parsed from `<bin> --version`. Null AFTER
+  // detection ran but `--version` returned nothing parseable.
+  version?: string | null;
+  // True while the version detection is in flight (covers initial
+  // mount and Recheck). When true the card renders a loading
+  // placeholder instead of "—".
+  versionLoading?: boolean;
   onSetDefault: () => void;
 }) {
   return (
@@ -30,7 +32,7 @@ export function ProviderOfficialCard({
         <span className="shrink-0 inline-flex items-center justify-center size-10 rounded-md bg-background shadow-sm [&_svg]:size-5">
           <BrandIcon source={CLI_APP_SOURCE_BADGE[app]} />
         </span>
-        <div className="flex-1 min-w-0 flex flex-col gap-1">
+        <div className="flex-1 min-w-0 flex flex-col">
           <div className="flex items-center gap-2">
             <h3 className="text-lg font-medium">Official</h3>
             {isInUse && (
@@ -38,7 +40,14 @@ export function ProviderOfficialCard({
             )}
           </div>
           <p className="text-xs text-muted-foreground leading-snug">
-            {OFFICIAL_DESCRIPTION[app]}
+            Version:{" "}
+            {versionLoading ? (
+              <span className="inline-block w-12 h-3 align-middle rounded bg-muted-foreground/15 animate-pulse" />
+            ) : version ? (
+              <span className="font-mono">v{version}</span>
+            ) : (
+              <span className="font-mono">—</span>
+            )}
           </p>
         </div>
         {!isInUse && (

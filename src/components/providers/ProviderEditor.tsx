@@ -179,7 +179,7 @@ export function ProviderEditor({
                   id="provider-apikey"
                   type={revealKey ? "text" : "password"}
                   className="font-mono"
-                  placeholder="sk-… (leave blank to fill in CLI later)"
+                  placeholder="sk-… (leave blank to fill in later)"
                   value={draft.apiKey ?? ""}
                   onChange={(e) => update("apiKey", e.target.value)}
                   autoComplete="off"

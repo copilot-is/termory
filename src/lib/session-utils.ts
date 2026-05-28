@@ -8,13 +8,11 @@ export function sessionKey(session: { source: string; path: string; id: string }
 // Pretty label for a tool/source identifier. Internal source values
 // stay short ("Claude", "Gemini"); the display layer always goes
 // through this helper so Records and Providers show the same official
-// tool name ("Claude Code", "Gemini CLI").
+// tool name ("Claude Code", "Gemini").
 export function sourceDisplayName(source: string): string {
   switch (source) {
     case "Claude":
       return "Claude Code";
-    case "Gemini":
-      return "Gemini CLI";
     default:
       return source;
   }

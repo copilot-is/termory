@@ -14,9 +14,9 @@ pub(crate) mod testutils {
 }
 
 use providers::{
-    activate, deactivate, delete_provider_traces, fetch_models, read_active_state,
-    set_opencode_default, test_provider, ActiveState, CliApp, ModelListResult, Provider,
-    TestResult,
+    activate, deactivate, delete_provider_traces, detect_cli_versions, detect_installed_clis,
+    fetch_models, read_active_state, set_opencode_default, test_provider, ActiveState, CliApp,
+    ModelListResult, Provider, TestResult,
 };
 use sessions::{get_session, scan_sessions, search_sessions, AppSession, SearchHit, SessionDetail};
 use tauri::Manager;
@@ -58,6 +58,51 @@ async fn search_all_sessions(query: String) -> Result<Vec<SearchHit>, String> {
     })
     .await
     .map_err(|err| err.to_string())?
+}
+
+/// Detect which CLI binaries are reachable on `$PATH`. Result is
+/// fresh per call — the frontend re-checks on Providers page mount
+/// and before every action so newly-installed CLIs surface without
+/// an app restart.
+#[tauri::command]
+async fn detect_clis() -> Result<std::collections::HashMap<String, bool>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let map = detect_installed_clis();
+        let serialized = map
+            .into_iter()
+            .map(|(app, installed)| (cli_app_key(app).to_string(), installed))
+            .collect();
+        Ok(serialized)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+/// Spawn each installed CLI with `--version` and return the parsed
+/// version. Heavier than [`detect_clis`] (4 subprocesses), so the
+/// frontend calls this only on page mount / Recheck.
+#[tauri::command]
+async fn detect_cli_versions_cmd(
+) -> Result<std::collections::HashMap<String, Option<String>>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let map = detect_cli_versions();
+        let serialized = map
+            .into_iter()
+            .map(|(app, version)| (cli_app_key(app).to_string(), version))
+            .collect();
+        Ok(serialized)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+fn cli_app_key(app: CliApp) -> &'static str {
+    match app {
+        CliApp::Claude => "claude",
+        CliApp::Codex => "codex",
+        CliApp::Gemini => "gemini",
+        CliApp::Opencode => "opencode",
+    }
 }
 
 /// Reverse-derive the active provider state for one CLI. The frontend
@@ -212,6 +257,8 @@ pub fn run() {
             scan_all_sessions,
             load_session,
             search_all_sessions,
+            detect_clis,
+            detect_cli_versions_cmd,
             provider_active_state,
             provider_active_states,
             activate_provider,

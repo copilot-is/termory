@@ -1,7 +1,7 @@
 import React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Plug, Plus } from "lucide-react";
+import { AlertTriangle, Plug, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -15,6 +15,7 @@ import { blankProvider } from "@/lib/provider-utils";
 import type { ActiveState, CliApp, Provider, TestResult } from "@/types";
 import { BrandIcon } from "@/components/BrandIcon";
 import { EmptyState } from "@/components/EmptyState";
+import { InstallGuide } from "./InstallGuide";
 import { ProviderCard } from "./ProviderCard";
 import { ProviderEditor } from "./ProviderEditor";
 import { ProviderOfficialCard } from "./ProviderOfficialCard";
@@ -38,10 +39,109 @@ export function ProvidersPage({
     gemini: null,
     opencode: null
   });
+  const [installed, setInstalled] = React.useState<Record<CliApp, boolean>>({
+    claude: true,
+    codex: true,
+    gemini: true,
+    opencode: true
+  });
+  const [versions, setVersions] = React.useState<Record<CliApp, string | null>>({
+    claude: null,
+    codex: null,
+    gemini: null,
+    opencode: null
+  });
+  const [versionsLoading, setVersionsLoading] = React.useState(true);
   const [toggling, setToggling] = React.useState<string | null>(null);
   const [testing, setTesting] = React.useState<string | null>(null);
   const [testResults, setTestResults] = React.useState<Record<string, TestResult>>({});
   const [settingDefault, setSettingDefault] = React.useState<string | null>(null);
+  const [rechecking, setRechecking] = React.useState(false);
+
+  const refreshInstalled = React.useCallback(async () => {
+    try {
+      const map = await invoke<Record<string, boolean>>("detect_clis");
+      setInstalled({
+        claude: !!map.claude,
+        codex: !!map.codex,
+        gemini: !!map.gemini,
+        opencode: !!map.opencode
+      });
+    } catch {
+      /* leave previous state on error */
+    }
+  }, []);
+
+  // Heavier than refreshInstalled — spawns 4 `<bin> --version`
+  // subprocesses. Called on page mount + Recheck; not before every
+  // action (the install gate uses refreshInstalled / detect_clis).
+  const refreshVersions = React.useCallback(async () => {
+    setVersionsLoading(true);
+    try {
+      const map = await invoke<Record<string, string | null>>(
+        "detect_cli_versions_cmd"
+      );
+      setVersions({
+        claude: map.claude ?? null,
+        codex: map.codex ?? null,
+        gemini: map.gemini ?? null,
+        opencode: map.opencode ?? null
+      });
+    } catch {
+      /* leave previous state on error */
+    } finally {
+      setVersionsLoading(false);
+    }
+  }, []);
+
+  const handleRecheckInstall = async () => {
+    setRechecking(true);
+    try {
+      const map = await invoke<Record<string, boolean>>("detect_clis");
+      const next = {
+        claude: !!map.claude,
+        codex: !!map.codex,
+        gemini: !!map.gemini,
+        opencode: !!map.opencode
+      };
+      setInstalled(next);
+      if (next[app]) {
+        toast.success(`${CLI_APP_LABEL[app]} detected.`);
+        void refreshVersions();
+      } else {
+        toast.error(`${CLI_APP_LABEL[app]} still not installed.`);
+      }
+    } catch (err) {
+      toast.error(`Detection failed: ${String(err)}`);
+    } finally {
+      setRechecking(false);
+    }
+  };
+
+  // Pre-action gate: re-check whether the target CLI is installed
+  // right now. Returns true to proceed, false to abort (toast already
+  // shown). Used by the action handlers that actually need the CLI
+  // binary to consume the live config we're about to mutate.
+  const ensureCliInstalled = async (target: CliApp): Promise<boolean> => {
+    try {
+      const map = await invoke<Record<string, boolean>>("detect_clis");
+      setInstalled({
+        claude: !!map.claude,
+        codex: !!map.codex,
+        gemini: !!map.gemini,
+        opencode: !!map.opencode
+      });
+      if (!map[target]) {
+        toast.error(
+          `${CLI_APP_LABEL[target]} is not installed. Install it first.`
+        );
+        return false;
+      }
+      return true;
+    } catch {
+      return true; // detection failed — don't block the user
+    }
+  };
 
   const refreshActive = React.useCallback(async () => {
     try {
@@ -62,6 +162,11 @@ export function ProvidersPage({
   React.useEffect(() => {
     void refreshActive();
   }, [refreshActive]);
+
+  React.useEffect(() => {
+    void refreshInstalled();
+    void refreshVersions();
+  }, [refreshInstalled, refreshVersions]);
 
   // Auto refresh when the Rust watcher detects any change in the
   // CLI dirs (live config files live inside those dirs). Reuse the
@@ -145,6 +250,7 @@ export function ProvidersPage({
   // don't have this concept — they only have "Set as default".
   const toggleEnabled = async (target: Provider) => {
     if (target.app !== "opencode") return;
+    if (!(await ensureCliInstalled(target.app))) return;
     const state = activeStates[target.app];
     const enabled = (state?.configuredProviderIds ?? []).includes(target.id);
     setToggling(target.id);
@@ -169,6 +275,7 @@ export function ProvidersPage({
 
   // Universal "Set as default" — promotes a provider to "In use".
   const setAsDefault = async (target: Provider) => {
+    if (!(await ensureCliInstalled(target.app))) return;
     setSettingDefault(target.id);
     try {
       if (target.app === "opencode") {
@@ -191,6 +298,7 @@ export function ProvidersPage({
   // Official "Set as default" — clears Termory writes from the CLI's
   // live config so it falls back to its native auth flow.
   const setOfficialAsDefault = async () => {
+    if (!(await ensureCliInstalled(app))) return;
     setSettingDefault("__official__");
     try {
       await invoke("deactivate_provider", {
@@ -246,8 +354,9 @@ export function ProvidersPage({
             type="button"
             size="icon"
             onClick={startNew}
+            disabled={!installed[app]}
             aria-label="Add provider"
-            title="Add provider"
+            title={installed[app] ? "Add provider" : `Install ${CLI_APP_LABEL[app]} first.`}
             className="rounded-md size-8 shrink-0 shadow-sm"
           >
             <Plus className="size-4" />
@@ -255,52 +364,87 @@ export function ProvidersPage({
         </div>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-auto p-3">
-        <div className="flex flex-col gap-2.5">
-          <ProviderOfficialCard
-            app={app}
-            isInUse={activeState?.kind === "official"}
-            settingDefault={settingDefault === "__official__"}
-            onSetDefault={() => void setOfficialAsDefault()}
-          />
-
-          {customProviders.map((p) => {
-            const configuredIds = activeState?.configuredProviderIds ?? [];
-            const matchedId = activeState?.matchedProviderId ?? null;
-            const isOpencode = p.app === "opencode";
-            const isConfigured = isOpencode
-              ? configuredIds.includes(p.id)
-              : matchedId === p.id;
-            const isInUse = matchedId === p.id;
-            return (
-              <ProviderCard
-                key={p.id}
-                provider={p}
-                isConfigured={isConfigured}
-                isInUse={isInUse}
-                toggling={toggling === p.id}
-                settingDefault={settingDefault === p.id}
-                testing={testing === p.id}
-                testResult={testResults[p.id]}
-                onToggleEnabled={isOpencode ? () => void toggleEnabled(p) : undefined}
-                onSetDefault={() => void setAsDefault(p)}
-                onEdit={() => startEdit(p)}
-                onDelete={() => deleteProvider(p.id)}
-                onTest={() => void testOne(p)}
+      {!installed[app] && customProviders.length === 0 ? (
+        <InstallGuide
+          app={app}
+          rechecking={rechecking}
+          onRecheck={() => void handleRecheckInstall()}
+        />
+      ) : (
+        <div className="flex-1 min-h-0 overflow-auto p-3">
+          <div className="flex flex-col gap-2.5">
+            {!installed[app] && (
+              <div className="flex items-start gap-2 rounded-md outline outline-1 outline-amber-500/30 bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 px-3 py-2 text-xs leading-relaxed">
+                <AlertTriangle className="size-4 shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <strong className="font-medium">
+                    {CLI_APP_LABEL[app]} is not installed.
+                  </strong>{" "}
+                  Edit and delete still work, but providers can't be activated
+                  until it's installed.
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={rechecking}
+                  onClick={() => void handleRecheckInstall()}
+                  className="shrink-0"
+                >
+                  {rechecking ? "Checking…" : "Recheck"}
+                </Button>
+              </div>
+            )}
+            {installed[app] && (
+              <ProviderOfficialCard
+                app={app}
+                isInUse={activeState?.kind === "official"}
+                settingDefault={settingDefault === "__official__"}
+                version={versions[app]}
+                versionLoading={versionsLoading}
+                onSetDefault={() => void setOfficialAsDefault()}
               />
-            );
-          })}
+            )}
 
-          {customProviders.length === 0 && (
-            <EmptyState
-              icon={<Plug size={32} />}
-              title="No custom providers yet"
-              description={`Add a third-party API platform for ${CLI_APP_LABEL[app]} and switch to it with one click.`}
-              action={{ label: "+ Add provider", onClick: startNew }}
-            />
-          )}
+            {customProviders.map((p) => {
+              const configuredIds = activeState?.configuredProviderIds ?? [];
+              const matchedId = activeState?.matchedProviderId ?? null;
+              const isOpencode = p.app === "opencode";
+              const isConfigured = isOpencode
+                ? configuredIds.includes(p.id)
+                : matchedId === p.id;
+              const isInUse = matchedId === p.id;
+              return (
+                <ProviderCard
+                  key={p.id}
+                  provider={p}
+                  isConfigured={isConfigured}
+                  isInUse={isInUse}
+                  toggling={toggling === p.id}
+                  settingDefault={settingDefault === p.id}
+                  testing={testing === p.id}
+                  testResult={testResults[p.id]}
+                  activatable={installed[app]}
+                  onToggleEnabled={isOpencode ? () => void toggleEnabled(p) : undefined}
+                  onSetDefault={() => void setAsDefault(p)}
+                  onEdit={() => startEdit(p)}
+                  onDelete={() => deleteProvider(p.id)}
+                  onTest={() => void testOne(p)}
+                />
+              );
+            })}
+
+            {customProviders.length === 0 && (
+              <EmptyState
+                icon={<Plug size={32} />}
+                title="No custom providers yet"
+                description={`Add a third-party API platform for ${CLI_APP_LABEL[app]} and switch to it with one click.`}
+                action={{ label: "+ Add provider", onClick: startNew }}
+              />
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       {editing && (
         <ProviderEditor

@@ -54,7 +54,7 @@ const CODEX_RESERVED_IDS: &[&str] = &[
     "ollama-chat",
 ];
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum CliApp {
     Claude,
@@ -73,6 +73,105 @@ impl CliApp {
             _ => None,
         }
     }
+
+    /// Name of the binary this CLI ships as, looked up on `$PATH`.
+    pub fn bin_name(self) -> &'static str {
+        match self {
+            CliApp::Claude => "claude",
+            CliApp::Codex => "codex",
+            CliApp::Gemini => "gemini",
+            CliApp::Opencode => "opencode",
+        }
+    }
+
+    pub fn all() -> [CliApp; 4] {
+        [CliApp::Claude, CliApp::Codex, CliApp::Gemini, CliApp::Opencode]
+    }
+}
+
+/// Report whether each supported CLI's binary is present on `$PATH`.
+/// Used by the Providers page to surface "not installed" hints before
+/// the user tries to activate a profile that nothing will read.
+///
+/// We check the binary, not config files — every CLI creates its
+/// config dir lazily (only after first run / login), so config-file
+/// presence is a poor proxy for "is this installed".
+pub fn detect_installed_clis() -> std::collections::HashMap<CliApp, bool> {
+    let mut out = std::collections::HashMap::new();
+    for app in CliApp::all() {
+        let installed = which::which(app.bin_name()).is_ok();
+        out.insert(app, installed);
+    }
+    out
+}
+
+/// Run each installed CLI with `--version` and return the parsed
+/// version string. Heavier than [`detect_installed_clis`] (spawns a
+/// subprocess per CLI), so the frontend should call this on page-load
+/// / recheck only — not before every action.
+pub fn detect_cli_versions() -> std::collections::HashMap<CliApp, Option<String>> {
+    let mut out = std::collections::HashMap::new();
+    for app in CliApp::all() {
+        out.insert(app, query_cli_version(app.bin_name()));
+    }
+    out
+}
+
+fn query_cli_version(binary: &str) -> Option<String> {
+    let resolved = which::which(binary).ok()?;
+    let output = std::process::Command::new(resolved)
+        .arg("--version")
+        .output()
+        .ok()?;
+    // Some CLIs (notably older node-based ones) print to stderr.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = if stdout.trim().is_empty() {
+        stderr
+    } else {
+        stdout
+    };
+    parse_version(&text)
+}
+
+/// Pull the first `MAJOR.MINOR[.PATCH][-suffix]` token out of free-form
+/// `--version` output. Tolerates leading `v`, trailing parenthetical
+/// build info, ANSI escapes, etc.
+fn parse_version(text: &str) -> Option<String> {
+    for token in text.split(|c: char| c.is_whitespace() || c == '(' || c == ')') {
+        let candidate = token.trim_start_matches('v').trim();
+        if candidate.is_empty() || !candidate.contains('.') {
+            continue;
+        }
+        let mut chars = candidate.chars().peekable();
+        if !matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
+            continue;
+        }
+        // Walk: digits, dots, then optional -prerelease.
+        let mut end = 0;
+        let mut seen_dot = false;
+        for (i, c) in candidate.char_indices() {
+            if c.is_ascii_digit() {
+                end = i + c.len_utf8();
+            } else if c == '.' {
+                seen_dot = true;
+                end = i + c.len_utf8();
+            } else if (c == '-' || c.is_ascii_alphabetic()) && seen_dot {
+                // Accept SemVer prerelease / build metadata.
+                end = i + c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if !seen_dot {
+            continue;
+        }
+        let trimmed = candidate[..end].trim_end_matches('.');
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1647,6 +1746,41 @@ fn string_match(provider_value: &str, live_value: Option<&str>) -> bool {
 mod tests {
     use super::*;
     use crate::testutils::HOME_LOCK;
+
+    #[test]
+    fn parse_version_handles_common_cli_outputs() {
+        // Plain "X.Y.Z" output
+        assert_eq!(parse_version("0.5.7"), Some("0.5.7".to_string()));
+        // Leading "v" prefix
+        assert_eq!(parse_version("v1.2.3"), Some("1.2.3".to_string()));
+        // Tool name + version (Codex / opencode style)
+        assert_eq!(
+            parse_version("codex-cli 0.46.0"),
+            Some("0.46.0".to_string())
+        );
+        // npm @scope/name@1.2.3 isn't a version flag's normal output,
+        // but the parser shouldn't trip on the leading "@" digits.
+        assert_eq!(
+            parse_version("@anthropic-ai/claude-code 0.0.32"),
+            Some("0.0.32".to_string())
+        );
+        // Parenthesized build metadata in output
+        assert_eq!(
+            parse_version("opencode 0.5.7 (build abc123)"),
+            Some("0.5.7".to_string())
+        );
+        // SemVer prerelease with hyphen
+        assert_eq!(
+            parse_version("gemini 0.10.0-preview.1"),
+            Some("0.10.0-preview.1".to_string())
+        );
+        // Major.minor only
+        assert_eq!(parse_version("v1.2"), Some("1.2".to_string()));
+        // No version → None
+        assert_eq!(parse_version("something with no version"), None);
+        // Empty
+        assert_eq!(parse_version(""), None);
+    }
 
     struct HomeOverride {
         prev: Option<std::ffi::OsString>,

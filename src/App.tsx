@@ -613,7 +613,7 @@ export function App() {
                       <EmptyState
                         icon={<FileJson size={32} />}
                         title="No sessions yet"
-                        description="Termory scans Codex, Claude Code, Gemini CLI, and OpenCode for chat history. None of those tools have recorded sessions here yet."
+                        description="Termory scans Codex, Claude Code, Gemini, and OpenCode for chat history. None of those tools have recorded sessions here yet."
                       />
                     )}
                     {!loading && filtered.length === 0 && sessionItems.length > 0 && (

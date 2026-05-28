@@ -48,6 +48,7 @@ export function ProviderCard({
   settingDefault,
   testing,
   testResult,
+  activatable = true,
   onToggleEnabled,
   onSetDefault,
   onEdit,
@@ -66,6 +67,11 @@ export function ProviderCard({
   settingDefault: boolean;
   testing: boolean;
   testResult: TestResult | undefined;
+  // False when the underlying CLI binary is missing from PATH — Set as
+  // default / Enable toggle are hard-disabled because writing the live
+  // config has no effect without a CLI to consume it. Edit / Delete /
+  // Test stay enabled (data management, not activation).
+  activatable?: boolean;
   // OpenCode-only: toggle the slot in opencode.json. Undefined for
   // other CLIs (their Enabled state isn't separately controllable).
   onToggleEnabled?: () => void;
@@ -119,11 +125,13 @@ export function ProviderCard({
                 variant="outline"
                 size="sm"
                 onClick={onSetDefault}
-                disabled={settingDefault || (isOpencode && !isConfigured)}
+                disabled={settingDefault || !activatable || (isOpencode && !isConfigured)}
                 title={
-                  isOpencode && !isConfigured
-                    ? "Enable this provider first."
-                    : undefined
+                  !activatable
+                    ? "Install it first."
+                    : isOpencode && !isConfigured
+                      ? "Enable this provider first."
+                      : undefined
                 }
               >
                 {settingDefault ? "Setting…" : "Set as default"}
@@ -135,7 +143,7 @@ export function ProviderCard({
                   <button
                     type="button"
                     onClick={onToggleEnabled}
-                    disabled={toggling}
+                    disabled={toggling || !activatable}
                     aria-label={isConfigured ? "Disable" : "Enable"}
                     className="inline-flex items-center justify-center size-8 rounded-md hover:bg-accent hover:text-accent-foreground disabled:opacity-50 disabled:pointer-events-none transition-colors"
                   >
@@ -148,7 +156,13 @@ export function ProviderCard({
                     )}
                   </button>
                 </TooltipTrigger>
-                <TooltipContent side="bottom">{isConfigured ? "Disable" : "Enable"}</TooltipContent>
+                <TooltipContent side="bottom">
+                  {!activatable
+                    ? "Install it first."
+                    : isConfigured
+                      ? "Disable"
+                      : "Enable"}
+                </TooltipContent>
               </Tooltip>
             )}
             <Tooltip>
