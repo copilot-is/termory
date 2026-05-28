@@ -552,11 +552,11 @@ All P0 items have shipped:
 
 - **Right-click context menus** — on list items ("Re-read this file", "Reveal in Finder", "Copy ID") and on sidebar source rows ("Re-scan this source").
 - **Keyboard navigation** — arrow keys in lists, Enter to open, Esc to close, Cmd-1..5 to switch rail, Cmd-F to summon search.
-- **Watcher completion** — current Rust watcher in `watcher.rs` skips cwd / per-project files (CLAUDE.md, AGENTS.md, etc.) to avoid `node_modules` noise. Either add a targeted cwd watcher or trigger a force-rescan on route change.
+- ~~Watcher completion~~ — intentionally not pursued. Per-project files (`<cwd>/CLAUDE.md`, `AGENTS.md`, `.claude/skills/`, etc.) are only read at launch; if a user edits them mid-session the change isn't reflected until next launch / manual refresh, and that's acceptable. Recursive cwd watching would pull in `node_modules` / build noise and isn't worth the complexity.
 - **Frontend test baseline** — zero tests today. Start with Vitest + React Testing Library on `CopyMenu`, `FreshnessFooter`, the route reducer.
 
 ### P3 — nice to have
 
-- **New-item badges** — watcher detects new session → rail Records icon + sidebar source row get an unread badge; cleared on view. Needs P1 store for cross-restart state.
+- ~~New-item badges~~ — explicitly excluded; the freshness footer ("Synced 2m ago") is enough passive feedback, an unread/red-dot system isn't desired here.
 - **Export session** — single session → markdown / PDF, surfaced via the detail header's existing action row.
 - **Starred sessions / tags** — virtual "Starred" source in sidebar; custom labels per record. Needs P1 store.

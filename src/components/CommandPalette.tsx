@@ -34,11 +34,12 @@ export function CommandPalette({
   const [query, setQuery] = React.useState("");
   const { hits, loading, committedQuery } = useSearchHits(query);
 
-  // Global ⌘K / Ctrl+K toggle.
+  // Global ⌘K / ⌘F (or Ctrl variants) toggle.
   React.useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase();
       const isToggle =
-        (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k";
+        (event.metaKey || event.ctrlKey) && (key === "k" || key === "f");
       if (isToggle) {
         event.preventDefault();
         setOpen((current) => !current);

@@ -42,6 +42,7 @@ import {
 } from "@/lib/session-utils";
 import { isProviderList } from "@/lib/provider-utils";
 import { addSetValue, toggleSetValue } from "@/lib/set-utils";
+import { RAIL_ROUTE_ORDER } from "@/constants";
 import { usePersistentState } from "@/hooks/usePersistentState";
 import { ActivityRail } from "@/components/ActivityRail";
 import { BrandIcon } from "@/components/BrandIcon";
@@ -53,6 +54,7 @@ import { MemoryCard } from "@/components/MemoryCard";
 import { MessageBody } from "@/components/MessageBody";
 import { MessageList } from "@/components/MessageList";
 import { RoutePlaceholder } from "@/components/RoutePlaceholder";
+import { SettingsPage } from "@/components/settings/SettingsPage";
 import { SnippetLine } from "@/components/SnippetLine";
 import { SearchPage } from "@/components/search/SearchPage";
 import { ProvidersPage } from "@/components/providers/ProvidersPage";
@@ -131,6 +133,20 @@ export function App() {
     const onHashChange = () => setRoute(readRouteFromHash());
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  // ⌘1..5 (or Ctrl 1..5) switch rail routes by visual order:
+  // 1=Providers, 2=Records, 3=Search, 4=Stats, 5=Settings.
+  React.useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey)) return;
+      const index = Number(event.key) - 1;
+      if (!Number.isInteger(index) || index < 0 || index >= RAIL_ROUTE_ORDER.length) return;
+      event.preventDefault();
+      setRoute(RAIL_ROUTE_ORDER[index]);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
   // Shared "jump to this record" action — used by both the Search page
@@ -388,7 +404,13 @@ export function App() {
               setApp={setProvidersApp}
             />
           )}
-          {route !== "records" && route !== "search" && route !== "config" && (
+          {route === "settings" && (
+            <SettingsPage
+              recentSearches={recentSearches}
+              onClearRecent={clearRecentSearches}
+            />
+          )}
+          {route !== "records" && route !== "search" && route !== "config" && route !== "settings" && (
             <RoutePlaceholder route={route} />
           )}
           {route === "records" && (

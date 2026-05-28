@@ -19,12 +19,27 @@ use providers::{
     TestResult,
 };
 use sessions::{get_session, scan_sessions, search_sessions, AppSession, SearchHit, SessionDetail};
+use tauri::Manager;
 
 #[tauri::command]
-async fn scan_all_sessions() -> Result<Vec<AppSession>, String> {
-    tauri::async_runtime::spawn_blocking(|| scan_sessions().map_err(|err| err.to_string()))
-        .await
-        .map_err(|err| err.to_string())?
+async fn scan_all_sessions(
+    watcher: tauri::State<'_, watcher::WatcherHandle>,
+) -> Result<Vec<AppSession>, String> {
+    let handle = watcher.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let sessions = scan_sessions().map_err(|err| err.to_string())?;
+        // Tell the watcher about the project cwds we just discovered so
+        // it can dynamically watch them (catching per-project
+        // CLAUDE.md / AGENTS.md / .claude/skills/ edits without
+        // recursively watching every cwd the user might be in).
+        let cwds = watcher::dynamic_paths_from_sessions(
+            sessions.iter().map(|s| s.project.as_str()),
+        );
+        handle.reconfigure_dynamic(cwds);
+        Ok(sessions)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -215,8 +230,13 @@ pub fn run() {
             // directory mutates. Failure is non-fatal — the app still
             // works with only the launch-time scan.
             let handle = app.handle().clone();
-            if let Err(err) = watcher::start(handle) {
-                eprintln!("termory watcher: init failed: {err}");
+            match watcher::start(handle) {
+                Ok(watcher_handle) => {
+                    app.manage(watcher_handle);
+                }
+                Err(err) => {
+                    eprintln!("termory watcher: init failed: {err}");
+                }
             }
             Ok(())
         })
