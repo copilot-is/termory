@@ -19,13 +19,19 @@ function ProviderFavicon({ url, name }: { url?: string; name?: string }) {
     }
   }
 
+  // Fetch the favicon directly from the provider's own domain — the
+  // provider already receives our API key requests, so the favicon
+  // request is no extra disclosure. Avoids leaking the user's full
+  // provider list to a third party (e.g. Google's s2/favicons service).
+  // Falls back to the letter avatar on 404 / CORS / network error.
   if (domain && !errored) {
     return (
       <span className="shrink-0 inline-flex items-center justify-center size-10 rounded-md bg-background shadow-sm">
         <img
-          src={`https://www.google.com/s2/favicons?domain=${domain}&sz=64`}
+          src={`https://${domain}/favicon.ico`}
           alt=""
           className="size-5 rounded-sm"
+          referrerPolicy="no-referrer"
           onError={() => setErrored(true)}
         />
       </span>

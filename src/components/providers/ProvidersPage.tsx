@@ -427,8 +427,8 @@ export function ProvidersPage({
         <div className="flex-1 min-h-0 overflow-auto p-3">
           <div className="flex flex-col gap-2.5">
             {!installed[app] && (
-              <div className="flex items-start gap-2 rounded-md outline outline-1 outline-amber-500/30 bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 px-3 py-2 text-xs leading-relaxed">
-                <AlertTriangle className="size-4 shrink-0 mt-0.5" />
+              <div className="flex items-center gap-2 rounded-md outline outline-1 outline-amber-500/30 bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 px-3 py-2 text-base leading-relaxed">
+                <AlertTriangle className="size-4 shrink-0" />
                 <div className="flex-1">
                   <strong className="font-medium">
                     {CLI_APP_LABEL[app]} is not installed.
