@@ -28,6 +28,12 @@ use crate::sessions::scan_sessions;
 /// Payload is `Vec<AppSession>` (same shape as `scan_all_sessions`).
 pub const SOURCES_CHANGED_EVENT: &str = "termory:sources-changed";
 
+/// Event name fired when something in a CLI install dir changes —
+/// binary appearing (install) or disappearing (uninstall). Payload is
+/// empty `()`; the frontend re-runs `detect_clis` / `detect_cli_versions`
+/// to read the current state. Replaces polling for install detection.
+pub const CLI_INSTALL_CHANGED_EVENT: &str = "termory:cli-install-changed";
+
 /// Coalesce changes that arrive within this window before triggering
 /// a re-scan. Many editors / DB engines emit a flurry of intermediate
 /// events on save (temp file → rename → mtime touch + WAL writes for
@@ -150,6 +156,20 @@ pub fn start(app_handle: AppHandle) -> notify::Result<WatcherHandle> {
         }
     }
 
+    // Install-detection watches: known CLI binary dirs + node version
+    // manager roots. Replaces 3s frontend polling — events here fire
+    // the `cli-install-changed` event so the Providers page can
+    // refresh just the install status (no session re-scan needed).
+    let install_targets = install_watch_targets();
+    for (path, mode) in &install_targets {
+        if !path.exists() {
+            continue;
+        }
+        if let Err(err) = watcher.watch(path, *mode) {
+            eprintln!("termory watcher: skip install {path:?}: {err}");
+        }
+    }
+
     let inner = Arc::new(Mutex::new(WatcherInner {
         watcher,
         dynamic_paths: HashSet::new(),
@@ -178,6 +198,20 @@ pub fn start(app_handle: AppHandle) -> notify::Result<WatcherHandle> {
                     Ok(Err(_)) => continue,
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+
+            // Install-detection routing: if any event touched a CLI
+            // binary dir or shell rc file, fire the install-changed
+            // event so the frontend re-runs detect_clis. Independent
+            // of the session rescan below — these paths usually don't
+            // overlap with session storage.
+            if events
+                .iter()
+                .any(|e| event_touches_install(e, &install_targets))
+            {
+                if let Err(err) = app_handle.emit(CLI_INSTALL_CHANGED_EVENT, ()) {
+                    eprintln!("termory watcher: install emit failed: {err}");
                 }
             }
 
@@ -286,4 +320,140 @@ fn watch_targets() -> Vec<PathBuf> {
         home.join(".local").join("share").join("opencode"),
         home.join(".agents"),
     ]
+}
+
+/// Dirs to watch for CLI binary install/uninstall events.
+///
+/// Each entry is `(path, mode)`:
+///   * `NonRecursive` for leaf bin dirs (`~/.opencode/bin`,
+///     `/opt/homebrew/bin`, …) — we only care about direct children
+///     (the binary itself appearing/disappearing).
+///   * `Recursive` for node-version-manager roots
+///     (`~/.nvm/versions/node`, fnm, mise) — each child is a version
+///     with its own bin/ subdir where the CLI gets installed.
+///
+/// Non-existent paths are silently skipped at registration time.
+/// Mirrors the install-side of `cli_search_paths` in `providers.rs`.
+fn install_watch_targets() -> Vec<(PathBuf, RecursiveMode)> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let mut targets: Vec<(PathBuf, RecursiveMode)> = Vec::new();
+
+    // Cross-platform per-user bin dirs (these resolve correctly on
+    // both Unix and Windows via `home.join()` — e.g. `.bun/bin` becomes
+    // `%USERPROFILE%\.bun\bin` on Windows, where bun does install).
+    for sub in [".opencode/bin", ".bun/bin", ".cargo/bin", ".npm-global/bin", ".codex/bin"] {
+        targets.push((home.join(sub), RecursiveMode::NonRecursive));
+    }
+
+    // Unix-only per-user dirs (XDG, n, Unix Volta layout).
+    #[cfg(unix)]
+    {
+        for sub in [".local/bin", "n/bin", ".volta/bin"] {
+            targets.push((home.join(sub), RecursiveMode::NonRecursive));
+        }
+    }
+
+    // pnpm — different default per platform.
+    #[cfg(target_os = "macos")]
+    targets.push((home.join("Library/pnpm"), RecursiveMode::NonRecursive));
+    #[cfg(target_os = "linux")]
+    targets.push((
+        home.join(".local/share/pnpm"),
+        RecursiveMode::NonRecursive,
+    ));
+
+    #[cfg(target_os = "macos")]
+    {
+        targets.push((
+            PathBuf::from("/opt/homebrew/bin"),
+            RecursiveMode::NonRecursive,
+        ));
+        targets.push((
+            PathBuf::from("/usr/local/bin"),
+            RecursiveMode::NonRecursive,
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        targets.push((
+            PathBuf::from("/usr/local/bin"),
+            RecursiveMode::NonRecursive,
+        ));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // npm global default: %APPDATA%\npm
+        if let Some(appdata) = dirs::data_dir() {
+            targets.push((appdata.join("npm"), RecursiveMode::NonRecursive));
+        }
+        // Node.js MSI installer
+        targets.push((
+            PathBuf::from("C:\\Program Files\\nodejs"),
+            RecursiveMode::NonRecursive,
+        ));
+        // Scoop shims (opencode README's recommended install method)
+        targets.push((
+            home.join("scoop").join("shims"),
+            RecursiveMode::NonRecursive,
+        ));
+        // Chocolatey bin (opencode README's other recommended method)
+        targets.push((
+            PathBuf::from("C:\\ProgramData\\chocolatey\\bin"),
+            RecursiveMode::NonRecursive,
+        ));
+        // Volta on Windows: %LOCALAPPDATA%\Volta\bin
+        if let Some(localdata) = dirs::data_local_dir() {
+            targets.push((
+                localdata.join("Volta").join("bin"),
+                RecursiveMode::NonRecursive,
+            ));
+            // pnpm on Windows: %LOCALAPPDATA%\pnpm
+            targets.push((localdata.join("pnpm"), RecursiveMode::NonRecursive));
+            // fnm on Windows: %LOCALAPPDATA%\fnm\node-versions
+            targets.push((
+                localdata.join("fnm").join("node-versions"),
+                RecursiveMode::Recursive,
+            ));
+        }
+        // NVM-Windows: $NVM_HOME or C:\nvm; recursive because each
+        // version is a sibling dir holding node.exe + npm.
+        let nvm_home = std::env::var_os("NVM_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\nvm"));
+        targets.push((nvm_home, RecursiveMode::Recursive));
+    }
+
+    // Unix node version managers — recursive enumeration of per-version bin dirs.
+    #[cfg(unix)]
+    {
+        targets.push((
+            home.join(".nvm/versions/node"),
+            RecursiveMode::Recursive,
+        ));
+        targets.push((
+            home.join(".local/state/fnm_multishells"),
+            RecursiveMode::Recursive,
+        ));
+        targets.push((
+            home.join(".local/share/mise/installs/node"),
+            RecursiveMode::Recursive,
+        ));
+    }
+
+    targets
+}
+
+/// True if `event` touches any path under one of the install-watch
+/// targets. We don't filter by file extension or name — any change
+/// inside a known bin dir is grounds to re-detect (binary added,
+/// removed, replaced, or even mtime-touched by a package manager).
+fn event_touches_install(
+    event: &notify::Event,
+    targets: &[(PathBuf, RecursiveMode)],
+) -> bool {
+    event.paths.iter().any(|path| {
+        targets.iter().any(|(target, _)| path.starts_with(target))
+    })
 }

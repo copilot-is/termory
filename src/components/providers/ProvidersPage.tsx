@@ -1,6 +1,7 @@
 import React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { AlertTriangle, Plug, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -166,6 +167,30 @@ export function ProvidersPage({
   React.useEffect(() => {
     void refreshInstalled();
     void refreshVersions();
+  }, [refreshInstalled, refreshVersions]);
+
+  // Event-driven install detection — no polling. Three triggers:
+  //   1. Rust watcher fires `cli-install-changed` when any CLI binary
+  //      dir or node-version-manager root mutates (install / uninstall).
+  //   2. Tauri window gains focus — covers the case where the OS
+  //      didn't propagate an FS event (e.g. uninstall script left the
+  //      binary in place but stripped PATH; user came back from
+  //      terminal and we re-check just in case).
+  //   3. (Already wired above) Page mount + manual Recheck.
+  React.useEffect(() => {
+    const refresh = () => {
+      void refreshInstalled();
+      void refreshVersions();
+    };
+    const unlistenPromise = listen("termory:cli-install-changed", refresh);
+    const win = getCurrentWindow();
+    const focusPromise = win.onFocusChanged(({ payload: focused }) => {
+      if (focused) refresh();
+    });
+    return () => {
+      void unlistenPromise.then((fn) => fn()).catch(() => {});
+      void focusPromise.then((fn) => fn()).catch(() => {});
+    };
   }, [refreshInstalled, refreshVersions]);
 
   // Auto refresh when the Rust watcher detects any change in the
@@ -439,7 +464,7 @@ export function ProvidersPage({
                 icon={<Plug size={32} />}
                 title="No custom providers yet"
                 description={`Add a third-party API platform for ${CLI_APP_LABEL[app]} and switch to it with one click.`}
-                action={{ label: "+ Add provider", onClick: startNew }}
+                action={{ label: "Add provider", onClick: startNew }}
               />
             )}
           </div>

@@ -89,9 +89,336 @@ impl CliApp {
     }
 }
 
-/// Report whether each supported CLI's binary is present on `$PATH`.
-/// Used by the Providers page to surface "not installed" hints before
-/// the user tries to activate a profile that nothing will read.
+/// Build the ordered list of directories to scan when looking for
+/// `tool`'s binary. Modeled after cc-switch's `scan_cli_version`
+/// (`commands/misc.rs:584`) — covers every common installation method
+/// instead of relying on the inherited process `$PATH`.
+///
+/// Order matters: shorter / user-level paths come first so we prefer
+/// per-user installs over system ones. Per-tool sections (opencode
+/// env vars + bun/go/XDG) only contribute when the tool requests them.
+fn cli_search_paths(tool: &str) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let home = dirs::home_dir().unwrap_or_default();
+
+    // Cross-platform user-level dir — `~/.npm-global/bin` resolves to
+    // `%USERPROFILE%\.npm-global\bin` on Windows; uncommon but valid
+    // when a user sets a custom npm prefix anywhere.
+    if !home.as_os_str().is_empty() {
+        push_unique(&mut paths, home.join(".npm-global/bin"));
+    }
+
+    // Unix-only user-level dirs (XDG `~/.local/bin`, n version manager,
+    // Unix-style Volta layout). On Windows these are non-existent paths,
+    // so gating them avoids dead stat() calls and clarifies intent.
+    #[cfg(unix)]
+    if !home.as_os_str().is_empty() {
+        push_unique(&mut paths, home.join(".local/bin"));
+        push_unique(&mut paths, home.join("n/bin"));
+        push_unique(&mut paths, home.join(".volta/bin"));
+        extend_mise_node_search_paths(&mut paths, &home);
+    }
+
+    // System dirs per platform.
+    #[cfg(target_os = "macos")]
+    {
+        push_unique(&mut paths, PathBuf::from("/opt/homebrew/bin"));
+        push_unique(&mut paths, PathBuf::from("/usr/local/bin"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        push_unique(&mut paths, PathBuf::from("/usr/local/bin"));
+        push_unique(&mut paths, PathBuf::from("/usr/bin"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // npm global default: %APPDATA%\npm
+        if let Some(appdata) = dirs::data_dir() {
+            push_unique(&mut paths, appdata.join("npm"));
+        }
+        // Node.js MSI installer
+        push_unique(
+            &mut paths,
+            PathBuf::from("C:\\Program Files\\nodejs"),
+        );
+        // Scoop — opencode README's recommended Windows install method
+        if !home.as_os_str().is_empty() {
+            push_unique(&mut paths, home.join("scoop").join("shims"));
+        }
+        // Chocolatey — opencode README's other recommended Windows method
+        push_unique(
+            &mut paths,
+            PathBuf::from("C:\\ProgramData\\chocolatey\\bin"),
+        );
+        // Volta on Windows lives at %LOCALAPPDATA%\Volta\bin (NOT ~/.volta)
+        if let Some(localdata) = dirs::data_local_dir() {
+            push_unique(&mut paths, localdata.join("Volta").join("bin"));
+            // pnpm on Windows: %LOCALAPPDATA%\pnpm
+            push_unique(&mut paths, localdata.join("pnpm"));
+        }
+    }
+
+    // Unix node version managers — recursive enumeration.
+    #[cfg(unix)]
+    {
+        // FNM (Fast Node Manager): each shell session gets its own
+        // `~/.local/state/fnm_multishells/<pid>/bin`.
+        let fnm_base = home.join(".local/state/fnm_multishells");
+        if fnm_base.exists() {
+            if let Ok(entries) = std::fs::read_dir(&fnm_base) {
+                for entry in entries.flatten() {
+                    let bin = entry.path().join("bin");
+                    if bin.exists() {
+                        push_unique(&mut paths, bin);
+                    }
+                }
+            }
+        }
+        // NVM: every installed node version gets its own bin dir.
+        let nvm_base = home.join(".nvm/versions/node");
+        if nvm_base.exists() {
+            if let Ok(entries) = std::fs::read_dir(&nvm_base) {
+                for entry in entries.flatten() {
+                    let bin = entry.path().join("bin");
+                    if bin.exists() {
+                        push_unique(&mut paths, bin);
+                    }
+                }
+            }
+        }
+    }
+
+    // Windows node version managers — different layouts from Unix:
+    //   - NVM-Windows (coreybutler/nvm-windows): %NVM_HOME% (default
+    //     C:\nvm); each child dir IS the version's bin (binaries live
+    //     directly in <version_dir>, not <version_dir>\bin).
+    //   - fnm on Windows: %LOCALAPPDATA%\fnm\node-versions\<v>\installation
+    #[cfg(target_os = "windows")]
+    {
+        let nvm_home = std::env::var_os("NVM_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\nvm"));
+        if nvm_home.exists() {
+            if let Ok(entries) = std::fs::read_dir(&nvm_home) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        push_unique(&mut paths, p);
+                    }
+                }
+            }
+        }
+        if let Some(localdata) = dirs::data_local_dir() {
+            let fnm_base = localdata.join("fnm").join("node-versions");
+            if fnm_base.exists() {
+                if let Ok(entries) = std::fs::read_dir(&fnm_base) {
+                    for entry in entries.flatten() {
+                        let installation =
+                            entry.path().join("installation");
+                        if installation.exists() {
+                            push_unique(&mut paths, installation);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // opencode's curl installer respects $OPENCODE_INSTALL_DIR then
+    // $XDG_BIN_DIR, and defaults to ~/.opencode/bin (per the upstream
+    // install script). Also reachable via bun and go installs.
+    if tool == "opencode" {
+        if let Some(val) = std::env::var_os("OPENCODE_INSTALL_DIR") {
+            push_unique(&mut paths, PathBuf::from(val));
+        }
+        if let Some(val) = std::env::var_os("XDG_BIN_DIR") {
+            push_unique(&mut paths, PathBuf::from(val));
+        }
+        if !home.as_os_str().is_empty() {
+            push_unique(&mut paths, home.join("bin"));
+            push_unique(&mut paths, home.join(".opencode/bin"));
+            // ~/go/bin is the Unix Go install convention; on Windows
+            // Go uses %USERPROFILE%\go which `home.join("go/bin")` does
+            // produce correctly, so we can keep it cross-platform.
+            push_unique(&mut paths, home.join("go/bin"));
+        }
+        if let Some(raw) = std::env::var_os("GOPATH") {
+            for p in std::env::split_paths(&raw) {
+                push_unique(&mut paths, p.join("bin"));
+            }
+        }
+    }
+
+    // Cross-platform per-user installer fallbacks (bun / cargo / codex
+    // curl). Bun and cargo on Windows install under %USERPROFILE%
+    // matching the same `~/.bun/bin`, `~/.cargo/bin` joins.
+    if !home.as_os_str().is_empty() {
+        push_unique(&mut paths, home.join(".bun/bin"));
+        push_unique(&mut paths, home.join(".cargo/bin"));
+        push_unique(&mut paths, home.join(".codex/bin"));
+    }
+    // pnpm default locations are platform-specific.
+    #[cfg(target_os = "macos")]
+    if !home.as_os_str().is_empty() {
+        push_unique(&mut paths, home.join("Library/pnpm"));
+    }
+    #[cfg(target_os = "linux")]
+    if !home.as_os_str().is_empty() {
+        push_unique(&mut paths, home.join(".local/share/pnpm"));
+    }
+
+    // The process's own PATH last — catches anything our hardcoded
+    // list misses (e.g. truly custom user setups). On macOS GUI launches
+    // this is just the launchd minimal PATH; on terminal launches it's
+    // the user's shell PATH.
+    if let Some(raw) = std::env::var_os("PATH") {
+        for p in std::env::split_paths(&raw) {
+            push_unique(&mut paths, p);
+        }
+    }
+
+    paths
+}
+
+fn push_unique(paths: &mut Vec<std::path::PathBuf>, p: std::path::PathBuf) {
+    if p.as_os_str().is_empty() {
+        return;
+    }
+    if !paths.iter().any(|existing| existing == &p) {
+        paths.push(p);
+    }
+}
+
+/// mise (`https://mise.jdx.dev`) stores its shims at
+/// `~/.local/share/mise/shims/` and its node installs at
+/// `~/.local/share/mise/installs/node/<version>/bin`. Mirrors
+/// cc-switch's `extend_mise_node_search_paths`. Unix-only — mise is
+/// primarily a Unix tool and even its Windows builds use different
+/// layouts that don't match this structure.
+#[cfg(unix)]
+fn extend_mise_node_search_paths(
+    paths: &mut Vec<std::path::PathBuf>,
+    home: &std::path::Path,
+) {
+    let mise = home.join(".local/share/mise");
+    push_unique(paths, mise.join("shims"));
+    let node_installs = mise.join("installs/node");
+    if node_installs.exists() {
+        if let Ok(entries) = std::fs::read_dir(&node_installs) {
+            for entry in entries.flatten() {
+                let bin = entry.path().join("bin");
+                if bin.exists() {
+                    push_unique(paths, bin);
+                }
+            }
+        }
+    }
+}
+
+/// Per-platform executable-name candidates for `tool` inside `dir`.
+/// On Windows we have to consider `.cmd` (npm shims) and `.exe`
+/// (native installers) in addition to the bare name.
+fn executable_candidates(
+    tool: &str,
+    dir: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        vec![
+            dir.join(format!("{tool}.cmd")),
+            dir.join(format!("{tool}.exe")),
+            dir.join(tool),
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        vec![dir.join(tool)]
+    }
+}
+
+/// Walk [`cli_search_paths`] and return the first `<dir>/<tool>` that
+/// resolves to a real file. No subprocess, no `which::which` — pure
+/// stat()-based lookup.
+pub fn find_cli_binary(tool: &str) -> Option<std::path::PathBuf> {
+    for dir in cli_search_paths(tool) {
+        for candidate in executable_candidates(tool, &dir) {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Run `--version` on the resolved binary, with PATH augmented to
+/// include the binary's directory (so the CLI's own runtime — node,
+/// dyld dependencies, etc. — resolves). Mirrors cc-switch's per-path
+/// `Command::new(tool_path).env("PATH", new_path)` pattern.
+fn query_version_at(binary: &std::path::Path) -> Option<String> {
+    let dir = binary.parent()?;
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    #[cfg(unix)]
+    let augmented = format!("{}:{}", dir.display(), current_path);
+    #[cfg(windows)]
+    let augmented = format!("{};{}", dir.display(), current_path);
+
+    let output = std::process::Command::new(binary)
+        .arg("--version")
+        .env("PATH", &augmented)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let raw = if stdout.trim().is_empty() {
+        stderr
+    } else {
+        stdout
+    };
+    if raw.trim().is_empty() {
+        return None;
+    }
+    parse_version(&raw)
+}
+
+/// Last-resort fallback when the hardcoded search list misses the
+/// install (user has it in some truly custom dir reachable only via
+/// `.zshrc`). Spawns the user's interactive shell so PATH-affecting
+/// rc files are sourced. cc-switch's `try_get_version` uses the same
+/// strategy as its primary path; we use it only as a fallback to keep
+/// the hot-path detection fast.
+#[cfg(unix)]
+fn shell_version_fallback(tool: &str) -> Option<String> {
+    let shell =
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let output = std::process::Command::new(&shell)
+        .args(["-l", "-i", "-c", &format!("{tool} --version 2>&1")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    if raw.trim().is_empty() {
+        return None;
+    }
+    parse_version(&raw)
+}
+
+#[cfg(not(unix))]
+fn shell_version_fallback(_tool: &str) -> Option<String> {
+    None
+}
+
+/// Report whether each supported CLI is installed. Path-only scan
+/// when the binary lives anywhere reachable via [`cli_search_paths`];
+/// falls back to spawning an interactive shell only when the scan
+/// fails (so the hot-path stays fast for users whose CLIs are in
+/// well-known locations).
 ///
 /// We check the binary, not config files — every CLI creates its
 /// config dir lazily (only after first run / login), so config-file
@@ -99,39 +426,26 @@ impl CliApp {
 pub fn detect_installed_clis() -> std::collections::HashMap<CliApp, bool> {
     let mut out = std::collections::HashMap::new();
     for app in CliApp::all() {
-        let installed = which::which(app.bin_name()).is_ok();
+        let installed = find_cli_binary(app.bin_name()).is_some()
+            || shell_version_fallback(app.bin_name()).is_some();
         out.insert(app, installed);
     }
     out
 }
 
 /// Run each installed CLI with `--version` and return the parsed
-/// version string. Heavier than [`detect_installed_clis`] (spawns a
-/// subprocess per CLI), so the frontend should call this on page-load
-/// / recheck only — not before every action.
-pub fn detect_cli_versions() -> std::collections::HashMap<CliApp, Option<String>> {
+/// version string. Spawns one subprocess per CLI so the frontend
+/// calls this on page-load + Recheck only, never inside hot paths.
+pub fn detect_cli_versions(
+) -> std::collections::HashMap<CliApp, Option<String>> {
     let mut out = std::collections::HashMap::new();
     for app in CliApp::all() {
-        out.insert(app, query_cli_version(app.bin_name()));
+        let v = find_cli_binary(app.bin_name())
+            .and_then(|p| query_version_at(&p))
+            .or_else(|| shell_version_fallback(app.bin_name()));
+        out.insert(app, v);
     }
     out
-}
-
-fn query_cli_version(binary: &str) -> Option<String> {
-    let resolved = which::which(binary).ok()?;
-    let output = std::process::Command::new(resolved)
-        .arg("--version")
-        .output()
-        .ok()?;
-    // Some CLIs (notably older node-based ones) print to stderr.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let text = if stdout.trim().is_empty() {
-        stderr
-    } else {
-        stdout
-    };
-    parse_version(&text)
 }
 
 /// Pull the first `MAJOR.MINOR[.PATCH][-suffix]` token out of free-form
@@ -1746,6 +2060,98 @@ fn string_match(provider_value: &str, live_value: Option<&str>) -> bool {
 mod tests {
     use super::*;
     use crate::testutils::HOME_LOCK;
+
+    #[test]
+    fn cli_search_paths_includes_opencode_specific_dirs() {
+        let paths = cli_search_paths("opencode");
+        let has = |needle: &str| {
+            paths.iter().any(|p| {
+                p.to_string_lossy()
+                    .replace('\\', "/")
+                    .contains(needle)
+            })
+        };
+        assert!(has(".opencode/bin"), "missing ~/.opencode/bin: {paths:?}");
+        assert!(has(".bun/bin"), "missing ~/.bun/bin: {paths:?}");
+        assert!(has("go/bin"), "missing ~/go/bin: {paths:?}");
+    }
+
+    #[test]
+    fn cli_search_paths_skips_opencode_only_dirs_for_other_tools() {
+        // Path::ends_with matches whole components, so `~/go/bin` matches
+        // but `~/.cargo/bin` does NOT (because the parent component is
+        // `.cargo`, not `go`).
+        let paths = cli_search_paths("claude");
+        let matching: Vec<_> = paths
+            .iter()
+            .filter(|p| p.ends_with("go/bin"))
+            .collect();
+        assert!(
+            matching.is_empty(),
+            "claude search list contains ~/go/bin entries: {matching:?}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cli_search_paths_windows_includes_scoop_and_choco() {
+        let paths = cli_search_paths("opencode");
+        let joined: String = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(
+            joined.contains("scoop\\shims"),
+            "Windows search list missing scoop shims: {joined}"
+        );
+        assert!(
+            joined.contains("chocolatey\\bin"),
+            "Windows search list missing chocolatey bin: {joined}"
+        );
+        assert!(
+            joined.contains("\\Program Files\\nodejs"),
+            "Windows search list missing Node.js MSI dir: {joined}"
+        );
+    }
+
+    #[test]
+    fn cli_search_paths_dedupes() {
+        let paths = cli_search_paths("opencode");
+        let mut sorted: Vec<_> =
+            paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        sorted.sort();
+        let len_before = sorted.len();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            len_before,
+            "cli_search_paths returned duplicates: {paths:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_candidates_unix_returns_bare_name_only() {
+        let dir = std::path::Path::new("/opt/bin");
+        let got = executable_candidates("claude", dir);
+        assert_eq!(got, vec![dir.join("claude")]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_candidates_windows_returns_cmd_exe_and_bare() {
+        let dir = std::path::Path::new("C:\\bin");
+        let got = executable_candidates("claude", dir);
+        assert_eq!(
+            got,
+            vec![
+                dir.join("claude.cmd"),
+                dir.join("claude.exe"),
+                dir.join("claude"),
+            ]
+        );
+    }
 
     #[test]
     fn parse_version_handles_common_cli_outputs() {
