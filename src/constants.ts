@@ -82,7 +82,7 @@ export const CLI_INSTALL: Record<
 > = {
   claude: {
     binary: "claude",
-    url: "https://www.claude.com/product/claude-code",
+    url: "https://code.claude.com/docs",
     methods: [
       {
         id: "npm",
@@ -119,7 +119,7 @@ export const CLI_INSTALL: Record<
   },
   opencode: {
     binary: "opencode",
-    url: "https://opencode.ai",
+    url: "https://opencode.ai/docs",
     methods: [
       {
         id: "curl",
