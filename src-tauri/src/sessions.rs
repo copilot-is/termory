@@ -372,7 +372,7 @@ pub fn search_sessions(query: &str) -> Result<Vec<SearchHit>, Box<dyn Error>> {
     let sessions = scan_sessions()?;
     let mut hits = Vec::new();
     for session in sessions {
-        let Ok(detail) = get_session(&session.source, &session.path, &session.id) else {
+        let Ok(detail) = get_session(&session.source, &session.id) else {
             continue;
         };
         let mut first: Option<(String, String)> = None;
@@ -469,19 +469,68 @@ pub fn scan_sessions() -> Result<Vec<AppSession>, Box<dyn Error>> {
     sessions.extend(scan_memory(&project_cwds)?);
     sessions.extend(scan_skills(&project_cwds)?);
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    refresh_session_path_index(&sessions);
     Ok(sessions)
 }
 
-pub fn get_session(source: &str, path: &str, id: &str) -> Result<SessionDetail, Box<dyn Error>> {
+/// Lookup table `(source, id) → path` for every record we returned to
+/// the frontend in the most recent `scan_sessions()` call. Updated
+/// atomically (replace, not grow) by every scan, including watcher
+/// ticks and Recheck.
+///
+/// **Security boundary**: `path` is never accepted as an IPC argument.
+/// The frontend only sends `(source, id)` — we look up the path here
+/// and refuse anything that wasn't part of the most recent scan. This
+/// inverts the previous design (where path came from the frontend and
+/// was validated against a path allow-list); a path the renderer
+/// doesn't know about can no longer reach `parse_doc_file` /
+/// `parse_codex_session` / etc. at all, regardless of whether a
+/// renderer-side XSS / prompt-injection vector ever materializes.
+static SESSION_PATH_INDEX: std::sync::Mutex<
+    Option<HashMap<(String, String), std::path::PathBuf>>,
+> = std::sync::Mutex::new(None);
+
+fn refresh_session_path_index(sessions: &[AppSession]) {
+    let map: HashMap<(String, String), std::path::PathBuf> = sessions
+        .iter()
+        .map(|s| {
+            (
+                (s.source.clone(), s.id.clone()),
+                std::path::PathBuf::from(&s.path),
+            )
+        })
+        .collect();
+    if let Ok(mut guard) = SESSION_PATH_INDEX.lock() {
+        *guard = Some(map);
+    }
+}
+
+fn lookup_session_path(source: &str, id: &str) -> Option<std::path::PathBuf> {
+    SESSION_PATH_INDEX
+        .lock()
+        .ok()?
+        .as_ref()?
+        .get(&(source.to_string(), id.to_string()))
+        .cloned()
+}
+
+pub fn get_session(source: &str, id: &str) -> Result<SessionDetail, Box<dyn Error>> {
+    let path = lookup_session_path(source, id).ok_or_else(|| {
+        format!(
+            "unknown session (call scan_all_sessions first): source={source} id={id}"
+        )
+    })?;
+    let p = path.as_path();
+    let path_str = p.to_string_lossy();
     match source {
-        "Codex" => parse_codex_session(Path::new(path), id),
-        "Claude" => parse_claude_session(Path::new(path)),
-        "Memory" => parse_doc_file(Path::new(path), "Memory"),
-        "Skill" => parse_doc_file(Path::new(path), "Skill"),
-        "Gemini" if path.ends_with(".jsonl") => parse_gemini_jsonl_session(Path::new(path)),
-        "Gemini" if path.ends_with(".json") => parse_gemini_json_session(Path::new(path)),
-        "OpenCode" if path.ends_with(".db") => parse_opencode_db_session(Path::new(path), id),
-        "OpenCode" => parse_opencode_storage_session(Path::new(path)),
+        "Codex" => parse_codex_session(p, id),
+        "Claude" => parse_claude_session(p),
+        "Memory" => parse_doc_file(p, "Memory"),
+        "Skill" => parse_doc_file(p, "Skill"),
+        "Gemini" if path_str.ends_with(".jsonl") => parse_gemini_jsonl_session(p),
+        "Gemini" if path_str.ends_with(".json") => parse_gemini_json_session(p),
+        "OpenCode" if path_str.ends_with(".db") => parse_opencode_db_session(p, id),
+        "OpenCode" => parse_opencode_storage_session(p),
         _ => Err(format!("unsupported source: {source}").into()),
     }
 }
@@ -7811,6 +7860,49 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn get_session_rejects_id_outside_scan_set() {
+        // Force a known empty-index state so we don't depend on any
+        // previous scan_sessions() call leaving residue.
+        refresh_session_path_index(&[]);
+        let err = get_session("Memory", "any-id")
+            .expect_err("must refuse an id that wasn't scanned");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown session"),
+            "expected unknown-session rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn get_session_looks_up_path_from_scan_index() {
+        // Seed the index with a synthetic (source, id) → path entry,
+        // then confirm get_session uses that path internally (we hit
+        // a real-file-not-found error, which proves the lookup ran).
+        let probe = AppSession {
+            id: "synthetic-probe-id".to_string(),
+            source: "Memory".to_string(),
+            title: String::new(),
+            project: String::new(),
+            path: "/nonexistent/synthetic.md".to_string(),
+            started_at: None,
+            updated_at: None,
+            message_count: 0,
+            preview: String::new(),
+            snippet: String::new(),
+            message_previews: Vec::new(),
+        };
+        refresh_session_path_index(std::slice::from_ref(&probe));
+        let err = get_session("Memory", "synthetic-probe-id")
+            .expect_err("file doesn't exist on disk");
+        let msg = err.to_string();
+        // Should be a real IO error, NOT the "unknown session" guard.
+        assert!(
+            !msg.contains("unknown session"),
+            "lookup should have succeeded, got guard message: {msg}"
+        );
+    }
 
     struct TestDir(PathBuf);
 

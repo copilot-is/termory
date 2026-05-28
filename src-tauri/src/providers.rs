@@ -351,6 +351,51 @@ pub fn find_cli_binary(tool: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Wallclock cap for a single `<bin> --version` (or shell-fallback)
+/// invocation. Real CLIs exit in tens of ms; anything past this
+/// boundary is almost certainly a hang (stuck-on-network sync, broken
+/// shebang stuck in interpreter prompt, runaway `.zshrc` user code via
+/// `shell_version_fallback`, etc.). Kill + give up so we don't pin a
+/// Tokio blocking-pool slot indefinitely.
+const SUBPROCESS_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// Spawn `cmd` and read its full output, killing the child if it
+/// hasn't exited within [`SUBPROCESS_TIMEOUT`]. Returns `None` on
+/// spawn failure, non-zero exit, or timeout. Polls `try_wait` every
+/// 50ms — accurate enough for a 5s budget and avoids a watchdog
+/// thread.
+fn output_with_timeout(
+    mut cmd: std::process::Command,
+) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {
+                if start.elapsed() > SUBPROCESS_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// Run `--version` on the resolved binary, with PATH augmented to
 /// include the binary's directory (so the CLI's own runtime — node,
 /// dyld dependencies, etc. — resolves). Mirrors cc-switch's per-path
@@ -363,11 +408,9 @@ fn query_version_at(binary: &std::path::Path) -> Option<String> {
     #[cfg(windows)]
     let augmented = format!("{};{}", dir.display(), current_path);
 
-    let output = std::process::Command::new(binary)
-        .arg("--version")
-        .env("PATH", &augmented)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("--version").env("PATH", &augmented);
+    let output = output_with_timeout(cmd)?;
 
     if !output.status.success() {
         return None;
@@ -391,14 +434,17 @@ fn query_version_at(binary: &std::path::Path) -> Option<String> {
 /// rc files are sourced. cc-switch's `try_get_version` uses the same
 /// strategy as its primary path; we use it only as a fallback to keep
 /// the hot-path detection fast.
+///
+/// Higher-risk timeout site: `-l -i` sources `~/.zshrc` which can run
+/// arbitrary user code. [`output_with_timeout`] kills the child after
+/// [`SUBPROCESS_TIMEOUT`] so a misbehaving rc file can't pin us.
 #[cfg(unix)]
 fn shell_version_fallback(tool: &str) -> Option<String> {
     let shell =
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let output = std::process::Command::new(&shell)
-        .args(["-l", "-i", "-c", &format!("{tool} --version 2>&1")])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(&shell);
+    cmd.args(["-l", "-i", "-c", &format!("{tool} --version 2>&1")]);
+    let output = output_with_timeout(cmd)?;
     if !output.status.success() {
         return None;
     }
@@ -2150,6 +2196,40 @@ mod tests {
                 dir.join("claude.exe"),
                 dir.join("claude"),
             ]
+        );
+    }
+
+    /// Verify [`output_with_timeout`] kills hung children. We can't
+    /// wait the full 5s in a unit test, so this exercises the
+    /// happy-path return shape instead — `sleep 0` exits immediately
+    /// and the watchdog never trips. Pair with a slower integration
+    /// test if hanging behavior matters more.
+    #[cfg(unix)]
+    #[test]
+    fn output_with_timeout_returns_on_immediate_exit() {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "exit 0"]);
+        let out = output_with_timeout(cmd).expect("shell should exit");
+        assert!(out.status.success());
+    }
+
+    /// Slow integration test — only runs when explicitly opted in via
+    /// `--ignored`, since it sleeps for the full SUBPROCESS_TIMEOUT
+    /// window. Confirms a child that exceeds the budget gets killed
+    /// and the function returns `None`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn output_with_timeout_kills_hung_child() {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30"]);
+        let start = std::time::Instant::now();
+        let result = output_with_timeout(cmd);
+        let elapsed = start.elapsed();
+        assert!(result.is_none(), "should have given up");
+        assert!(
+            elapsed < SUBPROCESS_TIMEOUT + std::time::Duration::from_secs(2),
+            "should have killed near the timeout window, took {elapsed:?}"
         );
     }
 

@@ -258,7 +258,10 @@ export function App() {
       prevSelectedKeyRef.current = null;
       return;
     }
-    const identity = `${selected.source}::${selected.path}::${selected.id}`;
+    // Identity = (source, id). Path used to be in here but the
+    // backend now looks the path up itself from the scan index, so
+    // including path would be misleading — it's display data only.
+    const identity = `${selected.source}::${selected.id}`;
     const isNewSelection = prevSelectedKeyRef.current !== identity;
     prevSelectedKeyRef.current = identity;
 
@@ -266,7 +269,6 @@ export function App() {
     if (isNewSelection) setDetailLoading(true);
     invoke<SessionDetail>("load_session", {
       source: selected.source,
-      path: selected.path,
       id: selected.id
     })
       .then((result) => {
@@ -282,7 +284,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-    // Re-fetch when identity (source/path/id) changes — show loading.
+    // Re-fetch when identity (source/id) changes — show loading.
     // Also re-fetch when the selection's mtime / message_count advances
     // (watcher-driven content update) — silently swap, no spinner.
     // message_count is included because some sources don't populate
@@ -290,7 +292,6 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     selected?.source,
-    selected?.path,
     selected?.id,
     selected?.updated_at,
     selected?.message_count

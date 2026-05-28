@@ -42,10 +42,15 @@ async fn scan_all_sessions(
     .map_err(|err| err.to_string())?
 }
 
+/// Open one record by `(source, id)`. The Rust side looks up the
+/// path from the index populated by the most recent `scan_sessions`
+/// — `path` is never accepted from the frontend, so a hypothetical
+/// renderer-side injection vector can't ask Termory to open
+/// `/etc/passwd` (or anything else not in the current scan set).
 #[tauri::command]
-async fn load_session(source: String, path: String, id: String) -> Result<SessionDetail, String> {
+async fn load_session(source: String, id: String) -> Result<SessionDetail, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        get_session(&source, &path, &id).map_err(|err| err.to_string())
+        get_session(&source, &id).map_err(|err| err.to_string())
     })
     .await
     .map_err(|err| err.to_string())?

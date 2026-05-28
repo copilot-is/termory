@@ -243,22 +243,17 @@ Implementation notes:
   - The detail pane renders messages through `<MessageList>` (`@tanstack/react-virtual`) which keeps roughly the visible window + 6-row overscan in the DOM regardless of session length. `measureElement` reports actual rendered heights so scrolling and the scrollbar stay accurate across variable-length message cards.
   - The `!selected && sessions.length === 0 && loading` "Scanning…" empty state was removed — initial boot just shows "Nothing to view yet" until data arrives, no transient spinner flash.
 - `AppSession.preview` carries comma-separated tool tags (e.g. `"codex,opencode"` for AGENTS.md). The list-card `MemoryCard` renders one brand badge per tag via `memoryToolsOf()`; the detail-header badge renders a single type label (`Session` / `Memory` / `Skill`) via `typeLabelOf()`.
-- For session-type entries the detail header shows the GUID (`selected.id`) on its own line below the project path, styled monospace via `.detailGuid`. Memory/Skill entries omit the GUID line.
+- For session-type entries the detail header shows the GUID (`selected.id`) on its own line below the project path, rendered as inline monospace via Tailwind (`font-mono` / `text-xs` / `text-muted-foreground`). Memory/Skill entries omit the GUID line.
 - Project-level `AGENTS.md` and `AGENTS.override.md` are always tagged with both `codex` and `opencode` regardless of which tool actually has sessions in the cwd. Rationale: the AGENTS.md spec is tool-neutral — Termory reports which tools CAN read the file, not which tool happened to run there. Verified by `scan_memory_always_tags_project_agents_md_with_both_codex_and_opencode` test.
 - Sidebar source filter (Codex/Claude/Gemini/OpenCode/All) applies to **all three** panes (Sessions, Memory, Skills). Memory and Skill filtering goes through `memoryToolsOf(item).includes(source as MemoryTool)`, so multi-tagged files (AGENTS.md with `codex,opencode`) appear under both Codex and OpenCode filters.
 - Session list cards currently show source, date, title, project, and message count.
 - `message_count` is an app-derived visible parsed message count when the official list does not provide the same count directly.
 - Empty or missing official titles should stay empty unless the official tool has the same fallback.
-- Badge colors live in `src/styles.css` and split into two families:
-  - **Brand badges** (list cards, one per tool tag) match each tool's logo:
-    - `.badge.codex` `#0E0E10` (OpenAI black)
-    - `.badge.claude` `#CC785C` (Anthropic Clay)
-    - `.badge.gemini` `linear-gradient(135deg, #4285F4 → #A142F4 → #34A853)` (Google blue/purple/green)
-    - `.badge.opencode` `#374151` (slate, distinct from Codex black)
-  - **Type badges** (detail header, one per entry by type — semantic, not brand-derived). All three pills sit at the Tailwind `600` saturation level so they feel visually balanced:
-    - `.badge.session` `#0284C7` (sky 600 — conversation/information)
-    - `.badge.memory` `#9333EA` (purple 600 — knowledge/recall)
-    - `.badge.skill` `#059669` (emerald 600 — capability/action)
+- Brand identity lives in the `<BrandIcon>` SVG component (`src/components/BrandIcon.tsx`), one branch per `source` literal. Colors are baked into the SVG `fill` attribute (no CSS class indirection after the Tailwind v4 migration). Current colors:
+  - `Codex` and `OpenCode` use `#111827` (slate-900 — both render the same dark glyph; cards distinguish them via the icon shape, not color)
+  - `Claude` uses `#d97745` (Anthropic Clay)
+  - `Gemini` uses an inline `<linearGradient>` defined in the same SVG: `#4285f4` → `#a142f4` → `#34a853` (Google blue/purple/green)
+- There is no per-CLI CSS class (no `.badge.codex` etc.) — list-card "badges" are just `<BrandIcon source="…">` instances. To resize, callers pass `className="size-12"` etc., merged into the SVG via `cn()` inside `BrandIcon`. The legacy `Session` / `Memory` / `Skill` color pills are gone from the detail header (the source / type is implied by the rest of the card content); `typeLabelOf()` is still used by the Cmd-K command palette to label results.
 
 ### Unified tool-message format — LOCKED RULE
 
@@ -477,12 +472,13 @@ Audit reference is OpenCode `1.15.5` (commit `9324ef0`). Compared against `v1.15
 - The detail-pane body uses `react-markdown` + `remark-gfm` (tables / task lists / strikethrough). No syntax-highlight pass: code blocks render as plain monospace until a per-language renderer is added intentionally.
 - No DOMPurify / rehype-sanitize: react-markdown emits React elements (not HTML strings), so raw `<tag>` in session content is auto-escaped by React's text node rendering and displays as literal text — same characters the CLI shows.
 - No raw / rendered toggle and no `viewMode` state — every message renders through the same react-markdown pipeline. The "open original file" affordance in the detail header still lets the user inspect the underlying JSONL / db row outside Termory.
-- **TUI-style scrollback layout**: messages render as continuous vertical flow without card borders. Each message has a colored left bar (`.roleBar`) + lowercase `.roleLabel` (OpenCode TUI inspired — `session-v2.tsx:267, 284, 357`). The bar color encodes role: user teal, assistant blue, tool tan, event gray. No per-message timestamp chip; `<TimeSeparator>` between turn boundaries handles big time jumps.
-- `.messageBody` has `padding-left: 11px` so body text aligns under the role label (label sits 3px bar + 8px gap = 11px from the message left edge). Overridden to `padding: 0` for `.docBody` (memory/skill single-doc view).
-- Inline `<code>` carries `word-break: break-all` so a long no-space path inside `**Read**(\`/very/long/path\`)` wraps with the surrounding paragraph instead of overflowing the message card.
-- `.messageBody pre` has `margin: 0; padding: 0 0 0 1em` — code fences sit flush with the verb header above, with a 1em left indent so the fence content visually aligns with the verb under the `⏺` marker.
-- `.message.tool .messageBody p + p { padding-left: 1em }` — second-and-later paragraphs inside tool cards (e.g. the `⎿ Added N lines, removed M lines` summary above an Edit diff) indent 1em to align with the verb past the `⏺` glyph. Scoped to `.message.tool` so plain-text assistant messages with multi-paragraph layouts stay flush-left.
-- `.messageBody p + pre { margin-top: -0.4em }` — pulls a fence visually onto the preceding paragraph when they form a logical pair (summary + diff). The CommonMark-required blank line between them stays in the markdown source so the fence is still recognized as a block.
+- **TUI-style scrollback layout**: messages render as continuous vertical flow without card borders. The role chip + per-role color bar live as inline Tailwind utilities in `MessageList.tsx` (no `.roleBar` / `.roleLabel` CSS classes after the v4 migration). Role color tokens are still in `src/styles.css` via CSS vars (`--role-user`, `--role-assistant`, `--role-tool`, `--role-event`); the bar/text inline styles read those vars so the color palette stays single-sourced.
+- The only meaningful CSS class still in `src/styles.css` is `.message-body` (note hyphen, **not** the old `.messageBody`). It wraps the react-markdown output and carries:
+  - `padding-left: 11px` so body text aligns under the role label (bar 3px + 8px gap = 11px) — overridden to `padding: 0` for the memory/skill single-doc view via a Tailwind variant on the wrapping element
+  - `word-break: break-all` on inline `<code>` so long paths inside `**Read**(\`/very/long/path\`)` wrap with the surrounding paragraph
+  - `.message-body pre { margin: 0; padding: 0 0 0 1em }` — fences sit flush with the verb header above, 1em left indent so fence content lines up under the `⏺` marker
+  - `.message-body p + pre { margin-top: -0.4em }` — pulls a fence visually onto the preceding paragraph (summary + diff pair). CommonMark-required blank line stays in the source
+- The `.message.tool .messageBody p + p { padding-left: 1em }` rule that used to indent second-paragraph summaries was removed when the role-chip layout moved to inline Tailwind; the visual still works because of the verb-header layout's intrinsic indent. If you regress this, the `⎿ Added N lines, removed M lines` summary above an Edit diff will sit flush-left instead of aligning under the verb.
 - Unordered lists render with the `- ` text marker via `list-style-type: "- "` (matching Codex TUI's `start_item` output at `codex-rs/tui/src/markdown_render.rs:754-760`).
 - Tool detail-pane loading state shows only the spinner icon (no `Loading transcript` label) so the brief delay between session select and detail load is unobtrusive.
 
