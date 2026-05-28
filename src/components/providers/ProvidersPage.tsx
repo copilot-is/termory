@@ -229,10 +229,10 @@ export function ProvidersPage({
   return (
     <div className="flex-1 min-h-0 flex flex-col bg-background">
       <div className="px-3 pt-3">
-        <div className="flex items-center gap-1 rounded-md bg-muted px-3 py-2">
+        <div className="flex items-center gap-1 rounded-md bg-muted p-3">
           <div className="flex-1 min-w-0 overflow-x-auto">
             <Tabs value={app} onValueChange={(v) => setApp(v as CliApp)}>
-              <TabsList className="w-full justify-start gap-1 bg-transparent p-0 [&>button]:flex-none [&>button]:rounded-full [&>button]:px-3">
+              <TabsList className="w-full justify-start gap-1 bg-transparent p-0 [&>button]:flex-none [&>button]:rounded-md [&>button]:px-3">
                 {CLI_APPS.map((id) => (
                   <TabsTrigger key={id} value={id}>
                     <BrandIcon source={CLI_APP_SOURCE_BADGE[id]} />
@@ -248,7 +248,7 @@ export function ProvidersPage({
             onClick={startNew}
             aria-label="Add provider"
             title="Add provider"
-            className="rounded-full size-8 shrink-0"
+            className="rounded-md size-8 shrink-0 shadow-sm"
           >
             <Plus className="size-4" />
           </Button>

@@ -1,10 +1,44 @@
-import { AlertTriangle, Check, Loader2, Pencil, Trash2, Zap } from "lucide-react";
+import React from "react";
+import { AlertTriangle, Check, CircleCheckBig, CircleOff, Loader2, Pencil, Trash2, Zap } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { maskKey } from "@/lib/provider-utils";
 import type { Provider, TestResult } from "@/types";
+
+function ProviderFavicon({ url, name }: { url?: string; name?: string }) {
+  const [errored, setErrored] = React.useState(false);
+  let domain = "";
+  if (url) {
+    try {
+      domain = new URL(url).hostname;
+    } catch {
+      domain = "";
+    }
+  }
+
+  if (domain && !errored) {
+    return (
+      <span className="shrink-0 inline-flex items-center justify-center size-10 rounded-md bg-background shadow-sm">
+        <img
+          src={`https://www.google.com/s2/favicons?domain=${domain}&sz=64`}
+          alt=""
+          className="size-5 rounded-sm"
+          onError={() => setErrored(true)}
+        />
+      </span>
+    );
+  }
+
+  const letter = (name?.trim()[0] ?? "?").toUpperCase();
+  return (
+    <span className="shrink-0 inline-flex items-center justify-center size-10 rounded-md bg-primary/15 text-primary text-base font-medium shadow-sm">
+      {letter}
+    </span>
+  );
+}
 
 export function ProviderCard({
   provider,
@@ -42,9 +76,10 @@ export function ProviderCard({
 }) {
   const isOpencode = provider.app === "opencode";
   return (
-    <Card className={cn("py-3 gap-0 outline outline-1 outline-foreground/5", isInUse && "outline-primary/15 bg-primary/10")}>
-      <CardContent className="px-4 flex flex-col gap-2.5">
-        <div className="flex items-center justify-between gap-3 flex-wrap min-h-7">
+    <Card className={cn("p-3 gap-0 outline outline-1 outline-foreground/5", isInUse && "outline-primary/15 bg-primary/10")}>
+      <CardContent className="px-0 flex flex-col gap-2">
+        <div className="flex items-start justify-between gap-3 flex-wrap min-h-7">
+          <ProviderFavicon url={provider.baseUrl} name={provider.name} />
           <div className="flex-1 min-w-0 flex flex-col gap-2">
             <div className="flex items-center gap-2">
               <h3 className="text-lg font-medium">
@@ -95,56 +130,67 @@ export function ProviderCard({
               </Button>
             )}
             {onToggleEnabled && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={onToggleEnabled}
-                disabled={toggling}
-              >
-                {toggling
-                  ? isConfigured
-                    ? "Disabling…"
-                    : "Enabling…"
-                  : isConfigured
-                    ? "Disable"
-                    : "Enable"}
-              </Button>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={onToggleEnabled}
+                    disabled={toggling}
+                    aria-label={isConfigured ? "Disable" : "Enable"}
+                    className="inline-flex items-center justify-center size-8 rounded-md hover:bg-accent hover:text-accent-foreground disabled:opacity-50 disabled:pointer-events-none transition-colors"
+                  >
+                    {toggling ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : isConfigured ? (
+                      <CircleCheckBig className="size-4 text-green-600" />
+                    ) : (
+                      <CircleOff className="size-4 text-red-600" />
+                    )}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">{isConfigured ? "Disable" : "Enable"}</TooltipContent>
+              </Tooltip>
             )}
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-7"
-              onClick={onTest}
-              disabled={testing}
-              title="Test"
-              aria-label="Test"
-            >
-              {testing ? <Loader2 className="size-4 animate-spin" /> : <Zap className="size-4" />}
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-7"
-              onClick={onEdit}
-              title="Edit"
-              aria-label="Edit"
-            >
-              <Pencil className="size-4" />
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-7 text-destructive hover:text-destructive hover:bg-destructive/10"
-              onClick={onDelete}
-              title="Delete"
-              aria-label="Delete"
-            >
-              <Trash2 className="size-4" />
-            </Button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={onTest}
+                  disabled={testing}
+                  aria-label="Test"
+                  className="inline-flex items-center justify-center size-8 rounded-md hover:bg-accent hover:text-accent-foreground disabled:opacity-50 disabled:pointer-events-none transition-colors"
+                >
+                  {testing ? <Loader2 className="size-4 animate-spin" /> : <Zap className="size-4" />}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Test</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={onEdit}
+                  aria-label="Edit"
+                  className="inline-flex items-center justify-center size-8 rounded-md hover:bg-accent hover:text-accent-foreground transition-colors"
+                >
+                  <Pencil className="size-4" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Edit</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={onDelete}
+                  aria-label="Delete"
+                  className="inline-flex items-center justify-center size-8 rounded-md text-destructive hover:text-destructive hover:bg-destructive/10 transition-colors"
+                >
+                  <Trash2 className="size-4" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Delete</TooltipContent>
+            </Tooltip>
           </div>
         </div>
         {testResult && (
