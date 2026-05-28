@@ -177,21 +177,49 @@ export function ProvidersPage({
   //      binary in place but stripped PATH; user came back from
   //      terminal and we re-check just in case).
   //   3. (Already wired above) Page mount + manual Recheck.
+  //
+  // Dedup: only refetch versions when the installed map actually flips.
+  // `detect_clis` is pure stat (~10ms), `detect_cli_versions` spawns 4
+  // subprocesses (~hundreds of ms) — without this guard, every focus
+  // event would flash the Version skeleton even when nothing changed.
+  const installedRef = React.useRef(installed);
+  installedRef.current = installed;
   React.useEffect(() => {
-    const refresh = () => {
-      void refreshInstalled();
-      void refreshVersions();
+    const refresh = async () => {
+      try {
+        const map = await invoke<Record<string, boolean>>("detect_clis");
+        const next = {
+          claude: !!map.claude,
+          codex: !!map.codex,
+          gemini: !!map.gemini,
+          opencode: !!map.opencode
+        };
+        const prev = installedRef.current;
+        const changed =
+          prev.claude !== next.claude ||
+          prev.codex !== next.codex ||
+          prev.gemini !== next.gemini ||
+          prev.opencode !== next.opencode;
+        if (changed) {
+          setInstalled(next);
+          void refreshVersions();
+        }
+      } catch {
+        /* leave previous state on transient error */
+      }
     };
-    const unlistenPromise = listen("termory:cli-install-changed", refresh);
+    const unlistenPromise = listen("termory:cli-install-changed", () => {
+      void refresh();
+    });
     const win = getCurrentWindow();
     const focusPromise = win.onFocusChanged(({ payload: focused }) => {
-      if (focused) refresh();
+      if (focused) void refresh();
     });
     return () => {
       void unlistenPromise.then((fn) => fn()).catch(() => {});
       void focusPromise.then((fn) => fn()).catch(() => {});
     };
-  }, [refreshInstalled, refreshVersions]);
+  }, [refreshVersions]);
 
   // Auto refresh when the Rust watcher detects any change in the
   // CLI dirs (live config files live inside those dirs). Reuse the
