@@ -199,6 +199,12 @@ Implementation notes:
 
 - `scan_all_sessions` calls Rust scanning on a blocking worker and returns sessions, memories, and skills in one list (distinguished by `source`).
 - `load_session` loads one selected record by `source`, `path`, and `id`.
+- **Records page perf** (`App.tsx` detail effect + `src/components/MessageList.tsx`):
+  - Detail load `useEffect` depends on `selected.source / path / id / updated_at / message_count` — narrow per-field deps instead of the whole `selected` object, so watcher-driven `applyScanResult` rebuilds that hand back a new `AppSession` reference with the same identity don't re-trigger `load_session`. A `prevSelectedKeyRef` distinguishes "new selection" (show `Loader2`) from "same selection, content advanced" (silent swap via `React.startTransition(setDetail)`).
+  - `applyScanResult` no longer auto-selects `result[0]` on first launch — Records opens with an empty detail pane so app boot doesn't pay the cost of parsing the most recent session up front.
+  - `setRoute` is wrapped in `React.useTransition` so clicking a rail icon (especially leaving a long Records detail) doesn't get blocked by the heavy unmount + re-render of the next route.
+  - The detail pane renders messages through `<MessageList>` (`@tanstack/react-virtual`) which keeps roughly the visible window + 6-row overscan in the DOM regardless of session length. `measureElement` reports actual rendered heights so scrolling and the scrollbar stay accurate across variable-length message cards.
+  - The `!selected && sessions.length === 0 && loading` "Scanning…" empty state was removed — initial boot just shows "Nothing to view yet" until data arrives, no transient spinner flash.
 - `AppSession.preview` carries comma-separated tool tags (e.g. `"codex,opencode"` for AGENTS.md). The list-card `MemoryCard` renders one brand badge per tag via `memoryToolsOf()`; the detail-header badge renders a single type label (`Session` / `Memory` / `Skill`) via `typeLabelOf()`.
 - For session-type entries the detail header shows the GUID (`selected.id`) on its own line below the project path, styled monospace via `.detailGuid`. Memory/Skill entries omit the GUID line.
 - Project-level `AGENTS.md` and `AGENTS.override.md` are always tagged with both `codex` and `opencode` regardless of which tool actually has sessions in the cwd. Rationale: the AGENTS.md spec is tool-neutral — Termory reports which tools CAN read the file, not which tool happened to run there. Verified by `scan_memory_always_tags_project_agents_md_with_both_codex_and_opencode` test.
@@ -523,7 +529,7 @@ All four were cross-verified against the upstream CLI source (`.audit-sources/{c
 
 ## Pending feature work
 
-The current UI shell is settled: activity rail (Records / Search / Stats / Providers / Settings), routed via URL hash, with a passive bottom freshness footer fed by the Rust filesystem watcher. Records and Providers are fully implemented; the other three rail destinations render placeholder cards.
+The current UI shell is settled: activity rail (Providers / Records / Search / Stats / Settings, in that order — Providers is the default landing route via `readRouteFromHash` → `"config"` fallback), routed via URL hash, with a passive bottom freshness footer fed by the Rust filesystem watcher. Records and Providers are fully implemented; the other three rail destinations render placeholder cards.
 
 Roadmap below is grouped by priority. Pick top-down within a tier.
 

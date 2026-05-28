@@ -193,13 +193,19 @@ export function App() {
     refresh();
   }, [refresh]);
 
+  const prevSelectedKeyRef = React.useRef<string | null>(null);
   React.useEffect(() => {
     if (!selected) {
       setDetail(null);
+      prevSelectedKeyRef.current = null;
       return;
     }
+    const identity = `${selected.source}::${selected.path}::${selected.id}`;
+    const isNewSelection = prevSelectedKeyRef.current !== identity;
+    prevSelectedKeyRef.current = identity;
+
     let cancelled = false;
-    setDetailLoading(true);
+    if (isNewSelection) setDetailLoading(true);
     invoke<SessionDetail>("load_session", {
       source: selected.source,
       path: selected.path,
@@ -213,12 +219,24 @@ export function App() {
         if (!cancelled) setError(String(err));
       })
       .finally(() => {
-        if (!cancelled) setDetailLoading(false);
+        if (!cancelled && isNewSelection) setDetailLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, [selected]);
+    // Re-fetch when identity (source/path/id) changes — show loading.
+    // Also re-fetch when the selection's mtime / message_count advances
+    // (watcher-driven content update) — silently swap, no spinner.
+    // message_count is included because some sources don't populate
+    // updated_at, so it's the more reliable content-change signal.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    selected?.source,
+    selected?.path,
+    selected?.id,
+    selected?.updated_at,
+    selected?.message_count
+  ]);
 
   React.useEffect(() => {
     const trimmed = query.trim();
@@ -687,7 +705,7 @@ export function App() {
               </section>
 
               <section className="flex flex-col min-h-0 min-w-0 bg-background">
-                {!selected && sessions.length === 0 && !loading && (
+                {!selected && sessions.length === 0 && (
                   <EmptyState
                     icon={<Sparkles size={32} />}
                     title="Nothing to view yet"
@@ -696,12 +714,6 @@ export function App() {
                 )}
                 {!selected && sessions.length > 0 && (
                   <EmptyState icon={<Sparkles />} title="Select a record" />
-                )}
-                {!selected && sessions.length === 0 && loading && (
-                  <EmptyState
-                    icon={<Loader2 className="animate-spin" />}
-                    title="Scanning…"
-                  />
                 )}
                 {selected && (
                   <>
