@@ -37,7 +37,6 @@ import {
   projectDisplayName,
   readRouteFromHash,
   resumeCommandFor,
-  roleClass,
   sessionKey,
   sourceDisplayName
 } from "@/lib/session-utils";
@@ -52,6 +51,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { FreshnessFooter } from "@/components/FreshnessFooter";
 import { MemoryCard } from "@/components/MemoryCard";
 import { MessageBody } from "@/components/MessageBody";
+import { MessageList } from "@/components/MessageList";
 import { RoutePlaceholder } from "@/components/RoutePlaceholder";
 import { SnippetLine } from "@/components/SnippetLine";
 import { SearchPage } from "@/components/search/SearchPage";
@@ -110,7 +110,14 @@ export function App() {
   const clearRecentSearches = React.useCallback(() => {
     setRecentSearches([]);
   }, [setRecentSearches]);
-  const [route, setRoute] = React.useState<Route>(() => readRouteFromHash());
+  const [route, setRouteImmediate] = React.useState<Route>(() => readRouteFromHash());
+  const [, startTransition] = React.useTransition();
+  const setRoute = React.useCallback(
+    (next: Route) => {
+      startTransition(() => setRouteImmediate(next));
+    },
+    []
+  );
   const [lastRefreshedAt, setLastRefreshedAt] = React.useState<number | null>(null);
 
   // Sync route ↔ URL hash so refresh / back-forward / deeplink work.
@@ -146,16 +153,14 @@ export function App() {
   const applyScanResult = React.useCallback((result: AppSession[]) => {
     setSessions(result);
     setSelected((current) => {
-      if (!current) return result[0] ?? null;
+      if (!current) return null;
       return (
         result.find(
           (session) =>
             session.source === current.source &&
             session.path === current.path &&
             session.id === current.id
-        ) ??
-        result[0] ??
-        null
+        ) ?? null
       );
     });
     setLastRefreshedAt(Date.now());
@@ -201,7 +206,8 @@ export function App() {
       id: selected.id
     })
       .then((result) => {
-        if (!cancelled) setDetail(result);
+        if (cancelled) return;
+        React.startTransition(() => setDetail(result));
       })
       .catch((err) => {
         if (!cancelled) setError(String(err));
@@ -779,42 +785,23 @@ export function App() {
                       </div>
                     </header>
 
-                    <div className="flex-1 flex flex-col gap-5 overflow-auto px-4 py-2">
-                      {detailLoading && (
-                        <div className="flex items-center justify-center min-h-[120px] text-muted-foreground">
-                          <Loader2 className="animate-spin" />
-                        </div>
-                      )}
-                      {!detailLoading &&
-                        isSessionItem(selected) &&
-                        detail?.messages.map((message, index) => (
-                          <article
-                            key={`${message.timestamp ?? "msg"}:${index}`}
-                            data-role={roleClass(message.role)}
-                          >
-                            <header className="flex items-center gap-2 mb-1">
-                              <span
-                                aria-hidden="true"
-                                data-role={roleClass(message.role)}
-                                className="w-[3px] h-[0.95em] rounded-sm shrink-0 bg-muted-foreground/60 data-[role=user]:bg-teal-500 data-[role=assistant]:bg-blue-400 data-[role=tool]:bg-amber-500"
-                              />
-                              <span className="text-xs font-medium text-muted-foreground lowercase tabular-nums">
-                                {message.role || "event"}
-                              </span>
-                            </header>
-                            <MessageBody text={message.text} className="pl-[11px]" />
-                          </article>
-                        ))}
-                      {!detailLoading &&
-                      !isSessionItem(selected) &&
-                      detail?.messages.length ? (
+                    {detailLoading ? (
+                      <div className="flex-1 flex items-center justify-center text-muted-foreground">
+                        <Loader2 className="animate-spin" />
+                      </div>
+                    ) : isSessionItem(selected) && detail?.messages.length ? (
+                      <MessageList messages={detail.messages} />
+                    ) : detail?.messages.length ? (
+                      <div className="flex-1 overflow-auto px-4 py-2">
                         <div className="rounded-lg bg-card text-card-foreground px-5 py-4">
                           <MessageBody
                             text={detail.messages.map((m) => m.text).join("\n\n")}
                           />
                         </div>
-                      ) : null}
-                    </div>
+                      </div>
+                    ) : (
+                      <div className="flex-1" />
+                    )}
                   </>
                 )}
               </section>
