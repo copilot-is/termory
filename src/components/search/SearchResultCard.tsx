@@ -70,6 +70,7 @@ export function SearchResultCard({
         query={query}
         role={hit.role}
         matchCount={hit.match_count}
+        truncated={hit.truncated}
       />
     </button>
   );

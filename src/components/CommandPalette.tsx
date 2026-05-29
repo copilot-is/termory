@@ -71,7 +71,7 @@ export function CommandPalette({
     for (const session of sessions) {
       const haystack = `${session.title}\n${session.project}\n${session.source}`.toLowerCase();
       if (haystack.includes(needle)) {
-        matches.push({ session, snippet: "", role: "", match_count: 0 });
+        matches.push({ session, snippet: "", role: "", match_count: 0, truncated: false });
         if (matches.length >= 16) break;
       }
     }

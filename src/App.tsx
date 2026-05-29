@@ -707,6 +707,7 @@ export function App() {
                                 query={query.trim()}
                                 role={hit.role}
                                 matchCount={hit.match_count}
+                                truncated={hit.truncated}
                               />
                             )}
                           </button>

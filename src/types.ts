@@ -31,6 +31,10 @@ export type SearchHit = {
   snippet: string;
   role: string;
   match_count: number;
+  // True when the per-session search loop stopped after hitting the
+  // backend's 500-match cap — render `×500+` instead of `×500` so
+  // the user knows there were probably way more.
+  truncated?: boolean;
 };
 
 export type MemoryTool = "Claude" | "Codex" | "Gemini" | "OpenCode" | "Other";

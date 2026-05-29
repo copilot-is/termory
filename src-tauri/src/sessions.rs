@@ -362,7 +362,18 @@ pub struct SearchHit {
     pub snippet: String,
     pub role: String,
     pub match_count: usize,
+    /// True when the per-session search loop stopped counting after
+    /// hitting the [`SEARCH_MATCH_CAP`] ceiling — i.e. the real match
+    /// count is at least `match_count` but could be much higher. The
+    /// frontend uses this to render `×500+` instead of `×500`.
+    #[serde(default)]
+    pub truncated: bool,
 }
+
+/// Per-session match-count ceiling. After this many hits we stop
+/// scanning the rest of the session — the user can already tell
+/// "this one has a lot" and counting further is wasted work.
+const SEARCH_MATCH_CAP: usize = 500;
 
 pub fn search_sessions(query: &str) -> Result<Vec<SearchHit>, Box<dyn Error>> {
     let trimmed = query.trim();
@@ -378,6 +389,7 @@ pub fn search_sessions(query: &str) -> Result<Vec<SearchHit>, Box<dyn Error>> {
         };
         let mut first: Option<(String, String)> = None;
         let mut match_count = 0usize;
+        let mut truncated = false;
         for message in &detail.messages {
             let lower = message.text.to_lowercase();
             let mut cursor = 0usize;
@@ -394,12 +406,13 @@ pub fn search_sessions(query: &str) -> Result<Vec<SearchHit>, Box<dyn Error>> {
                     ));
                 }
                 match_count += 1;
-                if match_count >= 500 {
+                if match_count >= SEARCH_MATCH_CAP {
+                    truncated = true;
                     break;
                 }
                 cursor = end;
             }
-            if match_count >= 500 {
+            if truncated {
                 break;
             }
         }
@@ -409,6 +422,7 @@ pub fn search_sessions(query: &str) -> Result<Vec<SearchHit>, Box<dyn Error>> {
                 snippet,
                 role,
                 match_count,
+                truncated,
             });
         }
     }

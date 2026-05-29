@@ -2,6 +2,7 @@ import React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, Plug, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -315,9 +316,23 @@ export function ProvidersPage({
   };
 
   const deleteProvider = async (id: string) => {
-    if (!window.confirm("Delete this provider?")) return;
     const target = providers.find((p) => p.id === id);
     if (!target) return;
+    // Tauri's native confirm dialog — feels at home on each OS
+    // (macOS sheet, Windows MessageBox, Linux GTK) and the Delete
+    // button is highlighted as the destructive one. Replaces the
+    // browser `window.confirm` which used to render an out-of-place
+    // generic "OK / Cancel" alert.
+    const confirmed = await ask(
+      `Delete ${target.name || "this provider"}? This can't be undone.`,
+      {
+        title: "Delete provider",
+        kind: "warning",
+        okLabel: "Delete",
+        cancelLabel: "Cancel"
+      }
+    );
+    if (!confirmed) return;
     const isInUse = activeStates[target.app]?.matchedProviderId === id;
     try {
       if (target.app === "opencode") {

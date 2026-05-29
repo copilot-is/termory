@@ -6,12 +6,14 @@ export function SnippetLine({
   snippet,
   query,
   role,
-  matchCount
+  matchCount,
+  truncated
 }: {
   snippet: string;
   query: string;
   role: string;
   matchCount: number;
+  truncated?: boolean;
 }) {
   const segments = React.useMemo(() => splitSnippet(snippet, query), [snippet, query]);
   const label = role ? role : "match";
@@ -20,7 +22,12 @@ export function SnippetLine({
       <span className="flex items-center gap-1 text-[10.5px] uppercase tracking-wide text-muted-foreground">
         <MessageSquare size={11} />
         <span>{label}</span>
-        {matchCount > 1 && <span className="text-muted-foreground/70">×{matchCount}</span>}
+        {matchCount > 1 && (
+          <span className="text-muted-foreground/70">
+            ×{matchCount}
+            {truncated && "+"}
+          </span>
+        )}
       </span>
       <span className="text-xs text-muted-foreground line-clamp-2">
         {segments.map((seg, index) =>
