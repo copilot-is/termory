@@ -24,6 +24,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2.9.0", features = [] }
+tauri-plugin-log = "2"
 tauri-plugin-opener = "2.5.0"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
@@ -33,3 +34,4 @@ walkdir = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 base64 = "0.22"
+log = "0.4"

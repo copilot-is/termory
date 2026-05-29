@@ -263,7 +263,41 @@ async fn write_app_providers(value: serde_json::Value) -> Result<(), String> {
 }
 
 pub fn run() {
+    // Log target directory: `~/.termory/logs/`. Falls back to the
+    // OS-default log location if HOME isn't readable so app launch
+    // never depends on logging setup. Mirrors where `config.json` and
+    // `providers.json` live so users have one place to look at when
+    // reporting a bug.
+    let logs_dir = dirs::home_dir().map(|h| h.join(".termory").join("logs"));
+
+    let log_plugin = {
+        let mut builder = tauri_plugin_log::Builder::new()
+            .max_file_size(5 * 1024 * 1024) // 5 MB
+            .rotation_strategy(
+                tauri_plugin_log::RotationStrategy::KeepAll,
+            )
+            .level(log::LevelFilter::Info);
+        if let Some(path) = logs_dir {
+            // Ensure the dir exists so the plugin's open() doesn't
+            // race on first launch.
+            let _ = std::fs::create_dir_all(&path);
+            builder = builder.targets([
+                tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Folder {
+                        path,
+                        file_name: Some("termory".into()),
+                    },
+                ),
+                tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ),
+            ]);
+        }
+        builder.build()
+    };
+
     tauri::Builder::default()
+        .plugin(log_plugin)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -299,7 +333,7 @@ pub fn run() {
                     app.manage(watcher_handle);
                 }
                 Err(err) => {
-                    eprintln!("termory watcher: init failed: {err}");
+                    log::error!("watcher init failed: {err}");
                 }
             }
             Ok(())

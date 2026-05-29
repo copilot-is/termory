@@ -103,7 +103,7 @@ impl WatcherHandle {
                 continue;
             }
             if let Err(err) = inner.watcher.watch(path, RecursiveMode::Recursive) {
-                eprintln!("termory watcher: skip dynamic {path:?}: {err}");
+                log::warn!("watcher skip dynamic {path:?}: {err}");
             }
         }
 
@@ -152,7 +152,7 @@ pub fn start(app_handle: AppHandle) -> notify::Result<WatcherHandle> {
         // Per-path failures are non-fatal — partial coverage beats no
         // coverage. A user might not have every CLI installed.
         if let Err(err) = watcher.watch(&path, RecursiveMode::Recursive) {
-            eprintln!("termory watcher: skip {path:?}: {err}");
+            log::warn!("watcher skip session target {path:?}: {err}");
         }
     }
 
@@ -166,7 +166,7 @@ pub fn start(app_handle: AppHandle) -> notify::Result<WatcherHandle> {
             continue;
         }
         if let Err(err) = watcher.watch(path, *mode) {
-            eprintln!("termory watcher: skip install {path:?}: {err}");
+            log::warn!("watcher skip install target {path:?}: {err}");
         }
     }
 
@@ -211,7 +211,7 @@ pub fn start(app_handle: AppHandle) -> notify::Result<WatcherHandle> {
                 .any(|e| event_touches_install(e, &install_targets))
             {
                 if let Err(err) = app_handle.emit(CLI_INSTALL_CHANGED_EVENT, ()) {
-                    eprintln!("termory watcher: install emit failed: {err}");
+                    log::warn!("watcher install-changed emit failed: {err}");
                 }
             }
 
@@ -238,11 +238,11 @@ pub fn start(app_handle: AppHandle) -> notify::Result<WatcherHandle> {
                     handle.reconfigure_dynamic(new_cwds);
 
                     if let Err(err) = app_handle.emit(SOURCES_CHANGED_EVENT, sessions) {
-                        eprintln!("termory watcher: emit failed: {err}");
+                        log::warn!("watcher sources-changed emit failed: {err}");
                     }
                 }
                 Err(err) => {
-                    eprintln!("termory watcher: rescan failed: {err}");
+                    log::warn!("watcher rescan failed: {err}");
                 }
             }
 
