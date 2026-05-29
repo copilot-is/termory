@@ -55,6 +55,13 @@ let cachedVersions: Record<CliApp, string | null> = {
   opencode: null
 };
 let cachedVersionsLoading = true;
+// True once the first `refreshVersions()` of the app lifetime has
+// resolved. Used to keep the version skeleton from flashing on every
+// route remount — after the first detect, subsequent route entries
+// render the cached values silently and only watcher events / Recheck
+// trigger a re-fetch (visible flash there is correct: the user
+// actually changed something).
+let versionsEverResolved = false;
 
 export function ProvidersPage({
   providers,
@@ -119,10 +126,19 @@ export function ProvidersPage({
   }, []);
 
   // Heavier than refreshInstalled — spawns 4 `<bin> --version`
-  // subprocesses. Called on page mount + Recheck; not before every
-  // action (the install gate uses refreshInstalled / detect_clis).
+  // subprocesses. Called on first cold-start mount, on Recheck, and
+  // when the watcher reports an install/uninstall. Subsequent route
+  // remounts read straight from the module-level cache without
+  // re-firing this.
+  //
+  // Only flips `versionsLoading` to `true` on the very first attempt
+  // of the app lifetime. After that, refreshes update the value
+  // silently — no skeleton flash — because the user already has
+  // accurate numbers on screen.
   const refreshVersions = React.useCallback(async () => {
-    setVersionsLoading(true);
+    if (!versionsEverResolved) {
+      setVersionsLoading(true);
+    }
     try {
       const map = await invoke<Record<string, string | null>>(
         "detect_cli_versions_cmd"
@@ -136,6 +152,7 @@ export function ProvidersPage({
     } catch {
       /* leave previous state on error */
     } finally {
+      versionsEverResolved = true;
       setVersionsLoading(false);
     }
   }, []);
@@ -211,7 +228,14 @@ export function ProvidersPage({
 
   React.useEffect(() => {
     void refreshInstalled();
-    void refreshVersions();
+    // First-mount-of-app-lifetime gate. Route remounts read the
+    // cached versions instantly; only the first cold start (or a
+    // page reload) pays the subprocess cost. After that, watcher
+    // events and manual Recheck are the only paths that re-fire
+    // `refreshVersions`.
+    if (!versionsEverResolved) {
+      void refreshVersions();
+    }
   }, [refreshInstalled, refreshVersions]);
 
   // Event-driven install detection — no polling. Three triggers:
@@ -485,7 +509,7 @@ export function ProvidersPage({
           />
         </React.Suspense>
       ) : (
-        <div className="flex-1 min-h-0 overflow-auto p-3">
+        <div className="flex-1 min-h-0 overflow-auto px-3 pt-3 pb-0">
           <div className="flex flex-col gap-2.5">
             {!installed[app] && (
               <div className="flex items-center gap-2 rounded-md outline outline-1 outline-amber-500/30 bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 px-3 py-2 text-base leading-relaxed">

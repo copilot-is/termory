@@ -12,9 +12,9 @@ import { cn } from "@/lib/utils";
 type ThemeChoice = "system" | "light" | "dark";
 
 const THEME_OPTIONS: { value: ThemeChoice; label: string; icon: React.ReactNode }[] = [
-  { value: "system", label: "System", icon: <Monitor className="size-4" /> },
-  { value: "light", label: "Light", icon: <Sun className="size-4" /> },
-  { value: "dark", label: "Dark", icon: <Moon className="size-4" /> }
+  { value: "system", label: "System", icon: <Monitor className="size-6" /> },
+  { value: "light", label: "Light", icon: <Sun className="size-6" /> },
+  { value: "dark", label: "Dark", icon: <Moon className="size-6" /> }
 ];
 
 const SHORTCUTS: { keys: string[]; label: string }[] = [
@@ -76,7 +76,7 @@ export function SettingsPage({
 
   return (
     <div className="flex-1 min-h-0 flex flex-col bg-background">
-      <div className="flex-1 min-h-0 overflow-auto p-3">
+      <div className="flex-1 min-h-0 overflow-auto px-3 pt-3 pb-0">
         <div className="flex flex-col gap-2">
           <SettingsSection title="Appearance">
               <div className="grid grid-cols-3 gap-2">
@@ -94,7 +94,7 @@ export function SettingsPage({
                           : "outline-foreground/5 hover:bg-accent hover:text-accent-foreground"
                       )}
                     >
-                      <span className="inline-flex items-center justify-center size-8 rounded-md bg-background text-foreground shadow-sm">
+                      <span className="inline-flex items-center justify-center size-8">
                         {opt.icon}
                       </span>
                       <span>{opt.label}</span>
@@ -178,7 +178,7 @@ export function SettingsPage({
                   <span className="text-muted-foreground">App</span>
                   <span>Termory</span>
                   <span className="text-muted-foreground">Version</span>
-                  <span className="font-mono">{appVersion || "—"}</span>
+                  <span className="font-mono">{appVersion ? `v${appVersion}` : "—"}</span>
                 </div>
                 <Button
                   type="button"
@@ -236,7 +236,7 @@ function SettingsSection({
   children: React.ReactNode;
 }) {
   return (
-    <Card className="p-3 gap-0 outline outline-1 outline-foreground/5">
+    <Card className="p-3 gap-0 outline outline-1 outline-transparent bg-card shadow-sm">
       <CardContent className="px-0 flex flex-col gap-3">
         <h2 className="text-lg font-medium">{title}</h2>
         {children}

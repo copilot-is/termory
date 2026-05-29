@@ -48,6 +48,17 @@
 
   /* Sidebar gets the very faintest tint to suggest a vibrancy material
    * without actually using one (vibrancy needs Tauri config). */
+  /* OpenCode brand mark colors. Two variants per the official assets
+   * at .audit-sources/opencode/packages/identity/. Naming is
+   * counter-intuitive — `mark.svg` is the DARK variant (intended
+   * for use on LIGHT pages so it stands out), `mark-light.svg` is
+   * the LIGHT variant (for use on DARK pages). So Termory's light
+   * theme uses mark.svg's values; the .dark block below flips to
+   * mark-light.svg's. */
+  --brand-opencode-bg: #131010;
+  --brand-opencode-screen: #5A5858;
+  --brand-opencode-frame: #FFFFFF;
+
   --sidebar: oklch(0.968 0.004 250);
   --sidebar-foreground: oklch(0.18 0.005 250);
   --sidebar-primary: oklch(0.6204 0.195 253.83);
@@ -71,8 +82,11 @@
   --popover: oklch(0.21 0.006 250);
   --popover-foreground: oklch(0.96 0.003 250);
 
-  --primary: oklch(0.72 0.18 253.83);
-  --primary-foreground: oklch(0.145 0 0);
+  /* Primary stays identical to the light theme so the "active /
+   * selected" highlight is the same blue across both modes — no
+   * jarring brightness shift when the user toggles theme. */
+  --primary: oklch(0.6204 0.195 253.83);
+  --primary-foreground: oklch(0.985 0 0);
 
   --secondary: oklch(0.22 0.006 250);
   --secondary-foreground: oklch(0.96 0.003 250);
@@ -88,7 +102,7 @@
 
   --border: oklch(1 0 0 / 9%);
   --input: oklch(1 0 0 / 12%);
-  --ring: oklch(0.72 0.18 253.83);
+  --ring: oklch(0.6204 0.195 253.83);
 
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.696 0.17 162.48);
@@ -96,14 +110,21 @@
   --chart-4: oklch(0.627 0.265 303.9);
   --chart-5: oklch(0.645 0.246 16.439);
 
+  /* Pure white from mark-light.svg was too jarring against the
+   * near-black page in dark mode — bring it down to a mid-gray that
+   * still reads as "light variant" but isn't a glowing square. */
+  --brand-opencode-bg: #A1A1AA;
+  --brand-opencode-screen: #71717A;
+  --brand-opencode-frame: #18181B;
+
   --sidebar: oklch(0.195 0.006 250);
   --sidebar-foreground: oklch(0.96 0.003 250);
-  --sidebar-primary: oklch(0.72 0.18 253.83);
-  --sidebar-primary-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.6204 0.195 253.83);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
   --sidebar-accent: oklch(0.3 0.04 253);
   --sidebar-accent-foreground: oklch(0.96 0.003 250);
   --sidebar-border: oklch(1 0 0 / 8%);
-  --sidebar-ring: oklch(0.72 0.18 253.83);
+  --sidebar-ring: oklch(0.6204 0.195 253.83);
 }
 
 @theme inline {

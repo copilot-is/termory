@@ -27,7 +27,14 @@ export function ProviderOfficialCard({
   onSetDefault: () => void;
 }) {
   return (
-    <Card className={cn("p-3 gap-0 outline outline-1 outline-foreground/5", isInUse && "outline-primary/15 bg-primary/10")}>
+    <Card
+      className={cn(
+        "p-3 gap-0 outline outline-1 outline-transparent shadow-sm",
+        isInUse
+          ? "border-l-4 border-l-primary bg-primary/5"
+          : "bg-card hover:bg-accent/40 transition-colors"
+      )}
+    >
       <CardContent className="px-0 flex items-center gap-3 min-h-7">
         <span className="shrink-0 inline-flex items-center justify-center size-10 rounded-md bg-background shadow-sm [&_svg]:size-5">
           <BrandIcon source={CLI_APP_SOURCE_BADGE[app]} />
@@ -36,11 +43,13 @@ export function ProviderOfficialCard({
           <div className="flex items-center gap-2">
             <h3 className="text-lg font-medium">Official</h3>
             {isInUse && (
-              <Badge className="uppercase text-[9px] tracking-wide px-1.5 py-0">In use</Badge>
+              <Badge className="uppercase text-[9px] tracking-wide px-1.5 py-0">
+                In use
+              </Badge>
             )}
           </div>
           <p className="text-xs text-muted-foreground leading-snug">
-            Version:{" "}
+            Version{" "}
             {versionLoading ? (
               <span className="inline-block w-12 h-3 align-middle rounded bg-muted-foreground/15 animate-pulse" />
             ) : version ? (

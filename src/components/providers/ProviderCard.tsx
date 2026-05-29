@@ -83,7 +83,19 @@ export function ProviderCard({
 }) {
   const isOpencode = provider.app === "opencode";
   return (
-    <Card className={cn("p-3 gap-0 outline outline-1 outline-foreground/5", isInUse && "outline-primary/15 bg-primary/10")}>
+    <Card
+      className={cn(
+        "p-3 gap-0 outline outline-1 outline-transparent shadow-sm",
+        // Active: left accent stripe (Mac Finder selected-row style)
+        //   + faint primary tint. Avoids dominating the whole card
+        //   with solid primary the way smaller surfaces (sidebar rows
+        //   etc.) can get away with.
+        // Inactive: standard card surface with hover affordance.
+        isInUse
+          ? "border-l-4 border-l-primary bg-primary/5"
+          : "bg-card hover:bg-accent/40 transition-colors"
+      )}
+    >
       <CardContent className="px-0 flex flex-col gap-2">
         <div className="flex items-start justify-between gap-3 flex-wrap min-h-7">
           <ProviderFavicon favicon={provider.favicon} name={provider.name} />
@@ -93,7 +105,9 @@ export function ProviderCard({
                 {provider.name || "(unnamed)"}
               </h3>
               {isInUse && (
-                <Badge className="uppercase text-[9px] tracking-wide px-1.5 py-0">In use</Badge>
+                <Badge className="uppercase text-[9px] tracking-wide px-1.5 py-0">
+                  In use
+                </Badge>
               )}
             </div>
             {(provider.baseUrl || provider.apiKey || provider.model) && (
