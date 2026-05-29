@@ -7,6 +7,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
@@ -372,7 +373,7 @@ pub fn search_sessions(query: &str) -> Result<Vec<SearchHit>, Box<dyn Error>> {
     let sessions = scan_sessions()?;
     let mut hits = Vec::new();
     for session in sessions {
-        let Ok(detail) = get_session(&session.source, &session.id) else {
+        let Some(detail) = get_session_for_search(&session) else {
             continue;
         };
         let mut first: Option<(String, String)> = None;
@@ -404,7 +405,7 @@ pub fn search_sessions(query: &str) -> Result<Vec<SearchHit>, Box<dyn Error>> {
         }
         if let Some((role, snippet)) = first {
             hits.push(SearchHit {
-                session: detail.session,
+                session: detail.session.clone(),
                 snippet,
                 role,
                 match_count,
@@ -412,6 +413,101 @@ pub fn search_sessions(query: &str) -> Result<Vec<SearchHit>, Box<dyn Error>> {
         }
     }
     Ok(hits)
+}
+
+/// LRU cache backing `search_sessions`. Search calls `get_session` for
+/// every record in scan output, which is `O(records × parse_cost)` —
+/// for users with 100s of sessions that means several seconds of
+/// JSONL / SQLite work per keystroke. Keyed by `(path, mtime)` so the
+/// cache invalidates automatically when the underlying file changes:
+/// a fresh write produces a new mtime → new key → cache miss → re-
+/// parse.
+///
+/// Capacity is intentionally small (default 200 entries). Real LRU
+/// eviction via a `VecDeque<key>` companion to the `HashMap` — when
+/// inserting past capacity, drop the front of the deque. Hot entries
+/// stay because every `get` rotates them to the back.
+struct SearchCache {
+    map: HashMap<(std::path::PathBuf, std::time::SystemTime), Arc<SessionDetail>>,
+    order: std::collections::VecDeque<(std::path::PathBuf, std::time::SystemTime)>,
+    capacity: usize,
+}
+
+impl SearchCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get(
+        &mut self,
+        key: &(std::path::PathBuf, std::time::SystemTime),
+    ) -> Option<Arc<SessionDetail>> {
+        if !self.map.contains_key(key) {
+            return None;
+        }
+        // Promote to MRU.
+        self.order.retain(|k| k != key);
+        self.order.push_back(key.clone());
+        self.map.get(key).map(Arc::clone)
+    }
+
+    fn put(
+        &mut self,
+        key: (std::path::PathBuf, std::time::SystemTime),
+        value: Arc<SessionDetail>,
+    ) {
+        if self.map.contains_key(&key) {
+            self.order.retain(|k| k != &key);
+        } else if self.map.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+static SEARCH_CACHE: std::sync::LazyLock<std::sync::Mutex<SearchCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(SearchCache::new(200)));
+
+/// Look up the session's parsed detail, using the LRU cache when the
+/// file's mtime hasn't changed since last time we parsed it. Returns
+/// `None` when the path can't be resolved or the file can't be parsed —
+/// search treats either as "skip this record" rather than fail.
+fn get_session_for_search(session: &AppSession) -> Option<Arc<SessionDetail>> {
+    let path = lookup_session_path(&session.source, &session.id)?;
+    // Look up mtime so we can key the cache on (path, mtime). If we
+    // can't stat the file, skip caching but still try a fresh parse —
+    // the file may exist but live in a path the runtime can't stat.
+    let mtime = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok();
+    if let Some(mtime) = mtime {
+        let key = (path.clone(), mtime);
+        if let Ok(mut cache) = SEARCH_CACHE.lock() {
+            if let Some(cached) = cache.get(&key) {
+                return Some(cached);
+            }
+        }
+        let detail = get_session(&session.source, &session.id).ok()?;
+        let arc = Arc::new(detail);
+        if let Ok(mut cache) = SEARCH_CACHE.lock() {
+            cache.put(key, Arc::clone(&arc));
+        }
+        Some(arc)
+    } else {
+        get_session(&session.source, &session.id).ok().map(Arc::new)
+    }
 }
 
 fn make_search_snippet(text: &str, match_start: usize, match_end: usize) -> String {
@@ -7733,7 +7829,7 @@ fn codex_display_title(text: &str) -> Option<String> {
 fn looks_like_codex_metadata(text: &str) -> bool {
     text.starts_with("msg_")
         || text.starts_with("sess_")
-        || text.len() > 40 && text.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        || (text.len() > 40 && text.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
 }
 
 fn estimate_codex_message_count(path: &Path) -> usize {
@@ -7906,6 +8002,99 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn search_cache_evicts_oldest_when_full() {
+        let mut cache = SearchCache::new(3);
+        let mtime = SystemTime::now();
+        let arc = || Arc::new(SessionDetail {
+            session: AppSession {
+                id: String::new(),
+                source: String::new(),
+                title: String::new(),
+                project: String::new(),
+                path: String::new(),
+                started_at: None,
+                updated_at: None,
+                message_count: 0,
+                preview: String::new(),
+                snippet: String::new(),
+                message_previews: Vec::new(),
+            },
+            messages: Vec::new(),
+        });
+        cache.put((PathBuf::from("/a"), mtime), arc());
+        cache.put((PathBuf::from("/b"), mtime), arc());
+        cache.put((PathBuf::from("/c"), mtime), arc());
+        assert_eq!(cache.len(), 3);
+        // Capacity reached; next put evicts oldest ("/a").
+        cache.put((PathBuf::from("/d"), mtime), arc());
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get(&(PathBuf::from("/a"), mtime)).is_none());
+        assert!(cache.get(&(PathBuf::from("/d"), mtime)).is_some());
+    }
+
+    #[test]
+    fn search_cache_get_promotes_to_mru() {
+        let mut cache = SearchCache::new(3);
+        let mtime = SystemTime::now();
+        let arc = || Arc::new(SessionDetail {
+            session: AppSession {
+                id: String::new(),
+                source: String::new(),
+                title: String::new(),
+                project: String::new(),
+                path: String::new(),
+                started_at: None,
+                updated_at: None,
+                message_count: 0,
+                preview: String::new(),
+                snippet: String::new(),
+                message_previews: Vec::new(),
+            },
+            messages: Vec::new(),
+        });
+        cache.put((PathBuf::from("/a"), mtime), arc());
+        cache.put((PathBuf::from("/b"), mtime), arc());
+        cache.put((PathBuf::from("/c"), mtime), arc());
+        // Touch /a to make it MRU.
+        let _ = cache.get(&(PathBuf::from("/a"), mtime));
+        // Now /b is the least-recently-used. Inserting /d should evict /b.
+        cache.put((PathBuf::from("/d"), mtime), arc());
+        assert!(cache.get(&(PathBuf::from("/a"), mtime)).is_some());
+        assert!(cache.get(&(PathBuf::from("/b"), mtime)).is_none());
+    }
+
+    #[test]
+    fn search_cache_put_refreshes_existing_position() {
+        let mut cache = SearchCache::new(2);
+        let mtime = SystemTime::now();
+        let arc = || Arc::new(SessionDetail {
+            session: AppSession {
+                id: String::new(),
+                source: String::new(),
+                title: String::new(),
+                project: String::new(),
+                path: String::new(),
+                started_at: None,
+                updated_at: None,
+                message_count: 0,
+                preview: String::new(),
+                snippet: String::new(),
+                message_previews: Vec::new(),
+            },
+            messages: Vec::new(),
+        });
+        cache.put((PathBuf::from("/a"), mtime), arc());
+        cache.put((PathBuf::from("/b"), mtime), arc());
+        // Re-put /a — should refresh position, NOT evict anything.
+        cache.put((PathBuf::from("/a"), mtime), arc());
+        assert_eq!(cache.len(), 2);
+        // Inserting /c now should evict /b (oldest), not /a.
+        cache.put((PathBuf::from("/c"), mtime), arc());
+        assert!(cache.get(&(PathBuf::from("/a"), mtime)).is_some());
+        assert!(cache.get(&(PathBuf::from("/b"), mtime)).is_none());
+    }
+
     fn get_session_rejects_id_outside_scan_set() {
         // Force a known empty-index state so we don't depend on any
         // previous scan_sessions() call leaving residue.

@@ -504,6 +504,7 @@ export function App() {
                         role="button"
                         tabIndex={0}
                         aria-current={groupActive ? "page" : undefined}
+                        aria-label={`${sourceDisplayName(group.source)} (${group.count})`}
                         onClick={() => {
                           setSource(group.source);
                           setProject(null);
@@ -634,7 +635,6 @@ export function App() {
                     {loading && sessionItems.length === 0 && (
                       <EmptyState
                         icon={<Loader2 className="animate-spin" />}
-                        title="Scanning local history"
                       />
                     )}
                     {!loading && filtered.length === 0 && sessionItems.length === 0 && (
@@ -720,7 +720,6 @@ export function App() {
                     {loading && memoryItems.length === 0 && (
                       <EmptyState
                         icon={<Loader2 className="animate-spin" />}
-                        title="Scanning memory"
                       />
                     )}
                     {!loading && filteredMemories.length === 0 && memoryItems.length === 0 && (
@@ -762,7 +761,6 @@ export function App() {
                     {loading && skillItems.length === 0 && (
                       <EmptyState
                         icon={<Loader2 className="animate-spin" />}
-                        title="Scanning skills"
                       />
                     )}
                     {!loading && filteredSkills.length === 0 && skillItems.length === 0 && (

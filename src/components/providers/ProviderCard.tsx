@@ -8,36 +8,31 @@ import { cn } from "@/lib/utils";
 import { maskKey } from "@/lib/provider-utils";
 import type { Provider, TestResult } from "@/types";
 
-function ProviderFavicon({ url, name }: { url?: string; name?: string }) {
+function ProviderFavicon({
+  favicon,
+  name
+}: {
+  favicon?: string;
+  name?: string;
+}) {
+  // The editor caches the favicon as a `data:image/...;base64,...`
+  // URL into providers.json when the user creates or edits the entry.
+  // Rendering from that cache means: no live network request per
+  // mount, no hostname disclosure to any third party, works offline.
+  // Empty / undefined → letter avatar fallback.
   const [errored, setErrored] = React.useState(false);
-  let domain = "";
-  if (url) {
-    try {
-      domain = new URL(url).hostname;
-    } catch {
-      domain = "";
-    }
-  }
-
-  // Fetch the favicon directly from the provider's own domain — the
-  // provider already receives our API key requests, so the favicon
-  // request is no extra disclosure. Avoids leaking the user's full
-  // provider list to a third party (e.g. Google's s2/favicons service).
-  // Falls back to the letter avatar on 404 / CORS / network error.
-  if (domain && !errored) {
+  if (favicon && !errored) {
     return (
       <span className="shrink-0 inline-flex items-center justify-center size-10 rounded-md bg-background shadow-sm">
         <img
-          src={`https://${domain}/favicon.ico`}
+          src={favicon}
           alt=""
           className="size-5 rounded-sm"
-          referrerPolicy="no-referrer"
           onError={() => setErrored(true)}
         />
       </span>
     );
   }
-
   const letter = (name?.trim()[0] ?? "?").toUpperCase();
   return (
     <span className="shrink-0 inline-flex items-center justify-center size-10 rounded-md bg-primary/15 text-primary text-base font-medium shadow-sm">
@@ -91,7 +86,7 @@ export function ProviderCard({
     <Card className={cn("p-3 gap-0 outline outline-1 outline-foreground/5", isInUse && "outline-primary/15 bg-primary/10")}>
       <CardContent className="px-0 flex flex-col gap-2">
         <div className="flex items-start justify-between gap-3 flex-wrap min-h-7">
-          <ProviderFavicon url={provider.baseUrl} name={provider.name} />
+          <ProviderFavicon favicon={provider.favicon} name={provider.name} />
           <div className="flex-1 min-w-0 flex flex-col gap-2">
             <div className="flex items-center gap-2">
               <h3 className="text-lg font-medium">

@@ -11,6 +11,18 @@ import { invoke } from "@tauri-apps/api/core";
 
 type ConfigObject = Record<string, unknown>;
 
+// Log only in dev. In production these warnings ship to the renderer's
+// devtools console where nobody opens them anyway, so they're either
+// noise or — for the API-key edge cases — leaked detail. Vite inlines
+// `import.meta.env.DEV` at build time, so this collapses to a no-op
+// in release bundles.
+const warn = (...args: unknown[]) => {
+  if (import.meta.env.DEV) {
+    // eslint-disable-next-line no-console
+    console.warn(...args);
+  }
+};
+
 const PROVIDERS_KEY = "providers";
 
 let configPromise: Promise<ConfigObject> | null = null;
@@ -26,7 +38,7 @@ function loadConfig(): Promise<ConfigObject> {
         return {};
       })
       .catch((err) => {
-        console.warn("config: read_app_config failed", err);
+        warn("config: read_app_config failed", err);
         return {} as ConfigObject;
       });
   }
@@ -38,7 +50,7 @@ function loadProviders(): Promise<unknown[]> {
     providersPromise = invoke<unknown>("read_app_providers")
       .then((value) => (Array.isArray(value) ? value : []))
       .catch((err) => {
-        console.warn("config: read_app_providers failed", err);
+        warn("config: read_app_providers failed", err);
         return [];
       });
   }
@@ -50,7 +62,7 @@ async function flushConfig(next: ConfigObject): Promise<void> {
   try {
     await invoke("write_app_config", { value: next });
   } catch (err) {
-    console.warn("config: write_app_config failed", err);
+    warn("config: write_app_config failed", err);
   }
 }
 
@@ -74,7 +86,7 @@ async function flushProviders(next: unknown[]): Promise<void> {
   try {
     await invoke("write_app_providers", { value: cleaned });
   } catch (err) {
-    console.warn("config: write_app_providers failed", err);
+    warn("config: write_app_providers failed", err);
   }
 }
 
@@ -92,7 +104,7 @@ export async function getConfig<T>(key: string): Promise<T | null> {
 export async function setConfig<T>(key: string, value: T): Promise<void> {
   if (key === PROVIDERS_KEY) {
     if (!Array.isArray(value)) {
-      console.warn("config: providers value must be an array, ignoring set");
+      warn("config: providers value must be an array, ignoring set");
       return;
     }
     await flushProviders(value as unknown[]);

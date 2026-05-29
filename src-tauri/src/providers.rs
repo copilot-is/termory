@@ -568,6 +568,14 @@ pub struct Provider {
     /// OpenCode-only options nested under `opencode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode: Option<OpencodeOptions>,
+    /// Cached favicon as a `data:image/...;base64,...` URL. Populated
+    /// at create / edit time via `fetch_favicon` so the ProviderCard
+    /// can render the brand mark locally without making a network
+    /// request on every render (and without leaking the provider's
+    /// hostname to Google's s2 service the way the legacy live-fetch
+    /// did). `None` ⇒ fall back to the letter avatar in the UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favicon: Option<String>,
 }
 
 /// Claude Code's `/model` menu reads three env vars
@@ -1721,6 +1729,111 @@ fn read_active_opencode(providers: &[Provider]) -> Result<ActiveState, Box<dyn E
 // Test API
 // ===================================================================
 
+/// Strip subdomains down to the brand domain — `api.openai.com` →
+/// `openai.com`, `chat.deepseek.com` → `deepseek.com`. Used as a
+/// favicon-fetch heuristic because API subdomains usually 404 on
+/// `/favicon.ico` while the brand root almost always serves one.
+///
+/// Heuristic only: takes the last two labels. Fails for `.co.uk` /
+/// `.com.cn` style multi-label TLDs (would yield `example.co.uk` →
+/// `co.uk`), but none of the upstream AI providers we support use
+/// those. IP literals are returned as `None` so we skip the strip and
+/// fall back to the literal host. Proper handling would need the
+/// Public Suffix List — overkill for the favicon nicety here.
+fn registrable_domain(host: &str) -> Option<String> {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let n = parts.len();
+    Some(format!("{}.{}", parts[n - 2], parts[n - 1]))
+}
+
+/// Fetch the favicon for `url` (anything that parses as a URL — we
+/// only care about its host) and return a `data:image/...;base64,...`
+/// URL the renderer can stick straight into an `<img src>`. Returns
+/// `None` on parse failure, network error, non-2xx, non-image
+/// Content-Type, or empty body.
+///
+/// Tries the brand-root domain first (`api.openai.com` →
+/// `openai.com/favicon.ico`), falls back to the literal host on miss.
+/// Per-attempt 4-second budget so a slow upstream caps the worst-case
+/// editor-save delay at ~8 seconds even when both probes have to
+/// time out.
+///
+/// No Google s2 fallback (that's the privacy leak we just fixed), no
+/// HTML `<link rel=icon>` scrape (too much work for a UI nicety). If
+/// neither candidate yields, the UI falls back to the letter avatar.
+pub async fn fetch_favicon(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .ok()?;
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(root) = registrable_domain(host) {
+        candidates.push(root);
+    }
+    if !candidates.iter().any(|h| h == host) {
+        candidates.push(host.to_string());
+    }
+    for h in &candidates {
+        let favicon_url = format!("https://{h}/favicon.ico");
+        if let Some(data_url) = try_fetch_favicon(&client, &favicon_url).await {
+            return Some(data_url);
+        }
+    }
+    None
+}
+
+/// Single-attempt favicon fetch + base64 wrap. Caller picks which
+/// host to probe; this helper enforces the MIME / size / status
+/// validation.
+async fn try_fetch_favicon(
+    client: &reqwest::Client,
+    url: &str,
+) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    // Most CDNs serve image/x-icon, image/vnd.microsoft.icon, or
+    // image/png/svg+xml. Anything that isn't an `image/...` MIME is
+    // almost certainly an HTML 404 page or a redirect we shouldn't
+    // base64-embed.
+    let mime = content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or("");
+    if !mime.starts_with("image/") {
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    // Cap at ~256 KB raw — favicons are usually 2-30 KB. Anything past
+    // this is either misconfigured or maliciously large, and bloats
+    // providers.json with a base64 payload we don't want in there.
+    if bytes.len() > 256 * 1024 {
+        return None;
+    }
+    let encoded = STANDARD.encode(&bytes);
+    Some(format!("data:{mime};base64,{encoded}"))
+}
+
 /// Lightweight connectivity check — calls `GET {base_url}/models` (or
 /// the Gemini variant) with the provider's API key. Counts any 2xx
 /// as success.
@@ -2234,6 +2347,34 @@ mod tests {
     }
 
     #[test]
+    fn registrable_domain_strips_subdomains_and_skips_ips() {
+        assert_eq!(
+            registrable_domain("api.openai.com"),
+            Some("openai.com".to_string())
+        );
+        assert_eq!(
+            registrable_domain("chat.deepseek.com"),
+            Some("deepseek.com".to_string())
+        );
+        // Already a brand root — returns itself.
+        assert_eq!(
+            registrable_domain("openai.com"),
+            Some("openai.com".to_string())
+        );
+        // Deep subdomain — still collapses to last two labels.
+        assert_eq!(
+            registrable_domain("v1.api.openai.com"),
+            Some("openai.com".to_string())
+        );
+        // IP literals: skip the strip so the caller falls back to the
+        // literal host (the only sane probe for IP-addressed servers).
+        assert_eq!(registrable_domain("127.0.0.1"), None);
+        assert_eq!(registrable_domain("[::1]"), None);
+        // Bare hostnames (intranet) — no `.` → can't be stripped.
+        assert_eq!(registrable_domain("localhost"), None);
+    }
+
+    #[test]
     fn parse_version_handles_common_cli_outputs() {
         // Plain "X.Y.Z" output
         assert_eq!(parse_version("0.5.7"), Some("0.5.7".to_string()));
@@ -2309,6 +2450,7 @@ mod tests {
             model: "test-model".into(),
             claude: None,
             opencode: None,
+            favicon: None,
         }
     }
 

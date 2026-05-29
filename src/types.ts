@@ -69,6 +69,12 @@ export type Provider = {
     providerId?: string;
     models?: string[];
   };
+  // Cached favicon as a `data:image/...;base64,...` URL. Populated at
+  // create / edit time by `invoke('fetch_provider_favicon')` so the
+  // ProviderCard renders the brand mark locally without making a
+  // network request on every render or leaking the hostname to a
+  // third-party favicon proxy. Absent → fall back to the letter avatar.
+  favicon?: string;
 };
 
 export type ActiveKind = "official" | "custom" | "unmanaged";

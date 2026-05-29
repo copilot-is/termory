@@ -40,7 +40,12 @@ export function ProviderEditor({
   const [modelOptions, setModelOptions] = React.useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = React.useState(false);
   const [modelError, setModelError] = React.useState<string | null>(null);
+  const [saving, setSaving] = React.useState(false);
   const modelDatalistId = React.useId();
+  // Snapshot the originally-loaded URL so we can decide whether to
+  // refetch the favicon on save. Captured once at mount — re-rendering
+  // with a new `provider` prop happens only on `isNew` flips.
+  const originalBaseUrlRef = React.useRef(provider.baseUrl ?? "");
 
   React.useEffect(() => {
     firstFieldRef.current?.focus();
@@ -95,9 +100,9 @@ export function ProviderEditor({
     }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!canSave) return;
+    if (!canSave || saving) return;
     // Trim every string field; collapse nested option objects to
     // undefined when nothing inside survived the trim, so providers.json
     // doesn't carry empty {claude: {}} / {opencode: {}} blocks.
@@ -115,14 +120,40 @@ export function ProviderEditor({
       models: extraModels.length > 0 ? extraModels : undefined
     };
     const opencodeHasAny = !!(opencode.providerId || opencode.models);
+    const trimmedBaseUrl = draft.baseUrl?.trim() || undefined;
+
+    // Refetch the favicon when the URL is new OR has just changed.
+    // Skip the network when the user is editing other fields and the
+    // host hasn't moved — the cached base64 in `draft.favicon` is
+    // still valid. Fetch failure is silent (favicon stays whatever it
+    // was) so a slow / 404 / offline upstream never blocks the save.
+    let favicon = draft.favicon;
+    const urlChanged =
+      (trimmedBaseUrl ?? "") !== (originalBaseUrlRef.current ?? "");
+    if (trimmedBaseUrl && (urlChanged || !favicon)) {
+      setSaving(true);
+      try {
+        const fetched = await invoke<string | null>(
+          "fetch_provider_favicon",
+          { url: trimmedBaseUrl }
+        );
+        if (fetched) favicon = fetched;
+        else if (urlChanged) favicon = undefined; // moved host → drop stale
+      } catch {
+        /* leave favicon as-is */
+      } finally {
+        setSaving(false);
+      }
+    }
     onSave({
       ...draft,
       name: draft.name.trim(),
-      baseUrl: draft.baseUrl?.trim() || undefined,
+      baseUrl: trimmedBaseUrl,
       apiKey: draft.apiKey?.trim() || undefined,
       model: draft.model?.trim() || undefined,
       claude: claudeHasAny ? claude : undefined,
-      opencode: opencodeHasAny ? opencode : undefined
+      opencode: opencodeHasAny ? opencode : undefined,
+      favicon
     });
   };
 
@@ -356,8 +387,17 @@ export function ProviderEditor({
             <Button type="button" variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!canSave}>
-              {isNew ? "Create" : "Save"}
+            <Button type="submit" disabled={!canSave || saving}>
+              {saving ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  {isNew ? "Creating…" : "Saving…"}
+                </>
+              ) : isNew ? (
+                "Create"
+              ) : (
+                "Save"
+              )}
             </Button>
           </DialogFooter>
         </form>

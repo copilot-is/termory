@@ -31,6 +31,30 @@ const ProviderEditor = React.lazy(() =>
   import("./ProviderEditor").then((m) => ({ default: m.ProviderEditor }))
 );
 
+// Module-level cache for CLI detection results so the OpenCode tab
+// doesn't flash "Official → InstallGuide" every time the user
+// switches away from Providers and back. ProvidersPage is gated by
+// `route === "config"` in App.tsx and so unmounts on every route
+// change; without this cache each remount would briefly render the
+// Official card with the optimistic `installed[opencode] = true`
+// default before the async detect_clis returned `false`.
+//
+// Updated by the page itself whenever a fresh detect result lands;
+// stays alive across mount/unmount cycles until the window reloads.
+let cachedInstalled: Record<CliApp, boolean> = {
+  claude: true,
+  codex: true,
+  gemini: true,
+  opencode: true
+};
+let cachedVersions: Record<CliApp, string | null> = {
+  claude: null,
+  codex: null,
+  gemini: null,
+  opencode: null
+};
+let cachedVersionsLoading = true;
+
 export function ProvidersPage({
   providers,
   setProviders,
@@ -50,19 +74,29 @@ export function ProvidersPage({
     gemini: null,
     opencode: null
   });
-  const [installed, setInstalled] = React.useState<Record<CliApp, boolean>>({
-    claude: true,
-    codex: true,
-    gemini: true,
-    opencode: true
-  });
-  const [versions, setVersions] = React.useState<Record<CliApp, string | null>>({
-    claude: null,
-    codex: null,
-    gemini: null,
-    opencode: null
-  });
-  const [versionsLoading, setVersionsLoading] = React.useState(true);
+  // Initialize from the module-level cache so a remount (route
+  // switch) renders with the last-known truth, not the optimistic
+  // default. The cache is written back from inside the refresh
+  // helpers below.
+  const [installed, setInstalled] =
+    React.useState<Record<CliApp, boolean>>(cachedInstalled);
+  const [versions, setVersions] =
+    React.useState<Record<CliApp, string | null>>(cachedVersions);
+  const [versionsLoading, setVersionsLoading] = React.useState(
+    cachedVersionsLoading
+  );
+
+  // Mirror state into the module-level cache on every change so the
+  // next mount has the fresh truth as its initial value.
+  React.useEffect(() => {
+    cachedInstalled = installed;
+  }, [installed]);
+  React.useEffect(() => {
+    cachedVersions = versions;
+  }, [versions]);
+  React.useEffect(() => {
+    cachedVersionsLoading = versionsLoading;
+  }, [versionsLoading]);
   const [toggling, setToggling] = React.useState<string | null>(null);
   const [testing, setTesting] = React.useState<string | null>(null);
   const [testResults, setTestResults] = React.useState<Record<string, TestResult>>({});
@@ -290,7 +324,7 @@ export function ProvidersPage({
         // OpenCode is multi-slot — delete only this provider's slot
         // from opencode.json (and the top-level model if it pointed
         // at this provider). Other Termory slots stay intact.
-        await invoke("delete_provider_entry", { provider: target });
+        await invoke("delete_provider", { provider: target });
       } else if (isInUse) {
         // Single-slot CLIs — when the deleted one is the live record,
         // full deactivate clears Termory's writes so the CLI falls
@@ -319,7 +353,7 @@ export function ProvidersPage({
     setToggling(target.id);
     try {
       if (enabled) {
-        await invoke("delete_provider_entry", { provider: target });
+        await invoke("delete_provider", { provider: target });
         toast.success(`Disabled ${target.name || "(unnamed)"}.`);
       } else {
         await invoke("activate_provider", {

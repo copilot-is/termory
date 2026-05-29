@@ -15,8 +15,9 @@ pub(crate) mod testutils {
 
 use providers::{
     activate, deactivate, delete_provider_traces, detect_cli_versions, detect_installed_clis,
-    fetch_models, read_active_state, set_opencode_default, test_provider, ActiveState, CliApp,
-    ModelListResult, Provider, TestResult,
+    fetch_favicon as providers_fetch_favicon, fetch_models, read_active_state,
+    set_opencode_default, test_provider, ActiveState, CliApp, ModelListResult, Provider,
+    TestResult,
 };
 use sessions::{get_session, scan_sessions, search_sessions, AppSession, SearchHit, SessionDetail};
 use tauri::Manager;
@@ -182,7 +183,7 @@ async fn set_opencode_default_provider(provider: Provider) -> Result<(), String>
 /// top-level `model` if it pointed here); sibling Termory slots and
 /// any /connect entries in `auth.json` stay untouched.
 #[tauri::command]
-async fn delete_provider_entry(provider: Provider) -> Result<(), String> {
+async fn delete_provider(provider: Provider) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         delete_provider_traces(&provider).map_err(|e| e.to_string())
     })
@@ -213,6 +214,15 @@ async fn test_provider_api(provider: Provider) -> Result<TestResult, String> {
 #[tauri::command]
 async fn fetch_provider_models(provider: Provider) -> Result<ModelListResult, String> {
     Ok(fetch_models(&provider).await)
+}
+
+/// Best-effort fetch of a `data:image/...;base64,...` favicon for the
+/// given URL. Called from the editor's save path so the favicon is
+/// cached into providers.json once and the renderer never has to make
+/// a third-party request to display it.
+#[tauri::command]
+async fn fetch_provider_favicon(url: String) -> Result<Option<String>, String> {
+    Ok(providers_fetch_favicon(&url).await)
 }
 
 /// Read ~/.termory/config.json. Returns an empty `{}` if missing.
@@ -267,10 +277,11 @@ pub fn run() {
             provider_active_states,
             activate_provider,
             deactivate_provider,
-            delete_provider_entry,
+            delete_provider,
             set_opencode_default_provider,
             test_provider_api,
             fetch_provider_models,
+            fetch_provider_favicon,
             read_app_config,
             write_app_config,
             read_app_providers,
