@@ -55,11 +55,34 @@ import { MemoryCard } from "@/components/MemoryCard";
 import { MessageBody } from "@/components/MessageBody";
 import { MessageList } from "@/components/MessageList";
 import { RoutePlaceholder } from "@/components/RoutePlaceholder";
-import { SettingsPage } from "@/components/settings/SettingsPage";
-import { UpdateDialog } from "@/components/UpdateDialog";
 import { SnippetLine } from "@/components/SnippetLine";
-import { SearchPage } from "@/components/search/SearchPage";
-import { ProvidersPage } from "@/components/providers/ProvidersPage";
+
+// Route + modal code-splitting (M6). Each lazy chunk only ships when
+// its surface mounts: Providers / Search / Settings are gated on the
+// active rail route; UpdateDialog only mounts when an update is
+// actually found. Splitting Settings also frees `@tauri-apps/plugin-
+// updater` to land in its own chunk (was previously pinned to the
+// main bundle by Settings' static import).
+const ProvidersPage = React.lazy(() =>
+  import("@/components/providers/ProvidersPage").then((m) => ({
+    default: m.ProvidersPage
+  }))
+);
+const SearchPage = React.lazy(() =>
+  import("@/components/search/SearchPage").then((m) => ({
+    default: m.SearchPage
+  }))
+);
+const SettingsPage = React.lazy(() =>
+  import("@/components/settings/SettingsPage").then((m) => ({
+    default: m.SettingsPage
+  }))
+);
+const UpdateDialog = React.lazy(() =>
+  import("@/components/UpdateDialog").then((m) => ({
+    default: m.UpdateDialog
+  }))
+);
 
 export function App() {
   const [sessions, setSessions] = React.useState<AppSession[]>([]);
@@ -429,33 +452,38 @@ export function App() {
       <div className="grid grid-cols-[63px_1fr] min-h-0 min-w-0">
         <ActivityRail route={route} onChange={setRoute} />
         <div className="min-w-0 min-h-0 flex flex-col mb-3">
-          {route === "search" && (
-            <SearchPage
-              sessions={sessions}
-              onOpenItem={openItem}
-              recentSearches={recentSearches}
-              onCommitSearch={addRecentSearch}
-              onClearRecent={clearRecentSearches}
-            />
-          )}
-          {route === "config" && (
-            <ProvidersPage
-              providers={providers}
-              setProviders={setProviders}
-              app={providersApp}
-              setApp={setProvidersApp}
-            />
-          )}
-          {route === "settings" && (
-            <SettingsPage
-              recentSearches={recentSearches}
-              onClearRecent={clearRecentSearches}
-              autoCheckUpdates={autoCheckUpdates}
-              onAutoCheckUpdatesChange={setAutoCheckUpdates}
-              appVersion={appVersion}
-              onUpdateFound={(update) => setPendingUpdate(update)}
-            />
-          )}
+          {/* Suspense fallback is intentionally empty — route chunks
+              are small (<50KB gzipped each) and load near-instantly
+              on a warm app; an explicit spinner would just flash. */}
+          <React.Suspense fallback={null}>
+            {route === "search" && (
+              <SearchPage
+                sessions={sessions}
+                onOpenItem={openItem}
+                recentSearches={recentSearches}
+                onCommitSearch={addRecentSearch}
+                onClearRecent={clearRecentSearches}
+              />
+            )}
+            {route === "config" && (
+              <ProvidersPage
+                providers={providers}
+                setProviders={setProviders}
+                app={providersApp}
+                setApp={setProvidersApp}
+              />
+            )}
+            {route === "settings" && (
+              <SettingsPage
+                recentSearches={recentSearches}
+                onClearRecent={clearRecentSearches}
+                autoCheckUpdates={autoCheckUpdates}
+                onAutoCheckUpdatesChange={setAutoCheckUpdates}
+                appVersion={appVersion}
+                onUpdateFound={(update) => setPendingUpdate(update)}
+              />
+            )}
+          </React.Suspense>
           {route !== "records" && route !== "search" && route !== "config" && route !== "settings" && (
             <RoutePlaceholder route={route} />
           )}
@@ -901,11 +929,18 @@ export function App() {
         onCommitSearch={addRecentSearch}
         onClearRecent={clearRecentSearches}
       />
-      <UpdateDialog
-        update={pendingUpdate}
-        currentVersion={appVersion}
-        onClose={() => setPendingUpdate(null)}
-      />
+      {/* UpdateDialog is gated on `pendingUpdate` being non-null AND
+          wrapped in Suspense so its chunk only downloads when an
+          update is actually found. */}
+      {pendingUpdate && (
+        <React.Suspense fallback={null}>
+          <UpdateDialog
+            update={pendingUpdate}
+            currentVersion={appVersion}
+            onClose={() => setPendingUpdate(null)}
+          />
+        </React.Suspense>
+      )}
     </div>
   );
 }

@@ -16,10 +16,20 @@ import { blankProvider } from "@/lib/provider-utils";
 import type { ActiveState, CliApp, Provider, TestResult } from "@/types";
 import { BrandIcon } from "@/components/BrandIcon";
 import { EmptyState } from "@/components/EmptyState";
-import { InstallGuide } from "./InstallGuide";
 import { ProviderCard } from "./ProviderCard";
-import { ProviderEditor } from "./ProviderEditor";
 import { ProviderOfficialCard } from "./ProviderOfficialCard";
+
+// InstallGuide and ProviderEditor are conditionally rendered (CLI
+// missing / editor open), so lazy-load to keep them out of the main
+// Providers chunk. Editor is the heavier of the two — it pulls in
+// the AI-SDK provider-id catalog, datalist autocomplete, the
+// invoke-based test/fetch-models actions, etc.
+const InstallGuide = React.lazy(() =>
+  import("./InstallGuide").then((m) => ({ default: m.InstallGuide }))
+);
+const ProviderEditor = React.lazy(() =>
+  import("./ProviderEditor").then((m) => ({ default: m.ProviderEditor }))
+);
 
 export function ProvidersPage({
   providers,
@@ -418,11 +428,13 @@ export function ProvidersPage({
       </div>
 
       {!installed[app] && customProviders.length === 0 ? (
-        <InstallGuide
-          app={app}
-          rechecking={rechecking}
-          onRecheck={() => void handleRecheckInstall()}
-        />
+        <React.Suspense fallback={null}>
+          <InstallGuide
+            app={app}
+            rechecking={rechecking}
+            onRecheck={() => void handleRecheckInstall()}
+          />
+        </React.Suspense>
       ) : (
         <div className="flex-1 min-h-0 overflow-auto p-3">
           <div className="flex flex-col gap-2.5">
@@ -500,12 +512,14 @@ export function ProvidersPage({
       )}
 
       {editing && (
-        <ProviderEditor
-          provider={editing}
-          isNew={editingIsNew}
-          onSave={saveProvider}
-          onClose={closeEditor}
-        />
+        <React.Suspense fallback={null}>
+          <ProviderEditor
+            provider={editing}
+            isNew={editingIsNew}
+            onSave={saveProvider}
+            onClose={closeEditor}
+          />
+        </React.Suspense>
       )}
     </div>
   );
