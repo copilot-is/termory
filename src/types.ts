@@ -1,5 +1,39 @@
 // Cross-file type definitions for Termory.
 
+// `tokens` and `model` map 1:1 onto the Rust-side TokenStats /
+// Option<String> on AppSession. Both are `undefined`/absent when the
+// source platform didn't record token data for that session — the
+// Stats page renders coverage explicitly ("N of M sessions") so
+// users aren't misled by partial totals.
+export type TokenStats = {
+  input: number;
+  output: number;
+  cached: number;
+  reasoning: number;
+  total: number;
+};
+
+/** One entry per local date a session was active — populated by all
+ * four scanners (Claude / Codex / Gemini / OpenCode) when the
+ * underlying records carry per-message / per-part timestamps. Used by
+ * the Stats page to place spend on the day it actually happened.
+ * Absent only when no timestamped token data could be recovered. */
+export type DailyTokenBreakdown = {
+  date: string; // YYYY-MM-DD (local)
+  tokens: TokenStats;
+  /** Number of AI interactions counted on this date. Absent on older
+   * sessions parsed before the field existed; default to 0. */
+  messages?: number;
+  /** Per-hour message counts, indexed by local hour 0..23. Empty when
+   * timestamps weren't available. */
+  hours?: number[];
+  /** Per-hour token totals, indexed by local hour 0..23. Parallel to
+   * `hours` but accumulates tokens.total instead of an interaction
+   * count. Empty for sources/sessions that didn't carry per-message
+   * timestamps. */
+  hour_tokens?: number[];
+};
+
 export type AppSession = {
   id: string;
   source: string;
@@ -12,6 +46,9 @@ export type AppSession = {
   preview: string;
   snippet?: string;
   message_previews: SessionMessage[];
+  tokens?: TokenStats;
+  model?: string;
+  daily_tokens?: DailyTokenBreakdown[];
 };
 
 export type SessionMessage = {
@@ -108,6 +145,6 @@ export type TestResult = {
   message: string;
 };
 
-export type Route = "records" | "search" | "stats" | "config" | "settings";
+export type Route = "records" | "search" | "stats" | "providers" | "settings";
 
 export type Pane = "sessions" | "memory" | "skills";

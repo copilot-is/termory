@@ -85,7 +85,12 @@ impl CliApp {
     }
 
     pub fn all() -> [CliApp; 4] {
-        [CliApp::Claude, CliApp::Codex, CliApp::Gemini, CliApp::Opencode]
+        [
+            CliApp::Claude,
+            CliApp::Codex,
+            CliApp::Gemini,
+            CliApp::Opencode,
+        ]
     }
 }
 
@@ -138,10 +143,7 @@ fn cli_search_paths(tool: &str) -> Vec<std::path::PathBuf> {
             push_unique(&mut paths, appdata.join("npm"));
         }
         // Node.js MSI installer
-        push_unique(
-            &mut paths,
-            PathBuf::from("C:\\Program Files\\nodejs"),
-        );
+        push_unique(&mut paths, PathBuf::from("C:\\Program Files\\nodejs"));
         // Scoop — opencode README's recommended Windows install method
         if !home.as_os_str().is_empty() {
             push_unique(&mut paths, home.join("scoop").join("shims"));
@@ -214,8 +216,7 @@ fn cli_search_paths(tool: &str) -> Vec<std::path::PathBuf> {
             if fnm_base.exists() {
                 if let Ok(entries) = std::fs::read_dir(&fnm_base) {
                     for entry in entries.flatten() {
-                        let installation =
-                            entry.path().join("installation");
+                        let installation = entry.path().join("installation");
                         if installation.exists() {
                             push_unique(&mut paths, installation);
                         }
@@ -297,10 +298,7 @@ fn push_unique(paths: &mut Vec<std::path::PathBuf>, p: std::path::PathBuf) {
 /// primarily a Unix tool and even its Windows builds use different
 /// layouts that don't match this structure.
 #[cfg(unix)]
-fn extend_mise_node_search_paths(
-    paths: &mut Vec<std::path::PathBuf>,
-    home: &std::path::Path,
-) {
+fn extend_mise_node_search_paths(paths: &mut Vec<std::path::PathBuf>, home: &std::path::Path) {
     let mise = home.join(".local/share/mise");
     push_unique(paths, mise.join("shims"));
     let node_installs = mise.join("installs/node");
@@ -319,10 +317,7 @@ fn extend_mise_node_search_paths(
 /// Per-platform executable-name candidates for `tool` inside `dir`.
 /// On Windows we have to consider `.cmd` (npm shims) and `.exe`
 /// (native installers) in addition to the bare name.
-fn executable_candidates(
-    tool: &str,
-    dir: &std::path::Path,
-) -> Vec<std::path::PathBuf> {
+fn executable_candidates(tool: &str, dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     #[cfg(windows)]
     {
         vec![
@@ -357,17 +352,14 @@ pub fn find_cli_binary(tool: &str) -> Option<std::path::PathBuf> {
 /// shebang stuck in interpreter prompt, runaway `.zshrc` user code via
 /// `shell_version_fallback`, etc.). Kill + give up so we don't pin a
 /// Tokio blocking-pool slot indefinitely.
-const SUBPROCESS_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(5);
+const SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Spawn `cmd` and read its full output, killing the child if it
 /// hasn't exited within [`SUBPROCESS_TIMEOUT`]. Returns `None` on
 /// spawn failure, non-zero exit, or timeout. Polls `try_wait` every
 /// 50ms — accurate enough for a 5s budget and avoids a watchdog
 /// thread.
-fn output_with_timeout(
-    mut cmd: std::process::Command,
-) -> Option<std::process::Output> {
+fn output_with_timeout(mut cmd: std::process::Command) -> Option<std::process::Output> {
     use std::process::Stdio;
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -440,8 +432,7 @@ fn query_version_at(binary: &std::path::Path) -> Option<String> {
 /// [`SUBPROCESS_TIMEOUT`] so a misbehaving rc file can't pin us.
 #[cfg(unix)]
 fn shell_version_fallback(tool: &str) -> Option<String> {
-    let shell =
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let mut cmd = std::process::Command::new(&shell);
     cmd.args(["-l", "-i", "-c", &format!("{tool} --version 2>&1")]);
     let output = output_with_timeout(cmd)?;
@@ -482,8 +473,7 @@ pub fn detect_installed_clis() -> std::collections::HashMap<CliApp, bool> {
 /// Run each installed CLI with `--version` and return the parsed
 /// version string. Spawns one subprocess per CLI so the frontend
 /// calls this on page-load + Recheck only, never inside hot paths.
-pub fn detect_cli_versions(
-) -> std::collections::HashMap<CliApp, Option<String>> {
+pub fn detect_cli_versions() -> std::collections::HashMap<CliApp, Option<String>> {
     let mut out = std::collections::HashMap::new();
     for app in CliApp::all() {
         let v = find_cli_binary(app.bin_name())
@@ -1793,10 +1783,7 @@ pub async fn fetch_favicon(url: &str) -> Option<String> {
 /// Single-attempt favicon fetch + base64 wrap. Caller picks which
 /// host to probe; this helper enforces the MIME / size / status
 /// validation.
-async fn try_fetch_favicon(
-    client: &reqwest::Client,
-    url: &str,
-) -> Option<String> {
+async fn try_fetch_favicon(client: &reqwest::Client, url: &str) -> Option<String> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let resp = client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
@@ -1812,11 +1799,7 @@ async fn try_fetch_favicon(
     // image/png/svg+xml. Anything that isn't an `image/...` MIME is
     // almost certainly an HTML 404 page or a redirect we shouldn't
     // base64-embed.
-    let mime = content_type
-        .split(';')
-        .next()
-        .map(str::trim)
-        .unwrap_or("");
+    let mime = content_type.split(';').next().map(str::trim).unwrap_or("");
     if !mime.starts_with("image/") {
         return None;
     }
@@ -2224,11 +2207,9 @@ mod tests {
     fn cli_search_paths_includes_opencode_specific_dirs() {
         let paths = cli_search_paths("opencode");
         let has = |needle: &str| {
-            paths.iter().any(|p| {
-                p.to_string_lossy()
-                    .replace('\\', "/")
-                    .contains(needle)
-            })
+            paths
+                .iter()
+                .any(|p| p.to_string_lossy().replace('\\', "/").contains(needle))
         };
         assert!(has(".opencode/bin"), "missing ~/.opencode/bin: {paths:?}");
         assert!(has(".bun/bin"), "missing ~/.bun/bin: {paths:?}");
@@ -2241,10 +2222,7 @@ mod tests {
         // but `~/.cargo/bin` does NOT (because the parent component is
         // `.cargo`, not `go`).
         let paths = cli_search_paths("claude");
-        let matching: Vec<_> = paths
-            .iter()
-            .filter(|p| p.ends_with("go/bin"))
-            .collect();
+        let matching: Vec<_> = paths.iter().filter(|p| p.ends_with("go/bin")).collect();
         assert!(
             matching.is_empty(),
             "claude search list contains ~/go/bin entries: {matching:?}"
@@ -2277,8 +2255,10 @@ mod tests {
     #[test]
     fn cli_search_paths_dedupes() {
         let paths = cli_search_paths("opencode");
-        let mut sorted: Vec<_> =
-            paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let mut sorted: Vec<_> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
         sorted.sort();
         let len_before = sorted.len();
         sorted.dedup();

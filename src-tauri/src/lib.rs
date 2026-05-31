@@ -33,9 +33,8 @@ async fn scan_all_sessions(
         // it can dynamically watch them (catching per-project
         // CLAUDE.md / AGENTS.md / .claude/skills/ edits without
         // recursively watching every cwd the user might be in).
-        let cwds = watcher::dynamic_paths_from_sessions(
-            sessions.iter().map(|s| s.project.as_str()),
-        );
+        let cwds =
+            watcher::dynamic_paths_from_sessions(sessions.iter().map(|s| s.project.as_str()));
         handle.reconfigure_dynamic(cwds);
         Ok(sessions)
     })
@@ -273,24 +272,18 @@ pub fn run() {
     let log_plugin = {
         let mut builder = tauri_plugin_log::Builder::new()
             .max_file_size(5 * 1024 * 1024) // 5 MB
-            .rotation_strategy(
-                tauri_plugin_log::RotationStrategy::KeepAll,
-            )
+            .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
             .level(log::LevelFilter::Info);
         if let Some(path) = logs_dir {
             // Ensure the dir exists so the plugin's open() doesn't
             // race on first launch.
             let _ = std::fs::create_dir_all(&path);
             builder = builder.targets([
-                tauri_plugin_log::Target::new(
-                    tauri_plugin_log::TargetKind::Folder {
-                        path,
-                        file_name: Some("termory".into()),
-                    },
-                ),
-                tauri_plugin_log::Target::new(
-                    tauri_plugin_log::TargetKind::Stdout,
-                ),
+                tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
+                    path,
+                    file_name: Some("termory".into()),
+                }),
+                tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
             ]);
         }
         builder.build()

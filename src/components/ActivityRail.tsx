@@ -22,7 +22,7 @@ export function ActivityRail({
   onChange: (next: Route) => void;
 }) {
   const items: { id: Route; icon: React.ReactNode; label: string }[] = [
-    { id: "config", icon: <Plug size={20} />, label: "Providers" },
+    { id: "providers", icon: <Plug size={20} />, label: "Providers" },
     { id: "records", icon: <History size={20} />, label: "Records" },
     { id: "search", icon: <Search size={20} />, label: "Search" },
     { id: "stats", icon: <BarChart3 size={20} />, label: "Stats" },

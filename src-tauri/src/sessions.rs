@@ -2,16 +2,69 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
 const CLAUDE_LITE_READ_BUF_SIZE: usize = 65_536;
+
+/// Token usage rollup for a single session, populated by the parser
+/// when the source platform persists token counts. All counters are
+/// cumulative for the entire session.
+///
+/// Field semantics (chosen to match across all 4 platforms):
+///   * `input`     — non-cached input/prompt tokens
+///   * `output`    — completion / assistant tokens
+///   * `cached`    — `cache_read + cache_creation` (Anthropic) /
+///                   `cached_input_tokens` (Codex) / `cached`
+///                   (Gemini) / `cache.read + cache.write` (OpenCode)
+///   * `reasoning` — Codex `reasoning_output_tokens` / Gemini
+///                   `thoughts` / OpenCode `reasoning`. Zero for
+///                   platforms without separate reasoning tokens.
+///   * `total`     — input + output + cached + reasoning (or the
+///                   platform's own `total` field when present)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenStats {
+    pub input: u64,
+    pub output: u64,
+    pub cached: u64,
+    pub reasoning: u64,
+    pub total: u64,
+}
+
+/// One entry per local date a session was active. Lets the frontend
+/// place tokens on the actual day they were consumed, instead of
+/// lumping a multi-day session's total onto `updated_at`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DailyTokenBreakdown {
+    /// YYYY-MM-DD in the SCANNING machine's local timezone (same TZ
+    /// used by every other date field on AppSession).
+    pub date: String,
+    pub tokens: TokenStats,
+    /// Number of AI interactions counted on this date. One unit per
+    /// assistant message (Claude) / token_count event (Codex) / tokens
+    /// record (Gemini) / step-finish part (OpenCode). Drives the
+    /// daily-workload chart on the Stats page.
+    #[serde(default)]
+    pub messages: u64,
+    /// Per-hour message count, length 24, indexed by local hour 0..23.
+    /// Drives the stacked time-of-day breakdown in the daily workload
+    /// chart. Empty when no interactions had timestamps that could be
+    /// resolved to a local hour.
+    #[serde(default)]
+    pub hours: Vec<u64>,
+    /// Per-hour token total, length 24, indexed by local hour 0..23.
+    /// Same shape as `hours` but accumulates `tokens.total` instead
+    /// of an interaction count. Empty when no timestamps resolved.
+    #[serde(default)]
+    pub hour_tokens: Vec<u64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSession {
@@ -31,6 +84,27 @@ pub struct AppSession {
     #[serde(default)]
     pub snippet: String,
     pub message_previews: Vec<SessionMessage>,
+    /// Aggregate token usage for the session. `None` when the source
+    /// didn't record any token data (legacy sessions, Memory/Skill
+    /// entries, etc.). The Stats page renders coverage explicitly:
+    /// "{N} of {M} sessions covered" so users aren't misled by
+    /// partial totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokenStats>,
+    /// Best-guess model id used for this session
+    /// (e.g. `claude-opus-4-7`, `gpt-5`, `gemini-3-flash-preview`).
+    /// `None` when the source didn't record one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Per-day token spend, sorted chronologically. Populated by all
+    /// four scanners when the underlying records carry per-message /
+    /// per-part timestamps (Claude `message.usage`, Codex
+    /// `token_count` events, Gemini per-record tokens, OpenCode
+    /// `step-finish` parts). `None` only when no timestamped token
+    /// data could be recovered — the frontend then falls back to
+    /// even-distribution across [started_at, updated_at].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_tokens: Option<Vec<DailyTokenBreakdown>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -469,11 +543,7 @@ impl SearchCache {
         self.map.get(key).map(Arc::clone)
     }
 
-    fn put(
-        &mut self,
-        key: (std::path::PathBuf, std::time::SystemTime),
-        value: Arc<SessionDetail>,
-    ) {
+    fn put(&mut self, key: (std::path::PathBuf, std::time::SystemTime), value: Arc<SessionDetail>) {
         if self.map.contains_key(&key) {
             self.order.retain(|k| k != &key);
         } else if self.map.len() >= self.capacity {
@@ -494,6 +564,87 @@ impl SearchCache {
 static SEARCH_CACHE: std::sync::LazyLock<std::sync::Mutex<SearchCache>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(SearchCache::new(200)));
 
+/// `(path, mtime) → (tokens, model)` cache used by scan-time token
+/// extraction for Codex / Claude. Scans iterate hundreds of session
+/// files; parsing each one only to recover token counts would balloon
+/// startup. Cache keys are absolute paths and mtimes, so any user-side
+/// edit (or watcher-driven file replacement) cleanly invalidates the
+/// entry — no manual eviction needed.
+#[derive(Clone)]
+struct ScanTokenCacheEntry {
+    mtime: std::time::SystemTime,
+    tokens: Option<TokenStats>,
+    model: Option<String>,
+    daily_tokens: Option<Vec<DailyTokenBreakdown>>,
+}
+
+static SCAN_TOKEN_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, ScanTokenCacheEntry>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Convert an ISO-8601 timestamp (typically RFC 3339 UTC) into a
+/// `(YYYY-MM-DD, hour)` pair in the scanning machine's local timezone.
+/// Used by per-message token + per-hour workload bucketing — every
+/// other date field on AppSession is in local time, so the buckets
+/// need to match.
+fn iso_to_local_date_hour(iso: &str) -> Option<(String, u8)> {
+    use chrono::Timelike;
+    let parsed = chrono::DateTime::parse_from_rfc3339(iso).ok()?;
+    let local = parsed.with_timezone(&Local);
+    Some((local.format("%Y-%m-%d").to_string(), local.hour() as u8))
+}
+
+/// Same as `iso_to_local_date_hour` but for epoch-milliseconds inputs.
+/// OpenCode stores `part.time_created` (and the JSON `time.created`
+/// field) as ms since the Unix epoch.
+fn epoch_ms_to_local_date_hour(ms: i64) -> Option<(String, u8)> {
+    use chrono::Timelike;
+    let dt = Utc.timestamp_millis_opt(ms).single()?;
+    let local = dt.with_timezone(&Local);
+    Some((local.format("%Y-%m-%d").to_string(), local.hour() as u8))
+}
+
+type TokenExtraction = (
+    Option<TokenStats>,
+    Option<String>,
+    Option<Vec<DailyTokenBreakdown>>,
+);
+
+fn cached_token_extract<F>(path: &Path, extract: F) -> TokenExtraction
+where
+    F: FnOnce(&Path) -> TokenExtraction,
+{
+    let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+    if let Some(mtime) = mtime {
+        if let Ok(cache) = SCAN_TOKEN_CACHE.lock() {
+            if let Some(entry) = cache.get(path) {
+                if entry.mtime == mtime {
+                    return (
+                        entry.tokens.clone(),
+                        entry.model.clone(),
+                        entry.daily_tokens.clone(),
+                    );
+                }
+            }
+        }
+        let (tokens, model, daily) = extract(path);
+        if let Ok(mut cache) = SCAN_TOKEN_CACHE.lock() {
+            cache.insert(
+                path.to_path_buf(),
+                ScanTokenCacheEntry {
+                    mtime,
+                    tokens: tokens.clone(),
+                    model: model.clone(),
+                    daily_tokens: daily.clone(),
+                },
+            );
+        }
+        (tokens, model, daily)
+    } else {
+        extract(path)
+    }
+}
+
 /// Look up the session's parsed detail, using the LRU cache when the
 /// file's mtime hasn't changed since last time we parsed it. Returns
 /// `None` when the path can't be resolved or the file can't be parsed —
@@ -503,9 +654,7 @@ fn get_session_for_search(session: &AppSession) -> Option<Arc<SessionDetail>> {
     // Look up mtime so we can key the cache on (path, mtime). If we
     // can't stat the file, skip caching but still try a fresh parse —
     // the file may exist but live in a path the runtime can't stat.
-    let mtime = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok();
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     if let Some(mtime) = mtime {
         let key = (path.clone(), mtime);
         if let Ok(mut cache) = SEARCH_CACHE.lock() {
@@ -596,9 +745,8 @@ pub fn scan_sessions() -> Result<Vec<AppSession>, Box<dyn Error>> {
 /// doesn't know about can no longer reach `parse_doc_file` /
 /// `parse_codex_session` / etc. at all, regardless of whether a
 /// renderer-side XSS / prompt-injection vector ever materializes.
-static SESSION_PATH_INDEX: std::sync::Mutex<
-    Option<HashMap<(String, String), std::path::PathBuf>>,
-> = std::sync::Mutex::new(None);
+static SESSION_PATH_INDEX: std::sync::Mutex<Option<HashMap<(String, String), std::path::PathBuf>>> =
+    std::sync::Mutex::new(None);
 
 fn refresh_session_path_index(sessions: &[AppSession]) {
     let map: HashMap<(String, String), std::path::PathBuf> = sessions
@@ -626,9 +774,7 @@ fn lookup_session_path(source: &str, id: &str) -> Option<std::path::PathBuf> {
 
 pub fn get_session(source: &str, id: &str) -> Result<SessionDetail, Box<dyn Error>> {
     let path = lookup_session_path(source, id).ok_or_else(|| {
-        format!(
-            "unknown session (call scan_all_sessions first): source={source} id={id}"
-        )
+        format!("unknown session (call scan_all_sessions first): source={source} id={id}")
     })?;
     let p = path.as_path();
     let path_str = p.to_string_lossy();
@@ -643,6 +789,154 @@ pub fn get_session(source: &str, id: &str) -> Result<SessionDetail, Box<dyn Erro
         "OpenCode" => parse_opencode_storage_session(p),
         _ => Err(format!("unsupported source: {source}").into()),
     }
+}
+
+/// Stream a Codex rollout JSONL and return:
+///   1. Cumulative session-total token usage (from the LAST
+///      `event_msg.token_count` event — Codex emits cumulative values)
+///   2. The model name from `session_meta.payload.model`
+///   3. Per-day token spend, computed by diffing consecutive
+///      `token_count` events. Each event carries the cumulative
+///      total at its timestamp, so `current - previous` is the
+///      delta produced between the two events, which we attribute
+///      to the day the new event landed on.
+///
+/// Mirrors the detail-time logic in `parse_codex_session` for (1)
+/// and (2); (3) is new and avoids the multi-day attribution bug
+/// where one long Codex thread shows all tokens on its last update.
+fn extract_codex_tokens_from_rollout(path: &Path) -> TokenExtraction {
+    let Ok(content) = fs::read_to_string(path) else {
+        return (None, None, None);
+    };
+    let mut tokens: Option<TokenStats> = None;
+    let mut model: Option<String> = None;
+    // [input, output, cached, reasoning, messages_count]
+    let mut daily: BTreeMap<String, [u64; 5]> = BTreeMap::new();
+    let mut daily_hours: BTreeMap<String, [u64; 24]> = BTreeMap::new();
+    let mut daily_hour_tokens: BTreeMap<String, [u64; 24]> = BTreeMap::new();
+    // Previous cumulative usage we've seen (any null `info` event
+    // resets, so a fresh delta starts from zero on the next one).
+    let mut prev_cumulative: Option<[u64; 4]> = None;
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            if let Some(m) = value
+                .get("payload")
+                .and_then(|p| p.get("model"))
+                .and_then(value_to_string)
+            {
+                model = Some(m);
+            }
+        }
+        if value.get("type").and_then(Value::as_str) == Some("event_msg") {
+            if let Some(payload) = value.get("payload") {
+                if payload.get("type").and_then(Value::as_str) == Some("token_count") {
+                    if let Some(usage) =
+                        payload.get("info").and_then(|v| v.get("total_token_usage"))
+                    {
+                        let input = usage
+                            .get("input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let cached = usage
+                            .get("cached_input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let output = usage
+                            .get("output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let reasoning = usage
+                            .get("reasoning_output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let total = usage
+                            .get("total_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(input + output + cached + reasoning);
+                        tokens = Some(TokenStats {
+                            input,
+                            output,
+                            cached,
+                            reasoning,
+                            total,
+                        });
+
+                        // Attribute the delta (current cumulative -
+                        // previous cumulative) to the day this event
+                        // arrived on. `saturating_sub` defends against
+                        // resets where the cumulative resets to zero
+                        // partway through.
+                        let current = [input, output, cached, reasoning];
+                        let date_hour = value
+                            .get("timestamp")
+                            .and_then(Value::as_str)
+                            .and_then(iso_to_local_date_hour);
+                        if let Some((date, hour)) = date_hour {
+                            let delta = match prev_cumulative {
+                                Some(prev) => [
+                                    current[0].saturating_sub(prev[0]),
+                                    current[1].saturating_sub(prev[1]),
+                                    current[2].saturating_sub(prev[2]),
+                                    current[3].saturating_sub(prev[3]),
+                                ],
+                                None => current,
+                            };
+                            let bucket = daily.entry(date.clone()).or_insert([0u64; 5]);
+                            bucket[0] += delta[0];
+                            bucket[1] += delta[1];
+                            bucket[2] += delta[2];
+                            bucket[3] += delta[3];
+                            bucket[4] += 1; // one AI interaction
+                            let hourbox =
+                                daily_hours.entry(date.clone()).or_insert([0u64; 24]);
+                            hourbox[hour as usize] += 1;
+                            let delta_total = delta[0] + delta[1] + delta[2] + delta[3];
+                            let tokbox =
+                                daily_hour_tokens.entry(date).or_insert([0u64; 24]);
+                            tokbox[hour as usize] += delta_total;
+                        }
+                        prev_cumulative = Some(current);
+                    }
+                }
+            }
+        }
+    }
+    let daily_out: Option<Vec<DailyTokenBreakdown>> = if daily.is_empty() {
+        None
+    } else {
+        Some(
+            daily
+                .into_iter()
+                .map(|(date, [i, o, c, r, m])| {
+                    let hours = daily_hours
+                        .get(&date)
+                        .map(|a| a.to_vec())
+                        .unwrap_or_default();
+                    let hour_tokens = daily_hour_tokens
+                        .get(&date)
+                        .map(|a| a.to_vec())
+                        .unwrap_or_default();
+                    DailyTokenBreakdown {
+                        date,
+                        tokens: TokenStats {
+                            input: i,
+                            output: o,
+                            cached: c,
+                            reasoning: r,
+                            total: i + o + c + r,
+                        },
+                        messages: m,
+                        hours,
+                        hour_tokens,
+                    }
+                })
+                .collect(),
+        )
+    };
+    (tokens, model, daily_out)
 }
 
 fn scan_codex() -> Result<Vec<AppSession>, Box<dyn Error>> {
@@ -695,6 +989,8 @@ fn scan_codex_state_db(path: &Path) -> Result<Vec<AppSession>, Box<dyn Error>> {
             .unwrap_or_default();
         let message_count = estimate_codex_message_count(Path::new(&rollout_path));
         let snippet = snippet_line(&first_user_message);
+        let (tokens, model, daily_tokens) =
+            cached_token_extract(Path::new(&rollout_path), extract_codex_tokens_from_rollout);
 
         Ok(AppSession {
             id: id.clone(),
@@ -708,6 +1004,9 @@ fn scan_codex_state_db(path: &Path) -> Result<Vec<AppSession>, Box<dyn Error>> {
             preview: String::new(),
             snippet,
             message_previews: Vec::new(),
+            tokens,
+            model,
+            daily_tokens,
         })
     })?;
 
@@ -719,6 +1018,147 @@ fn scan_codex_state_db(path: &Path) -> Result<Vec<AppSession>, Box<dyn Error>> {
         }
     }
     Ok(sessions)
+}
+
+/// Stream a Claude project JSONL and return:
+///   1. Aggregate `message.usage` across the whole session
+///   2. Last seen `message.model` (skipping `<synthetic>` placeholders)
+///   3. Per-day token spend, bucketed by each message's `timestamp`.
+///      Anthropic stamps every assistant turn with a real ISO time,
+///      so this gives accurate per-day attribution for `--continue`
+///      sessions that span multiple days.
+///
+/// Same per-message arithmetic as `collect_claude_metadata`'s token
+/// branch (input_tokens is summed-as-billed, not deduplicated — the
+/// session total matches Anthropic's invoice).
+fn extract_claude_tokens_from_jsonl(path: &Path) -> TokenExtraction {
+    let Ok(content) = fs::read_to_string(path) else {
+        return (None, None, None);
+    };
+    let mut input = 0u64;
+    let mut output = 0u64;
+    let mut cache_read = 0u64;
+    let mut cache_creation = 0u64;
+    let mut saw_any = false;
+    let mut model: Option<String> = None;
+    // [input, output, cache_read, cache_creation, messages] per local date
+    let mut daily: BTreeMap<String, [u64; 5]> = BTreeMap::new();
+    let mut daily_hours: BTreeMap<String, [u64; 24]> = BTreeMap::new();
+    let mut daily_hour_tokens: BTreeMap<String, [u64; 24]> = BTreeMap::new();
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let date_hour = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(iso_to_local_date_hour);
+        let date_key = date_hour.as_ref().map(|(d, _)| d.clone());
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        if let Some(usage) = message.get("usage") {
+            let mut line_input = 0u64;
+            let mut line_output = 0u64;
+            let mut line_cache_read = 0u64;
+            let mut line_cache_creation = 0u64;
+            if let Some(n) = usage.get("input_tokens").and_then(Value::as_u64) {
+                input += n;
+                line_input = n;
+                saw_any = true;
+            }
+            if let Some(n) = usage.get("output_tokens").and_then(Value::as_u64) {
+                output += n;
+                line_output = n;
+                saw_any = true;
+            }
+            if let Some(n) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+                cache_read += n;
+                line_cache_read = n;
+                saw_any = true;
+            }
+            if let Some(n) = usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+            {
+                cache_creation += n;
+                line_cache_creation = n;
+                saw_any = true;
+            }
+            if let Some(date) = date_key.clone() {
+                let bucket = daily.entry(date.clone()).or_insert([0u64; 5]);
+                bucket[0] += line_input;
+                bucket[1] += line_output;
+                bucket[2] += line_cache_read;
+                bucket[3] += line_cache_creation;
+                bucket[4] += 1; // one assistant message
+                if let Some((_, hour)) = date_hour.as_ref() {
+                    let hourbox = daily_hours.entry(date.clone()).or_insert([0u64; 24]);
+                    hourbox[*hour as usize] += 1;
+                    let line_total = line_input
+                        + line_output
+                        + line_cache_read
+                        + line_cache_creation;
+                    let tokbox =
+                        daily_hour_tokens.entry(date).or_insert([0u64; 24]);
+                    tokbox[*hour as usize] += line_total;
+                }
+            }
+        }
+        if let Some(m) = message.get("model").and_then(value_to_string) {
+            if !m.starts_with('<') {
+                model = Some(m);
+            }
+        }
+    }
+    let tokens = if saw_any {
+        let cached = cache_read + cache_creation;
+        Some(TokenStats {
+            input,
+            output,
+            cached,
+            // Claude folds reasoning into output_tokens — no separate
+            // breakout to surface here.
+            reasoning: 0,
+            total: input + output + cached,
+        })
+    } else {
+        None
+    };
+    let daily_out: Option<Vec<DailyTokenBreakdown>> = if daily.is_empty() {
+        None
+    } else {
+        Some(
+            daily
+                .into_iter()
+                .map(|(date, [i, o, cr, cc, m])| {
+                    let cached = cr + cc;
+                    let hours = daily_hours
+                        .get(&date)
+                        .map(|a| a.to_vec())
+                        .unwrap_or_default();
+                    let hour_tokens = daily_hour_tokens
+                        .get(&date)
+                        .map(|a| a.to_vec())
+                        .unwrap_or_default();
+                    DailyTokenBreakdown {
+                        date,
+                        tokens: TokenStats {
+                            input: i,
+                            output: o,
+                            cached,
+                            reasoning: 0,
+                            total: i + o + cached,
+                        },
+                        messages: m,
+                        hours,
+                        hour_tokens,
+                    }
+                })
+                .collect(),
+        )
+    };
+    (tokens, model, daily_out)
 }
 
 fn scan_claude() -> Result<Vec<AppSession>, Box<dyn Error>> {
@@ -749,7 +1189,12 @@ fn scan_claude_projects(root: &Path) -> Result<Vec<AppSession>, Box<dyn Error>> 
             if !path.is_file() || !is_claude_session_file(&path) {
                 continue;
             }
-            if let Ok(session) = parse_claude_lite_session(&path, None) {
+            if let Ok(mut session) = parse_claude_lite_session(&path, None) {
+                let (tokens, model, daily_tokens) =
+                    cached_token_extract(&path, extract_claude_tokens_from_jsonl);
+                session.tokens = tokens;
+                session.model = model;
+                session.daily_tokens = daily_tokens;
                 sessions.push(session);
             }
         }
@@ -1597,6 +2042,9 @@ fn doc_session_from_file(path: &Path, project: &str, source: &str) -> Option<App
         preview,
         snippet,
         message_previews: Vec::new(),
+        tokens: None,
+        model: None,
+        daily_tokens: None,
     })
 }
 
@@ -1714,6 +2162,9 @@ fn parse_doc_file(path: &Path, source: &str) -> Result<SessionDetail, Box<dyn Er
         preview: description,
         snippet: snippet_line(&snippet_source),
         message_previews: Vec::new(),
+        tokens: None,
+        model: None,
+        daily_tokens: None,
     };
     let role = if !mem_type.is_empty() {
         mem_type
@@ -1869,6 +2320,19 @@ struct ClaudeConversation {
     team_name: Option<String>,
     messages: Vec<SessionMessage>,
     visible_message_count: usize,
+    /// Cumulative token usage extracted from `message.usage` blocks
+    /// (Anthropic API response shape, written verbatim into the
+    /// JSONL by Claude Code). `(input, output, cache_read, cache_creation)`.
+    token_input: u64,
+    token_output: u64,
+    token_cache_read: u64,
+    token_cache_creation: u64,
+    /// True once we've seen at least one usage block, so we can tell
+    /// "no usage data at all" (legacy session) apart from "all zeros".
+    has_token_data: bool,
+    /// Last-seen `message.model` — for Claude this is generally
+    /// stable within a session so the last one wins.
+    model: Option<String>,
 }
 
 struct ClaudeLiteSessionFile {
@@ -1932,6 +2396,9 @@ fn parse_claude_lite_session(
         preview: String::new(),
         snippet,
         message_previews: Vec::new(),
+        tokens: None,
+        model: None,
+        daily_tokens: None,
     })
 }
 
@@ -2091,6 +2558,20 @@ fn parse_claude_session(path: &Path) -> Result<SessionDetail, Box<dyn Error>> {
             .updated_at
             .or_else(|| file_time(path, true));
     }
+    if conversation.has_token_data {
+        let cached = conversation.token_cache_read + conversation.token_cache_creation;
+        let total = conversation.token_input + conversation.token_output + cached;
+        detail.session.tokens = Some(TokenStats {
+            input: conversation.token_input,
+            output: conversation.token_output,
+            cached,
+            // Claude doesn't break out reasoning tokens — they're
+            // folded into `output_tokens`. Leave the field at 0.
+            reasoning: 0,
+            total,
+        });
+    }
+    detail.session.model = conversation.model.clone();
     Ok(detail)
 }
 
@@ -2126,6 +2607,44 @@ fn collect_claude_metadata(conversation: &mut ClaudeConversation, value: &Value)
     }
     if let Some(summary) = value.get("summary").and_then(value_to_string) {
         conversation.summary = Some(summary);
+    }
+    // Token usage lives at `message.usage` for assistant entries. The
+    // shape matches the Anthropic API response verbatim. Accumulate
+    // across every line; the model name (also under `message.model`)
+    // is generally stable per session so the last seen one wins.
+    if let Some(message) = value.get("message") {
+        if let Some(usage) = message.get("usage") {
+            let mut saw_any = false;
+            if let Some(n) = usage.get("input_tokens").and_then(Value::as_u64) {
+                conversation.token_input += n;
+                saw_any = true;
+            }
+            if let Some(n) = usage.get("output_tokens").and_then(Value::as_u64) {
+                conversation.token_output += n;
+                saw_any = true;
+            }
+            if let Some(n) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+                conversation.token_cache_read += n;
+                saw_any = true;
+            }
+            if let Some(n) = usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+            {
+                conversation.token_cache_creation += n;
+                saw_any = true;
+            }
+            if saw_any {
+                conversation.has_token_data = true;
+            }
+        }
+        if let Some(m) = message.get("model").and_then(value_to_string) {
+            // Skip placeholder strings the CLI sometimes writes
+            // (`<synthetic>`, etc.).
+            if !m.starts_with('<') {
+                conversation.model = Some(m);
+            }
+        }
     }
 }
 
@@ -2312,6 +2831,12 @@ struct GeminiConversation {
     messages: Vec<Value>,
     message_count: usize,
     has_user_or_assistant: bool,
+    // Token + model are extracted during the same line/record walk as
+    // the loader does, so metadata_only scans (Stats page) get the
+    // numbers without paying for full message construction.
+    token_stats: Option<TokenStats>,
+    model: Option<String>,
+    daily_tokens: Option<Vec<DailyTokenBreakdown>>,
 }
 
 fn is_gemini_session_file(path: &Path) -> bool {
@@ -2360,6 +2885,15 @@ fn parse_gemini_session_file(
     }
 
     let project = gemini_project_from_chat_path(path).ok_or("missing Gemini .project_root")?;
+
+    // Per-message `tokens` block + `model` field are accumulated
+    // inside the loader so metadata_only scans (Stats page) get the
+    // same numbers as detail loads — the messages array is empty in
+    // that mode, so we can't recompute here.
+    let token_stats = conversation.token_stats.take();
+    let model = conversation.model.take();
+    let daily_tokens = conversation.daily_tokens.take();
+
     let messages = if metadata_only {
         Vec::new()
     } else {
@@ -2383,7 +2917,184 @@ fn parse_gemini_session_file(
     detail.session.started_at = conversation.start_time;
     detail.session.updated_at = conversation.last_updated;
     detail.session.message_count = conversation.message_count;
+    detail.session.tokens = token_stats;
+    detail.session.model = model;
+    detail.session.daily_tokens = daily_tokens;
     Ok(detail)
+}
+
+/// Streaming token-usage accumulator. Lets the loader feed each
+/// record as it parses lines, so scan-time (metadata_only) paths get
+/// the same numbers as detail-time paths without rebuilding the
+/// full messages array.
+#[derive(Default)]
+struct GeminiTokenAccumulator {
+    input: u64,
+    output: u64,
+    cached: u64,
+    reasoning: u64,
+    total: u64,
+    saw_tokens: bool,
+    model: Option<String>,
+    /// Per-day token spend, keyed by local YYYY-MM-DD. Built only
+    /// when records carry their own `timestamp` field (Gemini does
+    /// for normal session records). Stored as a sorted BTreeMap so
+    /// the finish step can hand back a chronological Vec without
+    /// re-sorting.
+    /// [input, output, cached, reasoning, total, messages]
+    daily: BTreeMap<String, [u64; 6]>,
+    /// Per-hour message count by local date.
+    daily_hours: BTreeMap<String, [u64; 24]>,
+    /// Per-hour token total by local date.
+    daily_hour_tokens: BTreeMap<String, [u64; 24]>,
+}
+
+impl GeminiTokenAccumulator {
+    fn observe(&mut self, record: &Value) {
+        let date_hour = record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(iso_to_local_date_hour);
+        let date_key = date_hour.as_ref().map(|(d, _)| d.clone());
+        if let Some(tokens) = record.get("tokens") {
+            let mut any = false;
+            let mut line_input = 0u64;
+            let mut line_output = 0u64;
+            let mut line_cached = 0u64;
+            let mut line_reasoning = 0u64;
+            let mut line_total = 0u64;
+            if let Some(n) = tokens.get("input").and_then(Value::as_u64) {
+                self.input += n;
+                line_input = n;
+                any = true;
+            }
+            if let Some(n) = tokens.get("output").and_then(Value::as_u64) {
+                self.output += n;
+                line_output = n;
+                any = true;
+            }
+            if let Some(n) = tokens.get("cached").and_then(Value::as_u64) {
+                self.cached += n;
+                line_cached = n;
+                any = true;
+            }
+            if let Some(n) = tokens.get("thoughts").and_then(Value::as_u64) {
+                self.reasoning += n;
+                line_reasoning = n;
+                any = true;
+            }
+            if let Some(n) = tokens.get("total").and_then(Value::as_u64) {
+                self.total += n;
+                line_total = n;
+                any = true;
+            }
+            if any {
+                self.saw_tokens = true;
+                if let Some(date) = date_key.clone() {
+                    let bucket = self.daily.entry(date.clone()).or_insert([0u64; 6]);
+                    bucket[0] += line_input;
+                    bucket[1] += line_output;
+                    bucket[2] += line_cached;
+                    bucket[3] += line_reasoning;
+                    bucket[4] += line_total;
+                    bucket[5] += 1; // one tokens record = 1 interaction
+                    if let Some((_, hour)) = date_hour.as_ref() {
+                        let hourbox =
+                            self.daily_hours.entry(date.clone()).or_insert([0u64; 24]);
+                        hourbox[*hour as usize] += 1;
+                        let recorded_total = if line_total > 0 {
+                            line_total
+                        } else {
+                            line_input + line_output + line_cached + line_reasoning
+                        };
+                        let tokbox = self
+                            .daily_hour_tokens
+                            .entry(date)
+                            .or_insert([0u64; 24]);
+                        tokbox[*hour as usize] += recorded_total;
+                    }
+                }
+            }
+        }
+        if let Some(m) = record.get("model").and_then(value_to_string) {
+            self.model = Some(m);
+        }
+    }
+
+    fn finish(
+        self,
+    ) -> (
+        Option<TokenStats>,
+        Option<String>,
+        Option<Vec<DailyTokenBreakdown>>,
+    ) {
+        let stats = if self.saw_tokens {
+            Some(TokenStats {
+                input: self.input,
+                output: self.output,
+                cached: self.cached,
+                reasoning: self.reasoning,
+                // Use the per-record `total` sum when present; else
+                // derive from components.
+                total: if self.total > 0 {
+                    self.total
+                } else {
+                    self.input + self.output + self.cached + self.reasoning
+                },
+            })
+        } else {
+            None
+        };
+        let daily = if self.daily.is_empty() {
+            None
+        } else {
+            Some(
+                self.daily
+                    .into_iter()
+                    .map(|(date, [i, o, c, r, t, m])| {
+                        let hours = self
+                            .daily_hours
+                            .get(&date)
+                            .map(|a| a.to_vec())
+                            .unwrap_or_default();
+                        let hour_tokens = self
+                            .daily_hour_tokens
+                            .get(&date)
+                            .map(|a| a.to_vec())
+                            .unwrap_or_default();
+                        DailyTokenBreakdown {
+                            date,
+                            tokens: TokenStats {
+                                input: i,
+                                output: o,
+                                cached: c,
+                                reasoning: r,
+                                total: if t > 0 { t } else { i + o + c + r },
+                            },
+                            messages: m,
+                            hours,
+                            hour_tokens,
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        (stats, self.model, daily)
+    }
+}
+
+fn gemini_extract_token_usage(
+    records: &[Value],
+) -> (
+    Option<TokenStats>,
+    Option<String>,
+    Option<Vec<DailyTokenBreakdown>>,
+) {
+    let mut acc = GeminiTokenAccumulator::default();
+    for record in records {
+        acc.observe(record);
+    }
+    acc.finish()
 }
 
 fn load_gemini_jsonl_conversation(
@@ -2397,10 +3108,15 @@ fn load_gemini_jsonl_conversation(
     let mut message_ids = Vec::<String>::new();
     let mut message_kinds = HashMap::<String, (bool, bool)>::new();
     let mut first_user_message: Option<String> = None;
+    let mut token_acc = GeminiTokenAccumulator::default();
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        // Track tokens / model on every record so metadata_only scans
+        // (Stats page) get the same numbers detail loads do, without
+        // paying for the full messages array construction.
+        token_acc.observe(&value);
         if let Some(rewind_id) = value.get("$rewindTo").and_then(value_to_string) {
             if metadata_only {
                 if let Some(index) = message_ids.iter().position(|id| id == &rewind_id) {
@@ -2498,6 +3214,14 @@ fn load_gemini_jsonl_conversation(
     } else {
         loaded_messages.iter().any(gemini_is_user_or_assistant)
     };
+    // metadata_only path skips the loop above, so feed the metadata
+    // messages (set via `$set`) into the accumulator before finishing.
+    if metadata_only && !metadata_messages.is_empty() {
+        for record in &metadata_messages {
+            token_acc.observe(record);
+        }
+    }
+    let (token_stats, model, daily_tokens) = token_acc.finish();
 
     Ok(GeminiConversation {
         session_id: metadata
@@ -2527,6 +3251,9 @@ fn load_gemini_jsonl_conversation(
         },
         message_count,
         has_user_or_assistant,
+        token_stats,
+        model,
+        daily_tokens,
     })
 }
 
@@ -2541,6 +3268,9 @@ fn load_gemini_json_conversation(
         .cloned()
         .unwrap_or_default();
     let has_user_or_assistant = messages.iter().any(gemini_is_user_or_assistant);
+    // The .json layout has all messages up-front, so the simple
+    // aggregating helper is enough — no streaming needed.
+    let (token_stats, model, daily_tokens) = gemini_extract_token_usage(&messages);
     Ok(GeminiConversation {
         session_id: value
             .get("sessionId")
@@ -2568,6 +3298,9 @@ fn load_gemini_json_conversation(
         },
         message_count: messages.len(),
         has_user_or_assistant,
+        token_stats,
+        model,
+        daily_tokens,
     })
 }
 
@@ -3194,6 +3927,12 @@ fn parse_codex_session(path: &Path, id: &str) -> Result<SessionDetail, Box<dyn E
         .map(|session| session.project.clone())
         .unwrap_or_default();
     let mut timestamps = Vec::new();
+    // Codex emits periodic `event_msg.payload.type = "token_count"`
+    // events. The `info.total_token_usage` block is cumulative for
+    // the whole session, so we just keep overwriting and the last
+    // non-null one wins.
+    let mut latest_token_usage: Option<TokenStats> = None;
+    let mut model: Option<String> = None;
 
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -3210,8 +3949,59 @@ fn parse_codex_session(path: &Path, id: &str) -> Result<SessionDetail, Box<dyn E
                 if let Some(cwd) = payload.get("cwd").and_then(value_to_string) {
                     project = cwd;
                 }
+                if let Some(m) = payload.get("model").and_then(value_to_string) {
+                    model = Some(m);
+                }
             }
             continue;
+        }
+        // Token usage rollups
+        if value.get("type").and_then(Value::as_str) == Some("event_msg") {
+            if let Some(payload) = value.get("payload") {
+                if payload.get("type").and_then(Value::as_str) == Some("token_count") {
+                    if let Some(usage) =
+                        payload.get("info").and_then(|v| v.get("total_token_usage"))
+                    {
+                        let input = usage
+                            .get("input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let cached = usage
+                            .get("cached_input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let output = usage
+                            .get("output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let reasoning = usage
+                            .get("reasoning_output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let total = usage
+                            .get("total_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(input + output + cached + reasoning);
+                        latest_token_usage = Some(TokenStats {
+                            input,
+                            output,
+                            cached,
+                            reasoning,
+                            total,
+                        });
+                    }
+                }
+            }
+        }
+        // Model can also surface on response_item messages.
+        if model.is_none() {
+            if let Some(m) = value
+                .get("payload")
+                .and_then(|p| p.get("model"))
+                .and_then(value_to_string)
+            {
+                model = Some(m);
+            }
         }
         if let Some(message) = codex_message_from_value(&value) {
             messages.push(message);
@@ -3238,6 +4028,9 @@ fn parse_codex_session(path: &Path, id: &str) -> Result<SessionDetail, Box<dyn E
         detail.session.updated_at = session.updated_at;
         detail.session.message_count = detail.messages.len();
     }
+
+    detail.session.tokens = latest_token_usage;
+    detail.session.model = model;
 
     Ok(detail)
 }
@@ -3279,27 +4072,51 @@ fn codex_thread_from_state(id: &str) -> Result<AppSession, Box<dyn Error>> {
             preview: String::new(),
             snippet,
             message_previews: Vec::new(),
+            tokens: None,
+            model: None,
+            daily_tokens: None,
         })
     })?;
     Ok(session)
 }
 
 fn scan_opencode_db(path: &Path) -> Result<Vec<AppSession>, Box<dyn Error>> {
+    // 0-byte / freshly-created opencode.db has no tables yet — OpenCode
+    // creates the file on launch but only writes the schema on first
+    // session. Treat this as "no sessions" rather than a hard error so
+    // the rest of the scan (Codex / Claude / Gemini / memories) doesn't
+    // get aborted by the `?` further down.
+    if fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false) {
+        return Ok(Vec::new());
+    }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    if !table_exists(&conn, "session")? {
+        return Ok(Vec::new());
+    }
     ensure_opencode_schema(&conn)?;
-    let mut stmt = conn.prepare(
-        "select id, directory, title, time_created, time_updated \
+    let token_cols = opencode_token_columns(&conn)?;
+    let mut stmt = conn.prepare(&format!(
+        "select id, directory, title, time_created, time_updated{} \
          from session \
          where parent_id is null and time_archived is null \
          order by time_updated desc, id desc",
-    )?;
+        token_cols.select_suffix()
+    ))?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
         let project: String = row.get(1)?;
         let title: String = row.get(2)?;
         let created_raw: i64 = row.get(3)?;
         let updated_raw: i64 = row.get(4)?;
+        let tokens = token_cols.read_from_row(row, 5);
+        let model_raw: Option<String> = if token_cols.has_model {
+            row.get(token_cols.model_col_index()).ok()
+        } else {
+            None
+        };
+        let model = model_raw.and_then(parse_opencode_model_json);
         let message_count = count_opencode_visible_messages(&conn, &id).unwrap_or(0);
+        let daily_tokens = extract_opencode_daily_tokens(&conn, &id);
         // OpenCode's `session.title` is an auto-summarized prompt
         // (matches what the user sees in their TUI); reusing it as
         // the snippet keeps the card informative without a second
@@ -3317,6 +4134,9 @@ fn scan_opencode_db(path: &Path) -> Result<Vec<AppSession>, Box<dyn Error>> {
             preview: String::new(),
             snippet,
             message_previews: Vec::new(),
+            tokens,
+            model,
+            daily_tokens,
         })
     })?;
 
@@ -3353,11 +4173,15 @@ fn opencode_session_from_db(
     path: &Path,
     id: &str,
 ) -> Result<Option<AppSession>, Box<dyn Error>> {
+    let token_cols = opencode_token_columns(conn)?;
     let session = conn
         .query_row(
-            "select id, directory, title, time_created, time_updated \
-             from session \
-             where id = ?1 and time_archived is null",
+            &format!(
+                "select id, directory, title, time_created, time_updated{} \
+                 from session \
+                 where id = ?1 and time_archived is null",
+                token_cols.select_suffix()
+            ),
             [id],
             |row| {
                 let id: String = row.get(0)?;
@@ -3365,6 +4189,13 @@ fn opencode_session_from_db(
                 let title: String = row.get(2)?;
                 let created_raw: i64 = row.get(3)?;
                 let updated_raw: i64 = row.get(4)?;
+                let tokens = token_cols.read_from_row(row, 5);
+                let model_raw: Option<String> = if token_cols.has_model {
+                    row.get(token_cols.model_col_index()).ok()
+                } else {
+                    None
+                };
+                let model = model_raw.and_then(parse_opencode_model_json);
                 let snippet = snippet_line(&opencode_display_title(&title));
                 Ok(AppSession {
                     id: id.clone(),
@@ -3378,11 +4209,165 @@ fn opencode_session_from_db(
                     preview: String::new(),
                     snippet,
                     message_previews: Vec::new(),
+                    tokens,
+                    model,
+                    // Filled in below — the closure can't easily run a
+                    // second query against `conn` (already borrowed for
+                    // this row), so defer to outside the query_row.
+                    daily_tokens: None,
                 })
             },
         )
         .optional()?;
+    let session = session.map(|mut s| {
+        s.daily_tokens = extract_opencode_daily_tokens(conn, id);
+        s
+    });
     Ok(session)
+}
+
+/// Detect which token / model columns exist on the `session` table.
+/// OpenCode schemas have evolved — older databases may not have the
+/// reasoning / cache_read / cache_write breakdown, and even older
+/// ones may not have the `model` column. Probe once and reuse.
+#[derive(Default, Clone, Copy)]
+struct OpencodeTokenColumns {
+    has_input: bool,
+    has_output: bool,
+    has_reasoning: bool,
+    has_cache_read: bool,
+    has_cache_write: bool,
+    has_model: bool,
+}
+
+impl OpencodeTokenColumns {
+    /// Trailing fragment for the `select` list — empty when none of
+    /// the optional columns are present.
+    fn select_suffix(self) -> String {
+        let mut out = String::new();
+        if self.has_input {
+            out.push_str(", tokens_input");
+        }
+        if self.has_output {
+            out.push_str(", tokens_output");
+        }
+        if self.has_reasoning {
+            out.push_str(", tokens_reasoning");
+        }
+        if self.has_cache_read {
+            out.push_str(", tokens_cache_read");
+        }
+        if self.has_cache_write {
+            out.push_str(", tokens_cache_write");
+        }
+        if self.has_model {
+            out.push_str(", model");
+        }
+        out
+    }
+
+    fn token_count(self) -> usize {
+        [
+            self.has_input,
+            self.has_output,
+            self.has_reasoning,
+            self.has_cache_read,
+            self.has_cache_write,
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count()
+    }
+
+    fn model_col_index(self) -> usize {
+        // 5 = the 5 fixed columns (id, directory, title, time_created,
+        // time_updated). Token columns come next, then model.
+        5 + self.token_count()
+    }
+
+    /// Read whichever token columns we know exist, starting at the
+    /// given base index. Returns `None` when every column is missing
+    /// OR every present column is zero — so we don't surface a
+    /// "0 input / 0 output" total that the user would assume means
+    /// "no data" anyway.
+    fn read_from_row(self, row: &rusqlite::Row<'_>, base: usize) -> Option<TokenStats> {
+        let mut idx = base;
+        let mut input = 0u64;
+        let mut output = 0u64;
+        let mut reasoning = 0u64;
+        let mut cache_read = 0u64;
+        let mut cache_write = 0u64;
+        if self.has_input {
+            input = row
+                .get::<_, i64>(idx)
+                .ok()
+                .map(|v| v.max(0) as u64)
+                .unwrap_or(0);
+            idx += 1;
+        }
+        if self.has_output {
+            output = row
+                .get::<_, i64>(idx)
+                .ok()
+                .map(|v| v.max(0) as u64)
+                .unwrap_or(0);
+            idx += 1;
+        }
+        if self.has_reasoning {
+            reasoning = row
+                .get::<_, i64>(idx)
+                .ok()
+                .map(|v| v.max(0) as u64)
+                .unwrap_or(0);
+            idx += 1;
+        }
+        if self.has_cache_read {
+            cache_read = row
+                .get::<_, i64>(idx)
+                .ok()
+                .map(|v| v.max(0) as u64)
+                .unwrap_or(0);
+            idx += 1;
+        }
+        if self.has_cache_write {
+            cache_write = row
+                .get::<_, i64>(idx)
+                .ok()
+                .map(|v| v.max(0) as u64)
+                .unwrap_or(0);
+        }
+        let cached = cache_read + cache_write;
+        let total = input + output + reasoning + cached;
+        if total == 0 {
+            return None;
+        }
+        Some(TokenStats {
+            input,
+            output,
+            cached,
+            reasoning,
+            total,
+        })
+    }
+}
+
+fn opencode_token_columns(conn: &Connection) -> Result<OpencodeTokenColumns, Box<dyn Error>> {
+    Ok(OpencodeTokenColumns {
+        has_input: column_exists(conn, "session", "tokens_input")?,
+        has_output: column_exists(conn, "session", "tokens_output")?,
+        has_reasoning: column_exists(conn, "session", "tokens_reasoning")?,
+        has_cache_read: column_exists(conn, "session", "tokens_cache_read")?,
+        has_cache_write: column_exists(conn, "session", "tokens_cache_write")?,
+        has_model: column_exists(conn, "session", "model")?,
+    })
+}
+
+/// `session.model` is a JSON column with the shape
+/// `{"id":"...", "providerID":"...", "variant"?: "..."}`. Pull just
+/// the id so the UI displays "gpt-5" / "claude-opus-4-7" / etc.
+fn parse_opencode_model_json(raw: String) -> Option<String> {
+    let parsed: Value = serde_json::from_str(&raw).ok()?;
+    parsed.get("id").and_then(Value::as_str).map(str::to_string)
 }
 
 fn count_opencode_visible_messages(
@@ -3390,6 +4375,132 @@ fn count_opencode_visible_messages(
     session_id: &str,
 ) -> Result<usize, Box<dyn Error>> {
     Ok(read_opencode_db_messages(conn, session_id)?.len())
+}
+
+/// Pull per-day token spend out of OpenCode's `part` table by walking
+/// every `step-finish` part for the session. Each step-finish record
+/// is one upstream API call and carries:
+///   - `time.created`: ms since epoch (also mirrored as `time_created`
+///     column on the row)
+///   - `tokens.{input, output, reasoning, cache.{read, write}}`: the
+///     exact same structure the session-level aggregates roll up from
+///     (per `session/projectors.ts:36-40`)
+///
+/// Returns `None` when no step-finish part was seen (empty session,
+/// older schema, etc.) so the caller falls back to even-distribution.
+fn extract_opencode_daily_tokens(
+    conn: &Connection,
+    session_id: &str,
+) -> Option<Vec<DailyTokenBreakdown>> {
+    if !table_exists(conn, "part").ok()? {
+        return None;
+    }
+    let mut stmt = conn
+        .prepare(
+            "select time_created, data from part \
+             where session_id = ?1 \
+             order by time_created asc, id asc",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([session_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .ok()?;
+
+    // [input, output, cached, reasoning, total, messages]
+    let mut daily: BTreeMap<String, [u64; 6]> = BTreeMap::new();
+    let mut daily_hours: BTreeMap<String, [u64; 24]> = BTreeMap::new();
+    let mut daily_hour_tokens: BTreeMap<String, [u64; 24]> = BTreeMap::new();
+    let mut saw_any = false;
+    for row in rows {
+        let Ok((time_ms_col, data)) = row else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        // Only step-finish parts carry token usage — text/tool/etc.
+        // parts have no tokens field.
+        if value.get("type").and_then(Value::as_str) != Some("step-finish") {
+            continue;
+        }
+        let Some(tokens) = value.get("tokens") else {
+            continue;
+        };
+        let input = tokens.get("input").and_then(Value::as_u64).unwrap_or(0);
+        let output = tokens.get("output").and_then(Value::as_u64).unwrap_or(0);
+        let reasoning = tokens.get("reasoning").and_then(Value::as_u64).unwrap_or(0);
+        let cache = tokens.get("cache");
+        let cache_read = cache
+            .and_then(|c| c.get("read"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_write = cache
+            .and_then(|c| c.get("write"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cached = cache_read + cache_write;
+        if input == 0 && output == 0 && reasoning == 0 && cached == 0 {
+            continue;
+        }
+        saw_any = true;
+
+        // Prefer the embedded `time.created`; fall back to the
+        // `time_created` column when the JSON shape varies across
+        // OpenCode versions.
+        let time_ms = value
+            .get("time")
+            .and_then(|t| t.get("created"))
+            .and_then(Value::as_i64)
+            .unwrap_or(time_ms_col);
+        let Some((date, hour)) = epoch_ms_to_local_date_hour(time_ms) else {
+            continue;
+        };
+        let bucket = daily.entry(date.clone()).or_insert([0u64; 6]);
+        bucket[0] += input;
+        bucket[1] += output;
+        bucket[2] += cached;
+        bucket[3] += reasoning;
+        let part_total = input + output + cached + reasoning;
+        bucket[4] += part_total;
+        bucket[5] += 1; // one step-finish = 1 API call
+        let hourbox = daily_hours.entry(date.clone()).or_insert([0u64; 24]);
+        hourbox[hour as usize] += 1;
+        let tokbox = daily_hour_tokens.entry(date).or_insert([0u64; 24]);
+        tokbox[hour as usize] += part_total;
+    }
+    if !saw_any {
+        return None;
+    }
+    Some(
+        daily
+            .into_iter()
+            .map(|(date, [i, o, c, r, t, m])| {
+                let hours = daily_hours
+                    .get(&date)
+                    .map(|a| a.to_vec())
+                    .unwrap_or_default();
+                let hour_tokens = daily_hour_tokens
+                    .get(&date)
+                    .map(|a| a.to_vec())
+                    .unwrap_or_default();
+                DailyTokenBreakdown {
+                    date,
+                    tokens: TokenStats {
+                        input: i,
+                        output: o,
+                        cached: c,
+                        reasoning: r,
+                        total: t,
+                    },
+                    messages: m,
+                    hours,
+                    hour_tokens,
+                }
+            })
+            .collect(),
+    )
 }
 
 fn read_opencode_db_messages(
@@ -4629,6 +5740,9 @@ fn detail_from_messages(
             preview: String::new(),
             snippet,
             message_previews: Vec::new(),
+            tokens: None,
+            model: None,
+            daily_tokens: None,
         },
         messages,
     }
@@ -7977,9 +9091,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, B
     // that isn't a bare SQL identifier so a future caller that pipes
     // a row value here can't accidentally introduce injection.
     if !is_safe_sql_identifier(table) {
-        return Err(
-            format!("rejecting unsafe table identifier: {table}").into(),
-        );
+        return Err(format!("rejecting unsafe table identifier: {table}").into());
     }
     let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
     let mut rows = stmt.query([])?;
@@ -8020,22 +9132,27 @@ mod tests {
     fn search_cache_evicts_oldest_when_full() {
         let mut cache = SearchCache::new(3);
         let mtime = SystemTime::now();
-        let arc = || Arc::new(SessionDetail {
-            session: AppSession {
-                id: String::new(),
-                source: String::new(),
-                title: String::new(),
-                project: String::new(),
-                path: String::new(),
-                started_at: None,
-                updated_at: None,
-                message_count: 0,
-                preview: String::new(),
-                snippet: String::new(),
-                message_previews: Vec::new(),
-            },
-            messages: Vec::new(),
-        });
+        let arc = || {
+            Arc::new(SessionDetail {
+                session: AppSession {
+                    id: String::new(),
+                    source: String::new(),
+                    title: String::new(),
+                    project: String::new(),
+                    path: String::new(),
+                    started_at: None,
+                    updated_at: None,
+                    message_count: 0,
+                    preview: String::new(),
+                    snippet: String::new(),
+                    message_previews: Vec::new(),
+                    tokens: None,
+                    model: None,
+                    daily_tokens: None,
+                },
+                messages: Vec::new(),
+            })
+        };
         cache.put((PathBuf::from("/a"), mtime), arc());
         cache.put((PathBuf::from("/b"), mtime), arc());
         cache.put((PathBuf::from("/c"), mtime), arc());
@@ -8051,22 +9168,27 @@ mod tests {
     fn search_cache_get_promotes_to_mru() {
         let mut cache = SearchCache::new(3);
         let mtime = SystemTime::now();
-        let arc = || Arc::new(SessionDetail {
-            session: AppSession {
-                id: String::new(),
-                source: String::new(),
-                title: String::new(),
-                project: String::new(),
-                path: String::new(),
-                started_at: None,
-                updated_at: None,
-                message_count: 0,
-                preview: String::new(),
-                snippet: String::new(),
-                message_previews: Vec::new(),
-            },
-            messages: Vec::new(),
-        });
+        let arc = || {
+            Arc::new(SessionDetail {
+                session: AppSession {
+                    id: String::new(),
+                    source: String::new(),
+                    title: String::new(),
+                    project: String::new(),
+                    path: String::new(),
+                    started_at: None,
+                    updated_at: None,
+                    message_count: 0,
+                    preview: String::new(),
+                    snippet: String::new(),
+                    message_previews: Vec::new(),
+                    tokens: None,
+                    model: None,
+                    daily_tokens: None,
+                },
+                messages: Vec::new(),
+            })
+        };
         cache.put((PathBuf::from("/a"), mtime), arc());
         cache.put((PathBuf::from("/b"), mtime), arc());
         cache.put((PathBuf::from("/c"), mtime), arc());
@@ -8082,22 +9204,27 @@ mod tests {
     fn search_cache_put_refreshes_existing_position() {
         let mut cache = SearchCache::new(2);
         let mtime = SystemTime::now();
-        let arc = || Arc::new(SessionDetail {
-            session: AppSession {
-                id: String::new(),
-                source: String::new(),
-                title: String::new(),
-                project: String::new(),
-                path: String::new(),
-                started_at: None,
-                updated_at: None,
-                message_count: 0,
-                preview: String::new(),
-                snippet: String::new(),
-                message_previews: Vec::new(),
-            },
-            messages: Vec::new(),
-        });
+        let arc = || {
+            Arc::new(SessionDetail {
+                session: AppSession {
+                    id: String::new(),
+                    source: String::new(),
+                    title: String::new(),
+                    project: String::new(),
+                    path: String::new(),
+                    started_at: None,
+                    updated_at: None,
+                    message_count: 0,
+                    preview: String::new(),
+                    snippet: String::new(),
+                    message_previews: Vec::new(),
+                    tokens: None,
+                    model: None,
+                    daily_tokens: None,
+                },
+                messages: Vec::new(),
+            })
+        };
         cache.put((PathBuf::from("/a"), mtime), arc());
         cache.put((PathBuf::from("/b"), mtime), arc());
         // Re-put /a — should refresh position, NOT evict anything.
@@ -8113,8 +9240,8 @@ mod tests {
         // Force a known empty-index state so we don't depend on any
         // previous scan_sessions() call leaving residue.
         refresh_session_path_index(&[]);
-        let err = get_session("Memory", "any-id")
-            .expect_err("must refuse an id that wasn't scanned");
+        let err =
+            get_session("Memory", "any-id").expect_err("must refuse an id that wasn't scanned");
         let msg = err.to_string();
         assert!(
             msg.contains("unknown session"),
@@ -8139,10 +9266,13 @@ mod tests {
             preview: String::new(),
             snippet: String::new(),
             message_previews: Vec::new(),
+            tokens: None,
+            model: None,
+            daily_tokens: None,
         };
         refresh_session_path_index(std::slice::from_ref(&probe));
-        let err = get_session("Memory", "synthetic-probe-id")
-            .expect_err("file doesn't exist on disk");
+        let err =
+            get_session("Memory", "synthetic-probe-id").expect_err("file doesn't exist on disk");
         let msg = err.to_string();
         // Should be a real IO error, NOT the "unknown session" guard.
         assert!(
@@ -11843,5 +12973,588 @@ mod tests {
         assert_eq!(detail.messages.len(), 1);
         assert_eq!(detail.messages[0].kind, "skill");
         assert_eq!(detail.messages[0].text, "body text");
+    }
+
+    #[test]
+    fn claude_session_aggregates_token_usage_and_model() {
+        // Synthetic Claude resume JSONL with two assistant messages
+        // each carrying a `message.usage` block. Token totals should
+        // sum across messages; cache_read + cache_creation should be
+        // folded into the `cached` counter. Model is taken from the
+        // last seen `message.model`.
+        let dir = TestDir::new("claude-tokens");
+        // Filename has to be UUID-like to pass `is_claude_session_file`.
+        let path = dir
+            .path()
+            .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        let lines = [
+            r#"{"sessionId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","cwd":"/work","timestamp":"2026-05-29T10:00:00Z","customTitle":"Token test","message":{"role":"user","content":"hi"}}"#,
+            r#"{"timestamp":"2026-05-29T10:00:01Z","message":{"role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":120,"output_tokens":40,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}}}"#,
+            r#"{"timestamp":"2026-05-29T10:00:02Z","message":{"role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"more"}],"usage":{"input_tokens":80,"output_tokens":25,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+        let detail = parse_claude_session(&path).unwrap();
+        let tokens = detail
+            .session
+            .tokens
+            .as_ref()
+            .expect("Claude session should expose token totals");
+        assert_eq!(tokens.input, 200);
+        assert_eq!(tokens.output, 65);
+        // 10 + 5 + 0 + 0
+        assert_eq!(tokens.cached, 15);
+        assert_eq!(tokens.reasoning, 0);
+        assert_eq!(tokens.total, 200 + 65 + 15);
+        assert_eq!(detail.session.model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn opencode_db_reads_token_columns_and_model() {
+        // Build a minimal `session` table with all 5 token columns +
+        // model JSON. Verify the per-id read picks them up correctly,
+        // and that the JSON `model.id` is what surfaces on AppSession.
+        let dir = TestDir::new("opencode-tokens");
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "create table session (
+                id text primary key,
+                directory text,
+                title text,
+                time_created integer,
+                time_updated integer,
+                time_archived integer,
+                parent_id text,
+                tokens_input integer default 0,
+                tokens_output integer default 0,
+                tokens_reasoning integer default 0,
+                tokens_cache_read integer default 0,
+                tokens_cache_write integer default 0,
+                model text
+            );
+            create table message (
+                id text primary key,
+                session_id text,
+                time_created integer,
+                data text
+            );
+            create table part (
+                id text primary key,
+                message_id text,
+                session_id text,
+                type text,
+                data text
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "insert into session values \
+             ('sess-1', '/work', 'My session', 1714521600000, 1714521700000, \
+              null, null, \
+              200, 80, 12, 30, 18, '{\"id\":\"claude-opus-4-7\",\"providerID\":\"anthropic\"}')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let detail = parse_opencode_db_session(&db_path, "sess-1").unwrap();
+        let t = detail
+            .session
+            .tokens
+            .as_ref()
+            .expect("OpenCode session should expose token totals");
+        assert_eq!(t.input, 200);
+        assert_eq!(t.output, 80);
+        assert_eq!(t.reasoning, 12);
+        // cache_read + cache_write
+        assert_eq!(t.cached, 48);
+        assert_eq!(t.total, 200 + 80 + 12 + 48);
+        assert_eq!(detail.session.model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn opencode_extracts_per_day_tokens_from_step_finish_parts() {
+        // Real OpenCode schema (with time_created column on `part`) +
+        // two step-finish parts on different days. Expectation:
+        // each day shows up as its own DailyTokenBreakdown entry with
+        // the matching tokens. Other part types (text/tool/etc.) and
+        // step-finish without tokens are ignored.
+        let dir = TestDir::new("opencode-daily-tokens");
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "create table session (
+                id text primary key,
+                directory text,
+                title text,
+                time_created integer,
+                time_updated integer,
+                time_archived integer,
+                parent_id text,
+                tokens_input integer default 0,
+                tokens_output integer default 0,
+                tokens_reasoning integer default 0,
+                tokens_cache_read integer default 0,
+                tokens_cache_write integer default 0
+            );
+            create table message (
+                id text primary key,
+                session_id text,
+                time_created integer,
+                data text
+            );
+            create table part (
+                id text primary key,
+                message_id text,
+                session_id text,
+                time_created integer,
+                time_updated integer,
+                data text
+            );",
+        )
+        .unwrap();
+        // Session metadata
+        conn.execute(
+            "insert into session values \
+             ('sess-daily', '/work', 'Multi day', \
+              1748131200000, 1748390400000, null, null, \
+              300, 80, 10, 50, 0)",
+            [],
+        )
+        .unwrap();
+        // 2026-05-25 in UTC = `1748131200000` ms — step-finish with
+        // 200 input, 50 output, 20 reasoning, 30 cache read, 10 cache write
+        let step1 = r#"{"type":"step-finish","time":{"created":1748131200000},"cost":0.05,"tokens":{"input":200,"output":50,"reasoning":20,"cache":{"read":30,"write":10}}}"#;
+        // 2026-05-27 in UTC = `1748304000000` ms — step-finish with
+        // 100 input, 30 output, 0 reasoning, 10 cache read, 0 cache write
+        let step2 = r#"{"type":"step-finish","time":{"created":1748304000000},"cost":0.02,"tokens":{"input":100,"output":30,"reasoning":0,"cache":{"read":10,"write":0}}}"#;
+        // Non step-finish part with no tokens — should be IGNORED
+        let irrelevant = r#"{"type":"text","time":{"created":1748131200001},"text":"hello"}"#;
+        // step-finish with all-zero tokens — should be IGNORED
+        let zero_step = r#"{"type":"step-finish","time":{"created":1748390400000},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}"#;
+        for (id, time, data) in [
+            ("p-1", 1748131200000i64, step1),
+            ("p-2", 1748131200001i64, irrelevant),
+            ("p-3", 1748304000000i64, step2),
+            ("p-4", 1748390400000i64, zero_step),
+        ] {
+            conn.execute(
+                "insert into part values (?1, 'm-1', 'sess-daily', ?2, ?2, ?3)",
+                rusqlite::params![id, time, data],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let detail = parse_opencode_db_session(&db_path, "sess-daily").unwrap();
+        let daily = detail
+            .session
+            .daily_tokens
+            .expect("daily_tokens should be populated from step-finish parts");
+        // Two distinct days emerged. Date keys may shift by ±1 day
+        // depending on the test machine's local TZ vs UTC, but we
+        // can verify the TOTAL is preserved.
+        assert_eq!(daily.len(), 2);
+        let total_input: u64 = daily.iter().map(|d| d.tokens.input).sum();
+        let total_output: u64 = daily.iter().map(|d| d.tokens.output).sum();
+        let total_cached: u64 = daily.iter().map(|d| d.tokens.cached).sum();
+        let total_reasoning: u64 = daily.iter().map(|d| d.tokens.reasoning).sum();
+        assert_eq!(total_input, 300);
+        assert_eq!(total_output, 80);
+        assert_eq!(total_cached, 50); // 30+10+10+0 from the two real entries
+        assert_eq!(total_reasoning, 20);
+        // The larger day should be the step1 (May 25 = 300 total),
+        // the smaller is step2 (May 27 = 140 total). Verify they
+        // split correctly.
+        let larger = daily.iter().max_by_key(|d| d.tokens.total).unwrap();
+        let smaller = daily.iter().min_by_key(|d| d.tokens.total).unwrap();
+        assert_eq!(larger.tokens.input, 200);
+        assert_eq!(larger.tokens.output, 50);
+        assert_eq!(smaller.tokens.input, 100);
+        assert_eq!(smaller.tokens.output, 30);
+    }
+
+    #[test]
+    fn opencode_daily_tokens_none_when_no_step_finish() {
+        // Sessions with only text/tool parts (no step-finish records)
+        // should yield daily_tokens: None so the frontend falls back
+        // to even-distribution rather than reporting "0 tokens, all days".
+        let dir = TestDir::new("opencode-no-step-finish");
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "create table session (
+                id text primary key,
+                directory text,
+                title text,
+                time_created integer,
+                time_updated integer,
+                time_archived integer,
+                parent_id text,
+                tokens_input integer default 0,
+                tokens_output integer default 0
+            );
+            create table message (id text primary key, session_id text, time_created integer, data text);
+            create table part (
+                id text primary key,
+                message_id text,
+                session_id text,
+                time_created integer,
+                time_updated integer,
+                data text
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "insert into session values \
+             ('sess-no-sf', '/work', 'Just text', 1748131200000, 1748131200000, null, null, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into part values \
+             ('p-1', 'm-1', 'sess-no-sf', 1748131200000, 1748131200000, \
+              '{\"type\":\"text\",\"text\":\"hello\"}')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let detail = parse_opencode_db_session(&db_path, "sess-no-sf").unwrap();
+        assert!(detail.session.daily_tokens.is_none());
+    }
+
+    #[test]
+    fn opencode_db_returns_none_tokens_when_all_zero() {
+        let dir = TestDir::new("opencode-zero-tokens");
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "create table session (
+                id text primary key,
+                directory text,
+                title text,
+                time_created integer,
+                time_updated integer,
+                time_archived integer,
+                parent_id text,
+                tokens_input integer default 0,
+                tokens_output integer default 0,
+                tokens_reasoning integer default 0,
+                tokens_cache_read integer default 0,
+                tokens_cache_write integer default 0
+            );
+            create table message (id text primary key, session_id text, time_created integer, data text);
+            create table part (id text primary key, message_id text, session_id text, type text, data text);",
+        )
+        .unwrap();
+        conn.execute(
+            "insert into session values \
+             ('sess-zero', '/work', 'Empty', 1714521600000, 1714521700000, \
+              null, null, 0, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let detail = parse_opencode_db_session(&db_path, "sess-zero").unwrap();
+        assert!(detail.session.tokens.is_none());
+    }
+
+    #[test]
+    fn gemini_extract_token_usage_sums_per_record() {
+        // Synthetic Gemini records. Sum input/output/cached/thoughts
+        // across rows; verify the `total` field overrides component
+        // sum when present.
+        let records = vec![
+            serde_json::json!({
+                "type": "user",
+                "content": "hi",
+            }),
+            serde_json::json!({
+                "type": "gemini",
+                "model": "gemini-3-flash-preview",
+                "tokens": {
+                    "input": 100, "output": 20, "cached": 10,
+                    "thoughts": 5, "total": 135
+                },
+            }),
+            serde_json::json!({
+                "type": "gemini",
+                "model": "gemini-3-flash-preview",
+                "tokens": {
+                    "input": 50, "output": 10, "cached": 0,
+                    "thoughts": 2, "total": 62
+                },
+            }),
+        ];
+        let (stats, model, _) = gemini_extract_token_usage(&records);
+        let s = stats.unwrap();
+        assert_eq!(s.input, 150);
+        assert_eq!(s.output, 30);
+        assert_eq!(s.cached, 10);
+        assert_eq!(s.reasoning, 7);
+        // Per-record `total` sum is used when present.
+        assert_eq!(s.total, 197);
+        assert_eq!(model.as_deref(), Some("gemini-3-flash-preview"));
+    }
+
+    #[test]
+    fn gemini_extract_token_usage_returns_none_without_tokens() {
+        let records = vec![
+            serde_json::json!({"type": "user", "content": "hi"}),
+            serde_json::json!({"type": "gemini", "content": "hello"}),
+        ];
+        let (stats, _, _) = gemini_extract_token_usage(&records);
+        assert!(stats.is_none());
+    }
+
+    #[test]
+    fn gemini_scan_metadata_only_carries_token_usage() {
+        // Stats page consumes the scan-time AppSession, which loads
+        // each session with metadata_only=true. Before this change the
+        // metadata_only path dropped the `messages` array, so the
+        // token accumulator saw zero records → tokens=None and the
+        // Stats widgets stayed empty. Verify both the scan path and a
+        // detail load expose the same numbers.
+        let dir = TestDir::new("gemini-scan-tokens");
+        let project_dir = dir.path().join("tmp").join("token-project");
+        let chats_dir = project_dir.join("chats");
+        fs::create_dir_all(&chats_dir).unwrap();
+        fs::write(project_dir.join(".project_root"), "/workspace/tokens").unwrap();
+        let path = chats_dir.join("session-2026-05-30T00-00-aaaaaaaa.jsonl");
+        fs::write(
+            &path,
+            r#"{"sessionId":"tok-session","projectHash":"hash","startTime":"2026-05-30T00:00:00Z","lastUpdated":"2026-05-30T00:02:00Z","kind":"main"}"#.to_string()
+                + "\n"
+                + r#"{"id":"u-1","type":"user","content":[{"text":"hi"}]}"#
+                + "\n"
+                + r#"{"id":"a-1","type":"gemini","model":"gemini-3-pro","content":"hello","tokens":{"input":100,"output":20,"cached":10,"thoughts":5,"total":135}}"#
+                + "\n"
+                + r#"{"id":"a-2","type":"gemini","model":"gemini-3-pro","content":"more","tokens":{"input":50,"output":10,"cached":0,"thoughts":2,"total":62}}"#,
+        )
+        .unwrap();
+
+        let scanned = scan_gemini_chats_dir(&chats_dir).unwrap();
+        assert_eq!(scanned.len(), 1);
+        let tokens = scanned[0]
+            .tokens
+            .as_ref()
+            .expect("scan-time token usage should be populated");
+        assert_eq!(tokens.input, 150);
+        assert_eq!(tokens.output, 30);
+        assert_eq!(tokens.cached, 10);
+        assert_eq!(tokens.reasoning, 7);
+        assert_eq!(tokens.total, 197);
+        assert_eq!(scanned[0].model.as_deref(), Some("gemini-3-pro"));
+
+        let detail = parse_gemini_jsonl_session(&path).unwrap();
+        assert_eq!(detail.session.tokens, scanned[0].tokens);
+        assert_eq!(detail.session.model, scanned[0].model);
+    }
+
+    #[test]
+    fn codex_session_uses_last_token_count_event() {
+        // Codex emits periodic `token_count` events with cumulative
+        // `total_token_usage`. The first event has `info: null` (no
+        // data yet); we should ignore it and use the second event's
+        // numbers. Model comes from `session_meta.payload.model`.
+        let dir = TestDir::new("codex-tokens");
+        let path = dir.path().join("rollout.jsonl");
+        let lines = [
+            r#"{"type":"session_meta","payload":{"id":"codex-thread-1","cwd":"/work","model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-05-29T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+            r#"{"timestamp":"2026-05-29T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15000,"cached_input_tokens":6500,"output_tokens":300,"reasoning_output_tokens":70,"total_tokens":21870}}}}"#,
+            r#"{"timestamp":"2026-05-29T10:00:10Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20000,"cached_input_tokens":8000,"output_tokens":500,"reasoning_output_tokens":120,"total_tokens":28620}}}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+        let detail = parse_codex_session(&path, "codex-thread-1").unwrap();
+        let tokens = detail
+            .session
+            .tokens
+            .as_ref()
+            .expect("Codex session should expose latest token usage");
+        // Latest event wins (cumulative semantics).
+        assert_eq!(tokens.input, 20000);
+        assert_eq!(tokens.output, 500);
+        assert_eq!(tokens.cached, 8000);
+        assert_eq!(tokens.reasoning, 120);
+        assert_eq!(tokens.total, 28620);
+        assert_eq!(detail.session.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn claude_session_skips_token_block_when_absent() {
+        // Same shape minus `usage` — verifies `has_token_data` gates
+        // the Option<TokenStats> instead of returning "all zeros".
+        let dir = TestDir::new("claude-no-tokens");
+        let path = dir
+            .path()
+            .join("ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb.jsonl");
+        let line = r#"{"sessionId":"ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb","cwd":"/work","timestamp":"2026-05-29T10:00:00Z","customTitle":"No usage","message":{"role":"user","content":"hi"}}"#;
+        fs::write(&path, line).unwrap();
+        let detail = parse_claude_session(&path).unwrap();
+        assert!(detail.session.tokens.is_none());
+    }
+
+    #[test]
+    fn extract_codex_tokens_matches_parse_codex_session() {
+        // The scan-time extractor should yield identical numbers to the
+        // detail-time parser for the same rollout, so Stats and detail
+        // never disagree. Uses the same multi-event fixture as
+        // codex_session_uses_last_token_count_event.
+        let dir = TestDir::new("codex-scan-tokens");
+        let path = dir.path().join("rollout.jsonl");
+        let lines = [
+            r#"{"type":"session_meta","payload":{"id":"codex-thread-1","cwd":"/work","model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-05-29T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+            r#"{"timestamp":"2026-05-29T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15000,"cached_input_tokens":6500,"output_tokens":300,"reasoning_output_tokens":70,"total_tokens":21870}}}}"#,
+            r#"{"timestamp":"2026-05-29T10:00:10Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20000,"cached_input_tokens":8000,"output_tokens":500,"reasoning_output_tokens":120,"total_tokens":28620}}}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+        let (tokens, model, daily) = extract_codex_tokens_from_rollout(&path);
+        let t = tokens.expect("scan-time extractor should find token_count event");
+        assert_eq!(t.input, 20000);
+        assert_eq!(t.output, 500);
+        assert_eq!(t.cached, 8000);
+        assert_eq!(t.reasoning, 120);
+        assert_eq!(t.total, 28620);
+        assert_eq!(model.as_deref(), Some("gpt-5"));
+        // All three token_count events landed on 2026-05-29 in UTC.
+        // The first (info: null) is ignored; second and third both
+        // sum into the same date's bucket (delta from previous).
+        let daily = daily.expect("daily breakdown should be populated");
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].date.len(), 10); // YYYY-MM-DD shape
+        // Final delta should equal the final cumulative numbers since
+        // the first event was null (no prior baseline).
+        assert_eq!(daily[0].tokens.input, 20000);
+        assert_eq!(daily[0].tokens.output, 500);
+        assert_eq!(daily[0].tokens.cached, 8000);
+        assert_eq!(daily[0].tokens.reasoning, 120);
+    }
+
+    #[test]
+    fn extract_codex_tokens_splits_deltas_across_days() {
+        // Two token_count events: one on May 28 (cumulative 100/50),
+        // one on May 30 (cumulative 300/150). Daily breakdown should
+        // attribute the FIRST event's totals to May 28 and the DELTA
+        // (200/100) to May 30.
+        let dir = TestDir::new("codex-daily-deltas");
+        let path = dir.path().join("rollout.jsonl");
+        let lines = [
+            r#"{"type":"session_meta","payload":{"id":"x","cwd":"/w","model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-05-28T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":50,"cached_input_tokens":0,"reasoning_output_tokens":0,"total_tokens":150}}}}"#,
+            r#"{"timestamp":"2026-05-30T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"output_tokens":150,"cached_input_tokens":0,"reasoning_output_tokens":0,"total_tokens":450}}}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+        let (_, _, daily) = extract_codex_tokens_from_rollout(&path);
+        let daily = daily.expect("daily breakdown should be populated");
+        assert_eq!(daily.len(), 2);
+        // The two date keys may not be strictly "2026-05-28" / "30"
+        // depending on the test machine's local timezone (the JSONL
+        // timestamps are UTC). We just verify the totals split.
+        let total_input: u64 = daily.iter().map(|d| d.tokens.input).sum();
+        let total_output: u64 = daily.iter().map(|d| d.tokens.output).sum();
+        assert_eq!(total_input, 300);
+        assert_eq!(total_output, 150);
+        // The day with the smaller numbers should match the first event.
+        let smaller = daily.iter().min_by_key(|d| d.tokens.input).unwrap();
+        assert_eq!(smaller.tokens.input, 100);
+        assert_eq!(smaller.tokens.output, 50);
+    }
+
+    #[test]
+    fn extract_claude_tokens_accumulates_message_usage() {
+        // Two assistant messages, each with a `usage` block. Scan-time
+        // extractor must sum input/output and combine
+        // cache_read + cache_creation into `cached`, exactly matching
+        // collect_claude_metadata's logic.
+        let dir = TestDir::new("claude-scan-tokens");
+        let path = dir.path().join("session.jsonl");
+        let lines = [
+            r#"{"sessionId":"s","cwd":"/work","timestamp":"2026-05-29T10:00:00Z","customTitle":"x","message":{"role":"user","content":"hi"}}"#,
+            r#"{"message":{"role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":30,"cache_creation_input_tokens":10}}}"#,
+            r#"{"message":{"role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":200,"output_tokens":75,"cache_read_input_tokens":40,"cache_creation_input_tokens":0}}}"#,
+            // Synthetic placeholder should NOT overwrite the real model.
+            r#"{"message":{"role":"assistant","model":"<synthetic>"}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+        let (tokens, model, _daily) = extract_claude_tokens_from_jsonl(&path);
+        let t = tokens.expect("scan-time extractor should find usage blocks");
+        assert_eq!(t.input, 300);
+        assert_eq!(t.output, 125);
+        assert_eq!(t.cached, 80); // 30+10+40+0
+        assert_eq!(t.reasoning, 0);
+        assert_eq!(t.total, 505);
+        assert_eq!(model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn extract_claude_tokens_buckets_by_message_timestamp() {
+        // Three assistant messages on three different days. Each one's
+        // usage block should bucket to its own date in the daily
+        // breakdown — the multi-day attribution bug we set out to fix.
+        let dir = TestDir::new("claude-daily");
+        let path = dir.path().join("session.jsonl");
+        let lines = [
+            r#"{"sessionId":"s","cwd":"/w","timestamp":"2026-05-26T08:00:00Z","customTitle":"x","message":{"role":"user","content":"hi"}}"#,
+            r#"{"timestamp":"2026-05-26T08:00:01Z","message":{"role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:00Z","message":{"role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":200,"output_tokens":75}}}"#,
+            r#"{"timestamp":"2026-05-30T12:00:00Z","message":{"role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":400,"output_tokens":100,"cache_read_input_tokens":50}}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+        let (tokens, _, daily) = extract_claude_tokens_from_jsonl(&path);
+        let t = tokens.unwrap();
+        // Aggregate matches the previous behavior — sum across all msgs.
+        assert_eq!(t.input, 700);
+        assert_eq!(t.output, 225);
+        assert_eq!(t.cached, 50);
+        assert_eq!(t.total, 975);
+        let daily = daily.expect("Claude daily breakdown should be populated");
+        // Three distinct days emerge — verify they're chronological.
+        assert_eq!(daily.len(), 3);
+        for d in &daily {
+            assert_eq!(d.date.len(), 10);
+        }
+        let day1_input = daily.iter().map(|d| d.tokens.input).min().unwrap();
+        let day3_input = daily.iter().map(|d| d.tokens.input).max().unwrap();
+        assert_eq!(day1_input, 100);
+        assert_eq!(day3_input, 400);
+        let cached_total: u64 = daily.iter().map(|d| d.tokens.cached).sum();
+        assert_eq!(cached_total, 50);
+    }
+
+    #[test]
+    fn cached_token_extract_reuses_result_for_same_mtime() {
+        // Verify the cache short-circuits the extractor: pass a closure
+        // that increments a counter, call it twice with the same path,
+        // assert the counter is 1.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TestDir::new("scan-token-cache");
+        let path = dir.path().join("session.jsonl");
+        fs::write(&path, "irrelevant").unwrap();
+        let calls = AtomicUsize::new(0);
+        let extract = |_: &Path| -> TokenExtraction {
+            calls.fetch_add(1, Ordering::SeqCst);
+            (
+                Some(TokenStats {
+                    input: 1,
+                    output: 1,
+                    cached: 0,
+                    reasoning: 0,
+                    total: 2,
+                }),
+                None,
+                None,
+            )
+        };
+        // First call: cache miss → extractor runs.
+        let _ = cached_token_extract(&path, extract);
+        // Second call with the SAME mtime: cache hit → extractor must
+        // NOT re-run. (Closure is move'd, so spin a fresh one that we
+        // expect never to fire.)
+        let extract_should_skip = |_: &Path| -> TokenExtraction {
+            panic!("cache hit should bypass extractor");
+        };
+        let _ = cached_token_extract(&path, extract_should_skip);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

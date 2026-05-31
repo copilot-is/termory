@@ -35,7 +35,7 @@ const ProviderEditor = React.lazy(() =>
 // Module-level cache for CLI detection results so the OpenCode tab
 // doesn't flash "Official → InstallGuide" every time the user
 // switches away from Providers and back. ProvidersPage is gated by
-// `route === "config"` in App.tsx and so unmounts on every route
+// `route === "providers"` in App.tsx and so unmounts on every route
 // change; without this cache each remount would briefly render the
 // Official card with the optimistic `installed[opencode] = true`
 // default before the async detect_clis returned `false`.

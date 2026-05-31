@@ -79,3 +79,41 @@ export function formatTimeAgo(timestamp: number): string {
 export function formatFullNumber(value: number): string {
   return numberFormatter.format(value);
 }
+
+/**
+ * Compact format for dashboard widgets — token-tuned so M is the
+ * dominant unit. Pair with `formatFullNumber` in the `title=` attr
+ * when the precise value matters on hover.
+ *
+ *   < 1,000        →  raw integer        (e.g. 500)
+ *   1K – <100K     →  K with 0-1 decimal (e.g. 5K, 5.5K, 50K)
+ *   100K – <1M     →  M with 2 decimals  (e.g. 0.50M, 0.05M)
+ *   1M – <1B       →  M with 1 decimal   (e.g. 4.2M, 800M)
+ *   ≥ 1B           →  B with 1 decimal   (e.g. 1.2B, 4B)
+ *
+ * Whole-number values strip the trailing `.0` so "800.0M" becomes
+ * "800M" — Y-axis ticks especially shouldn't carry meaningless
+ * decimals.
+ */
+export function formatCompact(value: number): string {
+  if (value < 1_000) return String(value);
+  if (value < 100_000) {
+    const k = value / 1_000;
+    return `${stripTrailingZero(k.toFixed(value < 10_000 ? 1 : 0))}K`;
+  }
+  if (value < 1_000_000_000) {
+    const m = value / 1_000_000;
+    return `${stripTrailingZero(m.toFixed(m < 1 ? 2 : 1))}M`;
+  }
+  return `${stripTrailingZero((value / 1_000_000_000).toFixed(1))}B`;
+}
+
+/**
+ * Drop a single trailing `.0` from a fixed-decimal string so whole
+ * numbers render cleanly: "800.0" → "800", "0.50" → "0.50" (intact).
+ * Multi-zero tails (e.g. "0.00") are also normalised.
+ */
+function stripTrailingZero(s: string): string {
+  if (!s.includes(".")) return s;
+  return s.replace(/\.0+$/, "");
+}

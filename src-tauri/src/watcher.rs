@@ -114,7 +114,7 @@ impl WatcherHandle {
 /// Compute the project-cwd set Termory should be dynamically watching,
 /// from a freshly-scanned `Vec<AppSession>`.
 pub fn dynamic_paths_from_sessions<S: AsRef<str>>(
-    project_paths: impl IntoIterator<Item = S>
+    project_paths: impl IntoIterator<Item = S>,
 ) -> HashSet<PathBuf> {
     project_paths
         .into_iter()
@@ -229,9 +229,8 @@ pub fn start(app_handle: AppHandle) -> notify::Result<WatcherHandle> {
                     // cwds discovered in this scan. Sessions that have
                     // been opened in new projects pick up coverage;
                     // disappeared projects get unwatched.
-                    let new_cwds = dynamic_paths_from_sessions(
-                        sessions.iter().map(|s| s.project.as_str())
-                    );
+                    let new_cwds =
+                        dynamic_paths_from_sessions(sessions.iter().map(|s| s.project.as_str()));
                     let handle = WatcherHandle {
                         inner: inner_for_thread.clone(),
                     };
@@ -343,7 +342,13 @@ fn install_watch_targets() -> Vec<(PathBuf, RecursiveMode)> {
     // Cross-platform per-user bin dirs (these resolve correctly on
     // both Unix and Windows via `home.join()` — e.g. `.bun/bin` becomes
     // `%USERPROFILE%\.bun\bin` on Windows, where bun does install).
-    for sub in [".opencode/bin", ".bun/bin", ".cargo/bin", ".npm-global/bin", ".codex/bin"] {
+    for sub in [
+        ".opencode/bin",
+        ".bun/bin",
+        ".cargo/bin",
+        ".npm-global/bin",
+        ".codex/bin",
+    ] {
         targets.push((home.join(sub), RecursiveMode::NonRecursive));
     }
 
@@ -359,10 +364,7 @@ fn install_watch_targets() -> Vec<(PathBuf, RecursiveMode)> {
     #[cfg(target_os = "macos")]
     targets.push((home.join("Library/pnpm"), RecursiveMode::NonRecursive));
     #[cfg(target_os = "linux")]
-    targets.push((
-        home.join(".local/share/pnpm"),
-        RecursiveMode::NonRecursive,
-    ));
+    targets.push((home.join(".local/share/pnpm"), RecursiveMode::NonRecursive));
 
     #[cfg(target_os = "macos")]
     {
@@ -370,17 +372,11 @@ fn install_watch_targets() -> Vec<(PathBuf, RecursiveMode)> {
             PathBuf::from("/opt/homebrew/bin"),
             RecursiveMode::NonRecursive,
         ));
-        targets.push((
-            PathBuf::from("/usr/local/bin"),
-            RecursiveMode::NonRecursive,
-        ));
+        targets.push((PathBuf::from("/usr/local/bin"), RecursiveMode::NonRecursive));
     }
     #[cfg(target_os = "linux")]
     {
-        targets.push((
-            PathBuf::from("/usr/local/bin"),
-            RecursiveMode::NonRecursive,
-        ));
+        targets.push((PathBuf::from("/usr/local/bin"), RecursiveMode::NonRecursive));
     }
     #[cfg(target_os = "windows")]
     {
@@ -428,10 +424,7 @@ fn install_watch_targets() -> Vec<(PathBuf, RecursiveMode)> {
     // Unix node version managers — recursive enumeration of per-version bin dirs.
     #[cfg(unix)]
     {
-        targets.push((
-            home.join(".nvm/versions/node"),
-            RecursiveMode::Recursive,
-        ));
+        targets.push((home.join(".nvm/versions/node"), RecursiveMode::Recursive));
         targets.push((
             home.join(".local/state/fnm_multishells"),
             RecursiveMode::Recursive,
@@ -449,11 +442,9 @@ fn install_watch_targets() -> Vec<(PathBuf, RecursiveMode)> {
 /// targets. We don't filter by file extension or name — any change
 /// inside a known bin dir is grounds to re-detect (binary added,
 /// removed, replaced, or even mtime-touched by a package manager).
-fn event_touches_install(
-    event: &notify::Event,
-    targets: &[(PathBuf, RecursiveMode)],
-) -> bool {
-    event.paths.iter().any(|path| {
-        targets.iter().any(|(target, _)| path.starts_with(target))
-    })
+fn event_touches_install(event: &notify::Event, targets: &[(PathBuf, RecursiveMode)]) -> bool {
+    event
+        .paths
+        .iter()
+        .any(|path| targets.iter().any(|(target, _)| path.starts_with(target)))
 }

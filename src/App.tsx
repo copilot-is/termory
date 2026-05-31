@@ -51,6 +51,7 @@ import { CommandPalette } from "@/components/CommandPalette";
 import { CopyMenu } from "@/components/CopyMenu";
 import { EmptyState } from "@/components/EmptyState";
 import { FreshnessFooter } from "@/components/FreshnessFooter";
+import { SessionCardSkeletonList } from "@/components/SessionCardSkeleton";
 import { MemoryCard } from "@/components/MemoryCard";
 import { MessageBody } from "@/components/MessageBody";
 import { MessageList } from "@/components/MessageList";
@@ -73,6 +74,11 @@ const SearchPage = React.lazy(() =>
     default: m.SearchPage
   }))
 );
+const StatsPage = React.lazy(() =>
+  import("@/components/stats/StatsPage").then((m) => ({
+    default: m.StatsPage
+  }))
+);
 const SettingsPage = React.lazy(() =>
   import("@/components/settings/SettingsPage").then((m) => ({
     default: m.SettingsPage
@@ -92,6 +98,10 @@ export function App() {
   const [source, setSource] = React.useState("All");
   const [project, setProject] = React.useState<string | null>(null);
   const [expandedSources, setExpandedSources] = React.useState<Set<string>>(() => new Set());
+  // Starts true because we kick off a background scan on mount —
+  // FreshnessFooter shows "Syncing…" briefly even when the user lands
+  // on Providers, then flips to "Synced just now" when the scan
+  // returns. Sessions are pre-loaded for Records / Stats / Search.
   const [loading, setLoading] = React.useState(true);
   const [detailLoading, setDetailLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -253,6 +263,7 @@ export function App() {
       const result = await invoke<AppSession[]>("scan_all_sessions");
       applyScanResult(result);
     } catch (err) {
+      console.error("scan_all_sessions failed", err);
       setError(String(err));
     } finally {
       setLoading(false);
@@ -269,6 +280,10 @@ export function App() {
     };
   }, [applyScanResult]);
 
+  // Background scan on mount — runs regardless of landing route so
+  // sessions are pre-loaded by the time the user navigates to
+  // Records / Stats / Search. Non-blocking; FreshnessFooter shows
+  // "Syncing…" while it runs.
   React.useEffect(() => {
     refresh();
   }, [refresh]);
@@ -298,7 +313,10 @@ export function App() {
         React.startTransition(() => setDetail(result));
       })
       .catch((err) => {
-        if (!cancelled) setError(String(err));
+        if (!cancelled) {
+          console.error("load_session failed", err);
+          setError(String(err));
+        }
       })
       .finally(() => {
         if (!cancelled && isNewSelection) setDetailLoading(false);
@@ -339,7 +357,10 @@ export function App() {
           setContentQuery(trimmed);
         })
         .catch((err) => {
-          if (!cancelled) setError(String(err));
+          if (!cancelled) {
+            console.error("search_all_sessions failed", err);
+            setError(String(err));
+          }
         })
         .finally(() => {
           if (!cancelled) setSearchingContent(false);
@@ -465,7 +486,7 @@ export function App() {
                 onClearRecent={clearRecentSearches}
               />
             )}
-            {route === "config" && (
+            {route === "providers" && (
               <ProvidersPage
                 providers={providers}
                 setProviders={setProviders}
@@ -483,8 +504,15 @@ export function App() {
                 onUpdateFound={(update) => setPendingUpdate(update)}
               />
             )}
+            {route === "stats" && (
+              <StatsPage
+                sessions={sessions}
+                onRefresh={refresh}
+                refreshing={loading}
+              />
+            )}
           </React.Suspense>
-          {route !== "records" && route !== "search" && route !== "config" && route !== "settings" && (
+          {route !== "records" && route !== "search" && route !== "providers" && route !== "settings" && route !== "stats" && (
             <RoutePlaceholder route={route} />
           )}
           {route === "records" && (
@@ -624,18 +652,10 @@ export function App() {
                   </Tabs>
                 </div>
 
-                {error && (
-                  <div className="m-3 rounded-md border border-destructive/30 bg-destructive/10 text-destructive text-sm px-3 py-2">
-                    {error}
-                  </div>
-                )}
-
                 {pane === "sessions" && (
                   <div className="flex-1 min-h-0 overflow-auto px-3 flex flex-col gap-2">
                     {loading && sessionItems.length === 0 && (
-                      <EmptyState
-                        icon={<Loader2 className="animate-spin" />}
-                      />
+                      <SessionCardSkeletonList count={6} />
                     )}
                     {!loading && filtered.length === 0 && sessionItems.length === 0 && (
                       <EmptyState
@@ -719,9 +739,7 @@ export function App() {
                 {pane === "memory" && (
                   <div className="flex-1 min-h-0 overflow-auto px-3 flex flex-col gap-2">
                     {loading && memoryItems.length === 0 && (
-                      <EmptyState
-                        icon={<Loader2 className="animate-spin" />}
-                      />
+                      <SessionCardSkeletonList count={6} />
                     )}
                     {!loading && filteredMemories.length === 0 && memoryItems.length === 0 && (
                       <EmptyState
@@ -760,9 +778,7 @@ export function App() {
                 {pane === "skills" && (
                   <div className="flex-1 min-h-0 overflow-auto px-3 flex flex-col gap-2">
                     {loading && skillItems.length === 0 && (
-                      <EmptyState
-                        icon={<Loader2 className="animate-spin" />}
-                      />
+                      <SessionCardSkeletonList count={6} />
                     )}
                     {!loading && filteredSkills.length === 0 && skillItems.length === 0 && (
                       <EmptyState

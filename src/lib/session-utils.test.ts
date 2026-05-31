@@ -185,12 +185,12 @@ describe("readRouteFromHash", () => {
     window.location.hash = "#stats";
     expect(readRouteFromHash()).toBe("stats");
   });
-  it("falls back to 'config' for unknown hashes", () => {
+  it("falls back to 'providers' for unknown hashes", () => {
     window.location.hash = "#bogus";
-    expect(readRouteFromHash()).toBe("config");
+    expect(readRouteFromHash()).toBe("providers");
   });
-  it("falls back to 'config' for empty hash", () => {
+  it("falls back to 'providers' for empty hash", () => {
     window.location.hash = "";
-    expect(readRouteFromHash()).toBe("config");
+    expect(readRouteFromHash()).toBe("providers");
   });
 });

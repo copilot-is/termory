@@ -4,9 +4,9 @@ import type { Route } from "@/types";
 export function RoutePlaceholder({ route }: { route: Route }) {
   // Only `stats` is still a placeholder route — every other entry's
   // page is implemented and routed before this fallback is reached.
-  // Keeping the records / search / config / settings labels stops a
-  // future routing regression from rendering "Lands in a later phase"
-  // for an actually-shipped page.
+  // Keeping the records / search / providers / settings labels stops
+  // a future routing regression from rendering "Lands in a later
+  // phase" for an actually-shipped page.
   const labels: Record<Route, { title: string; detail: string }> = {
     records: { title: "Records", detail: "" },
     search: { title: "Search", detail: "" },
@@ -15,7 +15,7 @@ export function RoutePlaceholder({ route }: { route: Route }) {
       detail:
         "Dashboards (sessions / day, tokens per tool, top projects) land here in a later phase."
     },
-    config: { title: "Providers", detail: "" },
+    providers: { title: "Providers", detail: "" },
     settings: { title: "Settings", detail: "" }
   };
   const { title, detail } = labels[route];
