@@ -43,6 +43,8 @@ Current alignment target: data acquisition and message preview formatting should
 - Session/Memory/Skill scanning, parsing, and formatting: `src-tauri/src/sessions.rs`
 - Provider switching (activate / deactivate / reverse-derive / test / fetch-models): `src-tauri/src/providers.rs`
 - Local KV store (config.json + providers.json under `~/.termory/`, chmod 0600): `src-tauri/src/config.rs`
+- Stats aggregations (pure, window-accurate): `src/lib/stats-utils.ts` (+ `stats-utils.test.ts`)
+- Stats UI: `src/components/stats/{StatsPage,StatsFilterBar,OverviewHero,DailyTokenUsageChart,DailyActivityHeatmap,shared}.tsx`
 - Tauri config: `src-tauri/tauri.conf.json`
 - Rust parser/formatter tests: inline tests at the bottom of `src-tauri/src/sessions.rs`
 - Rust provider/store tests: inline tests at the bottom of `src-tauri/src/providers.rs` and `src-tauri/src/config.rs`
@@ -560,9 +562,70 @@ All four were cross-verified against the upstream CLI source (`.audit-sources/{c
 
 **Test coverage:** Each CLI has an activate/reverse roundtrip test, an unrelated-fields-preserved test, and an OAuth-credentials-isolated three-stage test (Stage 1 simulates a prior CLI login, Stage 2 activates a Custom provider via Termory, Stage 3 deactivates — credentials file must be byte-identical at the end). See `providers::tests::*` in `src-tauri/src/providers.rs`.
 
+## Stats
+
+Three cards stacked under a source filter + date range bar:
+
+1. **OverviewHero** — KPI strip: Sessions / Messages / Tokens / Projects. The Tokens cell hovers a 4-row breakdown (Input / Output / Reasoning / Cached + Total).
+2. **DailyTokenUsageChart** — 4 trend lines (Input / Output / Cached / Reasoning) on a single linear-scale chart. Tooltip per-day shows fixed 5-row breakdown.
+3. **DailyActivityHeatmap** — 24-hour × N-date heatmap. Cell intensity scales off message count; hover reveals `Sessions / Messages / Tokens` for that exact `(date, hour)` bucket. Hour labels: hand-picked 14 rows, work band 09:00–18:00 highlighted with `text-foreground`.
+
+### Accuracy rules (LOCKED — do not weaken)
+
+All Stats values are **window-accurate** — they reflect what actually happened in the chosen date range, NOT lifetime totals.
+
+The rules `windowTotals` (and the two visualization functions) follow:
+
+| Metric | Source | Notes |
+|---|---|---|
+| Sessions | `started_at ∈ window` count | Old session reused today does NOT count |
+| Messages | `Σ daily_tokens[date ∈ window].messages` | Per-message timestamps from backend |
+| Tokens | `Σ daily_tokens[date ∈ window].tokens` | Same |
+| Projects | unique projects of sessions with any of the above | Window-bounded |
+
+**No fallback smearing**: if a session has `s.tokens` but no `s.daily_tokens`, it contributes ZERO to Messages/Tokens. Termory does not even-distribute lifetime totals across `[started_at, updated_at]` — that would fabricate per-day numbers indistinguishable from real ones. (`sessionActiveDays` and the fallback branch were removed.)
+
+**filter uses interval overlap**: `filterSessions` keeps a session if `[started_at, updated_at] ∩ window ≠ ∅`. Filtering on `updated_at ∈ window` alone would drop sessions whose `updated_at` is after a custom past window even when their `daily_tokens` fall inside it.
+
+**Cross-source consistency** (backend-guaranteed):
+- `entry.messages === Σ entry.hours[h]` per `daily_tokens` entry
+- `entry.tokens.total === Σ entry.hour_tokens[h]` per entry (Gemini edge case: when some records have explicit `total` and others don't, slight drift)
+- Therefore `Σ windowTotals.messages === Σ DailyActivity.messages[h][d]` and `Σ windowTotals.tokens.total === Σ DailyTokenUsage[].total === Σ DailyActivity.tokens[h][d]`
+
+### Backend wire shape
+
+`DailyTokenBreakdown` (per-day, per-session):
+
+```rust
+{
+  date: "YYYY-MM-DD",            // scanning machine's local TZ
+  tokens: TokenStats { input, output, cached, reasoning, total },
+  messages: u64,                 // count of AI interactions that day
+  hours: [u64; 24],              // per-hour message count, local hour 0..23
+  hour_tokens: [u64; 24],        // per-hour tokens.total
+}
+```
+
+Populated by all four scanners when underlying records carry timestamps:
+- **Codex** — `event_msg.token_count` events (delta between cumulative usages); per-event `timestamp` → local date+hour.
+- **Claude** — per-`message.usage` JSONL line; line `timestamp` → local date+hour.
+- **Gemini** — per-`record.tokens` entry; record `timestamp` → local date+hour.
+- **OpenCode** — per `step-finish` part; `time.created` (epoch ms) → local date+hour.
+
+All four are gated on a successful local-time parse — records without a timestamp don't appear in `daily_tokens`, the session shows up but contributes zero to time-bucketed widgets.
+
+### Frontend aggregation
+
+`src/lib/stats-utils.ts` exports the pure helpers (`windowTotals` / `dailyTokenUsage` / `dailyActivity` / `filterSessions`). Each one iterates `filtered` sessions once; the Stats page memoizes them per `(filtered, resolved)`. 86 unit tests cover the window-overlap regression, no-fallback enforcement, per-source attribution, and cross-consistency between aggregator outputs.
+
+Naming alignment (UI label ↔ data field ↔ file ↔ component) is intentional:
+- "DAILY TOKEN USAGE" card → `DailyTokenUsageChart.tsx` (component) ← `DailyTokenUsage[]` (type) ← `dailyTokenUsage()` (function)
+- "DAILY ACTIVITY" card → `DailyActivityHeatmap.tsx` ← `DailyActivity` ← `dailyActivity()`
+- KPI labels (`Sessions` / `Messages` / `Tokens` / `Projects`) map 1:1 to `WindowTotals` fields
+
 ## Pending feature work
 
-The current UI shell is settled: activity rail (Providers / Records / Search / Stats / Settings, in that order — Providers is the default landing route via `readRouteFromHash` → `"config"` fallback), routed via URL hash, with a passive bottom freshness footer fed by the Rust filesystem watcher. Records and Providers are fully implemented; the other three rail destinations render placeholder cards.
+The current UI shell is settled: activity rail (Providers / Records / Search / Stats / Settings, in that order — Providers is the default landing route via `readRouteFromHash` → `"providers"` fallback), routed via URL hash, with a passive bottom freshness footer fed by the Rust filesystem watcher. Providers / Records / Search / Stats are fully implemented; only Settings still renders a placeholder card.
 
 Roadmap below is grouped by priority. Pick top-down within a tier.
 
@@ -578,7 +641,7 @@ All P0 items have shipped:
 
 - ~~`tauri-plugin-store`~~ — replaced with custom `config.rs` module (`~/.termory/{config,providers}.json` with `chmod 0600`). The plugin couldn't control file location or Unix permissions; rolling our own KV gives both.
 - ~~Providers page~~ — done. See the "Providers" section above. Cross-verified against `.audit-sources/cc-switch/` for the per-CLI write shapes; 4 CLIs supported with per-CLI tests. OpenCode adapter was re-done in a second pass: instead of self-declaring `provider.termory.{npm,name,models}` (which fights OpenCode's catalog at runtime), Termory now writes the API key under one of OpenCode's built-in catalog ids (`anthropic`/`openai`/`openai-compatible`/…) into `~/.local/share/opencode/auth.json` — same shape `/connect` produces — and optionally overlays a `baseURL` in `opencode.json`. The AI SDK dropdown in the editor is the catalog id picker.
-- **Stats page** — dashboards (sessions/day, tokens/tool, top projects, model distribution). Requires extending the four parsers in `sessions.rs` to extract token counts (currently dropped); each platform exposes the field differently.
+- ~~Stats page~~ — done. See the "Stats" section below. KPI strip (Sessions/Messages/Tokens/Projects) + DAILY TOKEN USAGE line chart + DAILY ACTIVITY heatmap. All values window-accurate from each session's `daily_tokens[]` — no fallback smearing, no lifetime-of-touched-session totals.
 - **App Settings page** — theme, scan-path overrides, keyboard shortcuts, watcher toggle.
 
 ### P2 — quality of life
